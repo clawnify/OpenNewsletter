@@ -1,3 +1,5 @@
+<img src="readme-banner.png" alt="Open Newsletter preview" width="100%" />
+
 # Open Newsletter — The Open-Source Mailchimp & beehiiv Alternative
 
 [![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-newsletter)
@@ -11,8 +13,6 @@ tokens, and send it to your audience through **Resend**. Built with
 A self-hostable, open-source alternative to **Mailchimp**, **beehiiv**,
 **Substack**, and **ConvertKit** — the AI editor, the brand controls, and the
 sending pipeline, fully yours. No per-subscriber pricing, no lock-in.
-
-<img width="1728" height="994" alt="Image" src="https://github.com/user-attachments/assets/38d948f7-dfae-446a-8351-94540f6fa1d6" />
 
 ## Features
 
