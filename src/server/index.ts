@@ -1,5 +1,5 @@
-import { Hono } from "hono";
-import { initDB, query, get, run } from "./db";
+import { createApp } from "@clawnify/app";
+import { query, get, run } from "./db";
 import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
@@ -20,7 +20,7 @@ type Env = {
   };
 };
 
-const app = new Hono<Env>();
+const app = createApp<Env>({ title: "Open Newsletter", version: "1.0.0" });
 
 // Surface real error messages instead of Hono's opaque "Internal Server
 // Error" so the dashboard toast (and logs) say what actually failed.
@@ -59,7 +59,6 @@ async function ensureSeed() {
 }
 
 app.use("*", async (c, next) => {
-  initDB(c.env);
   await ensureSeed();
   await next();
 });

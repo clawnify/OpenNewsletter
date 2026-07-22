@@ -10,8 +10,10 @@
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.196",
+    "@clawnify/app": "^0.1.0",
     "@clawnify/db": "^0.4.1",
     "@fontsource-variable/geist": "^5.2.9",
+    "@hono/zod-openapi": "^0.18.0",
     "@openrouter/ai-sdk-provider": "^2.9.0",
     "@streamdown/cjk": "^1.0.3",
     "@streamdown/code": "^1.1.1",
