@@ -45,11 +45,18 @@ export function MailsView({ openMail }: { openMail: (id: number) => void }) {
       )}
 
       <Dialog open={picking} onOpenChange={setPicking}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle>Start from a template</DialogTitle>
           </DialogHeader>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3">
+            <button
+              className="rounded-xl border border-dashed p-4 text-left transition hover:border-primary hover:bg-muted"
+              onClick={() => start("blank")}
+            >
+              <div className="font-medium">Blank</div>
+              <div className="mt-1 text-xs text-muted-foreground">Start from scratch — an empty canvas with the default design.</div>
+            </button>
             {templates.map((t) => (
               <button
                 key={t.slug}
