@@ -9,11 +9,11 @@
   "app": {
     "framework": "react+hono",
     "database": true,
-    "storage": true
+    "storage": true,
+    "credentials": ["resend"]
   },
   "env": {
-    "required": ["RESEND_API_KEY"],
     "oneOf": [["OPENROUTER_API_KEY"]],
-    "optional": ["NEWSLETTER_MODEL"]
+    "optional": ["RESEND_API_KEY", "NEWSLETTER_MODEL"]
   }
 }

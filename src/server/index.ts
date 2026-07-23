@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { CredentialBinding } from "@clawnify/connections";
 import { initDB, query, get, run } from "./db";
 import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
@@ -13,6 +14,10 @@ type Env = {
   Bindings: {
     DB: D1Database;
     UPLOADS?: R2Bucket;
+    // Injected by Clawnify when the org connects Resend in the dashboard —
+    // read via @clawnify/connections. RESEND_API_KEY wins as a BYO fallback.
+    CREDENTIALS?: CredentialBinding;
+    CLAWNIFY_ORG_ID?: string;
     RESEND_API_KEY?: string;
     OPENROUTER_API_KEY?: string;
     NEWSLETTER_MODEL?: string;
@@ -174,7 +179,7 @@ function fromAddress(s: Settings): string | null {
 
 app.get("/api/status", async (c) => {
   const env = envOf(c);
-  const provider = getEmailProvider(env);
+  const provider = await getEmailProvider(c.env);
   let audiences: any[] = [];
   if (provider) {
     try {
@@ -222,7 +227,7 @@ app.put("/api/settings", async (c) => {
 
 // Verified sending domains + the user's saved senders, for the Senders UI.
 app.get("/api/senders", async (c) => {
-  const p = provider(c);
+  const p = await provider(c);
   let domains: { name: string; status: string }[] = [];
   if (p) {
     try { domains = await p.listDomains(); } catch { domains = []; }
@@ -565,12 +570,11 @@ app.get("/api/uploads/:key", async (c) => {
 // ── audiences (Resend segments) ──────────────────────────────────────
 
 function provider(c: any) {
-  const p = getEmailProvider(envOf(c));
-  return p;
+  return getEmailProvider(c.env);
 }
 
 app.get("/api/audiences", async (c) => {
-  const p = provider(c);
+  const p = await provider(c);
   if (!p) return c.json({ error: "Resend not connected" }, 400);
   try {
     return c.json(await p.listAudiences());
@@ -580,7 +584,7 @@ app.get("/api/audiences", async (c) => {
 });
 
 app.get("/api/audiences/:id/contacts", async (c) => {
-  const p = provider(c);
+  const p = await provider(c);
   if (!p) return c.json({ error: "Resend not connected" }, 400);
   try {
     return c.json(await p.listContacts(c.req.param("id")));
@@ -590,7 +594,7 @@ app.get("/api/audiences/:id/contacts", async (c) => {
 });
 
 app.post("/api/audiences/:id/contacts", async (c) => {
-  const p = provider(c);
+  const p = await provider(c);
   if (!p) return c.json({ error: "Resend not connected" }, 400);
   const b = await c.req.json<{ email: string; first_name?: string; last_name?: string }>();
   if (!b.email?.trim()) return c.json({ error: "Email required" }, 400);
@@ -603,7 +607,7 @@ app.post("/api/audiences/:id/contacts", async (c) => {
 });
 
 app.delete("/api/audiences/:id/contacts/:contactId", async (c) => {
-  const p = provider(c);
+  const p = await provider(c);
   if (!p) return c.json({ error: "Resend not connected" }, 400);
   try {
     await p.removeContact(c.req.param("id"), c.req.param("contactId"));
@@ -617,7 +621,7 @@ app.delete("/api/audiences/:id/contacts/:contactId", async (c) => {
 
 app.post("/api/mails/:id/test", async (c) => {
   const id = Number(c.req.param("id"));
-  const p = provider(c);
+  const p = await provider(c);
   if (!p) return c.json({ error: "Resend not connected" }, 400);
   const { to, from: fromOverride } = await c.req.json<{ to: string; from?: string }>();
   if (!to?.trim()) return c.json({ error: "Recipient email required" }, 400);
@@ -640,7 +644,7 @@ app.post("/api/mails/:id/test", async (c) => {
 
 app.post("/api/mails/:id/send", async (c) => {
   const id = Number(c.req.param("id"));
-  const p = provider(c);
+  const p = await provider(c);
   if (!p) return c.json({ error: "Resend not connected" }, 400);
   const { scheduled_at, from: fromOverride } = await c.req.json<{ scheduled_at?: string; from?: string }>().catch(() => ({}) as any);
 
