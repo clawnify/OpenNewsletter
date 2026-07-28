@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { CredentialBinding } from "@clawnify/connections";
+import { enqueueJob, verifyDelivery } from "@clawnify/queue";
 import { initDB, query, get, run } from "./db";
 import * as contacts from "./contacts";
 import { getEmailProvider } from "./providers";
@@ -818,48 +819,25 @@ app.post("/api/mails/:id/test", async (c) => {
 // ── scheduling via the platform queue ────────────────────────────────
 //
 // The queue holds the job and POSTs back to /api/jobs/send-mail at the
-// appointed time. Called over plain HTTP rather than through @clawnify/queue
-// because that package isn't on npm yet (publish-queue.yml ships it) — swap to
-// enqueueJob()/verifyDelivery() once it is, which also upgrades the callback
-// check below from a shared secret to the platform's ES256 delivery signature.
-
-const QUEUE_URL = "https://services.clawnify.com/queue";
-
-/**
- * Authenticator for the delivery callback. /api/jobs/send-mail has to be a
- * public route for the queue to reach it, so it can't rely on the app
- * perimeter — anyone who knew the URL could otherwise fire a send. Derived
- * from CLAWNIFY_TOKEN, which only this app and the platform hold, and bound to
- * the mail id so a captured header can't be replayed against a different issue.
- */
-async function jobAuth(token: string, mailId: number): Promise<string> {
-  const data = new TextEncoder().encode(`${token}:send-mail:${mailId}`);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
+// appointed time, signing each delivery. The callback verifies that signature
+// (ES256, public key from the platform's JWKS) rather than sharing a secret.
 
 async function enqueueSend(c: any, mailId: number, runAt: string, from: string): Promise<void> {
-  const token = (c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN;
-  if (!token) {
+  if (!(c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN) {
     throw new Error("Scheduling needs Clawnify managed sending; this app has no CLAWNIFY_TOKEN.");
   }
+  // The queue only delivers to the app's own *.apps.clawnify.com hostname, so
+  // scheduling from a custom domain or preview origin is rejected upfront —
+  // surfaced to the operator rather than silently never firing.
   const origin = new URL(c.req.url).origin;
-  const res = await fetch(`${QUEUE_URL}/enqueue`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      target_url: `${origin}/api/jobs/send-mail`,
-      payload: { mail_id: mailId, from },
-      headers: { "X-Job-Auth": await jobAuth(token, mailId) },
-      run_at: runAt,
-      // Re-scheduling the same issue replaces rather than stacks, so an
-      // operator changing their mind twice doesn't send it twice.
-      idempotency_key: `send-mail-${mailId}`,
-    }),
+  await enqueueJob(c.env, {
+    targetUrl: `${origin}/api/jobs/send-mail`,
+    payload: { mail_id: mailId, from },
+    runAt,
+    // Re-scheduling the same issue replaces rather than stacks, so an operator
+    // changing their mind twice doesn't send it twice.
+    idempotencyKey: `send-mail-${mailId}`,
   });
-  if (!res.ok) {
-    throw new Error(`Queue ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
-  }
 }
 
 /**
@@ -1012,21 +990,26 @@ app.post("/api/mails/:id/send", async (c) => {
 // Queue delivery target for scheduled sends. Public (the queue calls it from
 // outside the app perimeter), so the X-Job-Auth header is the authorization.
 app.post("/api/jobs/send-mail", async (c) => {
-  const token = (c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN;
-  const body = await c.req
-    .json<{ mail_id?: number; from?: string }>()
-    .catch(() => ({}) as { mail_id?: number; from?: string });
-  const id = Number(body.mail_id);
-  if (!token || !Number.isFinite(id)) return c.json({ error: "bad_request" }, 400);
+  // Must verify against the *raw* body — the signature covers the exact bytes,
+  // so re-serialising parsed JSON would not match.
+  const raw = await c.req.text();
+  const ok = await verifyDelivery(raw, {
+    // X-Queue-*, not X-Clawnify-*: app-router strips the latter as
+    // anti-spoofing, so those headers never reach a deployed app.
+    signature: c.req.header("X-Queue-Signature") ?? null,
+    timestamp: c.req.header("X-Queue-Timestamp") ?? null,
+    keyId: c.req.header("X-Queue-Key-Id") ?? null,
+  });
+  if (!ok) return c.json({ error: "unauthorized" }, 401);
 
-  const expected = await jobAuth(token, id);
-  const got = c.req.header("X-Job-Auth") ?? "";
-  // Fixed-width hex on both sides; compare without early exit.
-  let diff = got.length ^ expected.length;
-  for (let i = 0; i < got.length && i < expected.length; i++) {
-    diff |= got.charCodeAt(i) ^ expected.charCodeAt(i);
+  let body: { mail_id?: number; from?: string };
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return c.json({ error: "bad_request" }, 400);
   }
-  if (diff !== 0) return c.json({ error: "unauthorized" }, 401);
+  const id = Number(body.mail_id);
+  if (!Number.isFinite(id)) return c.json({ error: "bad_request" }, 400);
 
   const r = await sendMailNow(c, id, body.from);
   return c.json(r.body, r.status);

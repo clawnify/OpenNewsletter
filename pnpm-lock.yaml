@@ -17,6 +17,9 @@ importers:
       '@clawnify/db':
         specifier: ^0.4.1
         version: 0.4.1(@cloudflare/workers-types@4.20260601.1)(@opentelemetry/api@1.9.1)
+      '@clawnify/queue':
+        specifier: ^0.1.0
+        version: 0.1.0
       '@fontsource-variable/geist':
         specifier: ^5.2.9
         version: 5.2.9
@@ -303,6 +306,9 @@ packages:
 
   '@clawnify/integrations@0.2.2':
     resolution: {integrity: sha512-st7m8+zszpskeaj599kepIz8LSX0ASTkJThJ7gNGuOG7Ra9sn3ui+1P9kkKo8opYOXGOnLxYpAX2n8zRKkY26w==}
+
+  '@clawnify/queue@0.1.0':
+    resolution: {integrity: sha512-ActuyaeleK8HDe6iVfNO0xET67Ovkg3Ysix8embMFsBSnbCkfkdkYOi5Qq5fp7h6FU2DvBrEc/kFrjv/CoeeqA==}
 
   '@cloudflare/kv-asset-handler@0.5.0':
     resolution: {integrity: sha512-jxQYkj8dSIzc0cD6cMMNdOc1UVjqSqu8BZdor5s8cGjW2I8BjODt/kWPVdY+u9zj3ms75Q5qaZgnxUad83+eAg==}
@@ -4759,6 +4765,8 @@ snapshots:
       - sqlite3
 
   '@clawnify/integrations@0.2.2': {}
+
+  '@clawnify/queue@0.1.0': {}
 
   '@cloudflare/kv-asset-handler@0.5.0': {}
 
