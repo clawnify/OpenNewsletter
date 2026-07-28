@@ -126,11 +126,23 @@ export interface ResendAudience {
   contact_count?: number;
 }
 
+/**
+ * A subscriber. Named for Resend historically; contacts are now stored locally
+ * in D1 (see server/contacts.ts) and this shape mirrors that table — the name
+ * is left alone only to avoid churning every import in one pass.
+ */
 export interface ResendContact {
   id: string;
   email: string;
   first_name?: string;
   last_name?: string;
-  unsubscribed?: boolean;
+  /**
+   * Consent state. Replaces the old boolean `unsubscribed`: "not unsubscribed"
+   * and "confirmed opt-in" are different things, and only `subscribed` is ever
+   * mailed. `pending` means they signed up but never clicked the confirmation.
+   */
+  status?: "pending" | "subscribed" | "unsubscribed" | "bounced";
+  consent_source?: string;
+  consent_at?: string | null;
   created_at?: string;
 }

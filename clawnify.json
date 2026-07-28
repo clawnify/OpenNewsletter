@@ -2,7 +2,7 @@
   "$schema": "https://app.clawnify.com/schema/v1/clawnify.json",
   "name": "Open Newsletter",
   "icon": "icon.svg",
-  "description": "Generation-first newsletter studio. Draft issues with AI, design them with live DESIGN.md tokens, and send to your audience via Resend. An open-source alternative to Mailchimp, beehiiv, Substack, and ConvertKit.",
+  "description": "Generation-first newsletter studio. Draft issues with AI, design them with live DESIGN.md tokens, and send to a subscriber list you own. An open-source alternative to Mailchimp, beehiiv, Substack, and ConvertKit.",
   "template": {
     "displayName": "Newsletter",
     "category": "Marketing"
@@ -11,7 +11,16 @@
     "framework": "react+hono",
     "database": true,
     "storage": true,
-    "credentials": ["resend"]
+    "credentials": ["resend"],
+    "api": {
+      "public_routes": [
+        "/api/subscribe",
+        "/api/confirm",
+        "/api/unsubscribe",
+        "/widget.js",
+        "/api/jobs/send-mail"
+      ]
+    }
   },
   "env": {
     "oneOf": [["OPENROUTER_API_KEY"]],
