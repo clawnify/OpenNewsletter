@@ -17,6 +17,12 @@ export interface RenderOpts {
   forEmail?: boolean;
   mobile?: Partial<DesignTokens> | null;
   logo?: string;
+  /**
+   * This subscriber's unsubscribe URL, rendered into the footer. Per-recipient:
+   * a shared link would let whoever clicks it unsubscribe the whole list.
+   * Omitted for previews and test sends, which fall back to a dead link.
+   */
+  unsubscribeUrl?: string;
 }
 
 function esc(s: string): string {
@@ -111,7 +117,11 @@ export function renderInner(mail: Mail, d: DesignTokens, settings: Settings, opt
   for (const b of mail.blocks || []) rows.push(`<tr><td style="padding:${space}px 0 0;">${renderBlock(b, d)}</td></tr>`);
 
   if (d.options.showFooter) {
-    const unsub = opts.forEmail ? `{{{RESEND_UNSUBSCRIBE_URL}}}` : "#";
+    // Was `{{{RESEND_UNSUBSCRIBE_URL}}}`, a Resend-Broadcasts-only variable —
+    // a dead literal now that sends are per-recipient. The app hosts its own
+    // unsubscribe page instead, so the link is the publication's, not a
+    // third party's.
+    const unsub = opts.unsubscribeUrl || "#";
     const footerText = settings.footer_text || `You're receiving this because you subscribed to ${settings.publication_name || "our newsletter"}.`;
     rows.push(
       `<tr><td style="padding:${space + 8}px 0 0;"><div style="font-family:${body};font-size:12px;line-height:1.5;color:${d.colors.secondary};border-top:1px solid ${d.colors.border};padding-top:${space}px;">` +

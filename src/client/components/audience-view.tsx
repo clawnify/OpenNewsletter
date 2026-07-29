@@ -119,7 +119,20 @@ export function AudienceView() {
                     <div className="truncate text-xs text-muted-foreground">{[c.first_name, c.last_name].filter(Boolean).join(" ")}</div>
                   ) : null}
                 </div>
-                {c.unsubscribed ? <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">Unsub</span> : null}
+                {c.status && c.status !== "subscribed" ? (
+                  <span
+                    className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground"
+                    title={
+                      c.status === "pending"
+                        ? "Signed up but hasn't confirmed — not included in sends"
+                        : c.status === "bounced"
+                          ? "Delivery failed permanently"
+                          : "Unsubscribed"
+                    }
+                  >
+                    {c.status === "pending" ? "Pending" : c.status === "bounced" ? "Bounced" : "Unsub"}
+                  </span>
+                ) : null}
                 <button className="rounded-lg p-2 text-muted-foreground hover:text-destructive" onClick={() => remove(c.id)} aria-label="Remove contact">
                   <Trash2 size={15} />
                 </button>

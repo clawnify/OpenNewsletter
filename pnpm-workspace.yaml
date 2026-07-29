@@ -1,0 +1,5 @@
+allowBuilds:
+  esbuild: set this to true or false
+  workerd: set this to true or false
+minimumReleaseAgeExclude:
+  - '@clawnify/queue@0.1.0'

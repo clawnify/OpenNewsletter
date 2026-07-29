@@ -1,51 +1,75 @@
 /**
- * Email-provider abstraction. The app talks to this interface; a
- * concrete provider (currently only Resend) maps it to a vendor API.
+ * Email-provider abstraction. The app talks to this interface; a concrete
+ * provider maps it to a vendor API.
  *
- * Designed so a second provider (Loops, Mailchimp, …) is a new file
- * implementing this interface + one line in `providers/index.ts` — no
- * changes to routes or UI. Only Resend is wired today.
- *
- * Domain vocabulary: we call a recipient list an **audience**. Resend
- * has renamed these to "segments" internally, so the Resend adapter
- * maps `audienceId` → `segment_id`.
+ * Deliberately **send-only**. It used to carry audiences, contacts and
+ * broadcasts, which locked the app to providers that host subscriber lists and
+ * left the publication's own list sitting in a third-party account. Contacts
+ * now live in D1 (see ../contacts.ts), so a provider's only job is delivery —
+ * which is what makes the backend genuinely swappable.
  */
-import type { ResendAudience, ResendContact } from "../../shared/types";
 
 export interface SendResult {
   id: string;
 }
 
-export interface NewContact {
-  email: string;
-  first_name?: string;
-  last_name?: string;
-}
-
-export interface CreateBroadcastInput {
-  audienceId: string;
+export interface SendEmailInput {
   from: string;
+  to: string;
   subject: string;
   html: string;
 }
 
+/**
+ * One recipient of a bulk send, carrying its own rendered body.
+ *
+ * Per-recipient rather than one shared body because the unsubscribe link in
+ * the footer has to identify *this* subscriber — a shared link would let
+ * whoever clicks it unsubscribe everyone on the list.
+ */
+export interface BulkRecipient {
+  email: string;
+  html: string;
+  /**
+   * This subscriber's unsubscribe URL. Already embedded in `html`; passed
+   * separately so a provider that has to add the List-Unsubscribe header
+   * itself doesn't have to scrape it back out of the markup.
+   */
+  unsubscribeUrl: string;
+}
+
+export interface SendBulkInput {
+  from: string;
+  subject: string;
+  recipients: BulkRecipient[];
+  /**
+   * Stable identifier for the list being mailed — the audience id. Scopes
+   * unsubscribes, so it must never change for a given list: a new key silently
+   * detaches every prior opt-out and starts mailing people who left.
+   */
+  listKey: string;
+}
+
+export interface SendBulkResult {
+  sent: string[];
+  /** Recipients the backend refused because they had already unsubscribed. */
+  suppressed: string[];
+  failed: { email: string; error: string }[];
+}
+
 export interface EmailProvider {
-  /** Provider id, e.g. "resend". */
+  /** Provider id, e.g. "clawnify" or "resend". */
   readonly name: string;
-
-  // ── Audience / contacts ──
-  listAudiences(): Promise<ResendAudience[]>;
-  /** Verified sending domains on the provider account (status: "verified", …). */
+  /**
+   * Whether the backend enforces unsubscribes itself and adds the RFC 8058
+   * List-Unsubscribe headers. When false the app is solely responsible for
+   * both — its own footer link and its own suppression check.
+   */
+  readonly managesUnsubscribes: boolean;
+  /** Verified sending domains on the account (status: "verified", …). */
   listDomains(): Promise<{ name: string; status: string }[]>;
-  listContacts(audienceId: string): Promise<ResendContact[]>;
-  addContact(audienceId: string, contact: NewContact): Promise<ResendContact>;
-  removeContact(audienceId: string, contactId: string): Promise<void>;
-
-  // ── Sending ──
   /** Send a one-off email (used for "send test"). */
-  sendEmail(input: { from: string; to: string; subject: string; html: string }): Promise<SendResult>;
-  /** Create a broadcast draft to an audience; returns its id. */
-  createBroadcast(input: CreateBroadcastInput): Promise<SendResult>;
-  /** Trigger a created broadcast, optionally scheduled (natural language or ISO). */
-  sendBroadcast(broadcastId: string, scheduledAt?: string | null): Promise<void>;
+  sendEmail(input: SendEmailInput): Promise<SendResult>;
+  /** Send one message per recipient. */
+  sendBulk(input: SendBulkInput): Promise<SendBulkResult>;
 }
