@@ -6,13 +6,16 @@
 
 A **generation-first newsletter studio**. Describe a newsletter and let AI draft
 it, design it live with [DESIGN.md](https://github.com/google-labs-code/design.md)
-tokens, and send it to your audience through **Resend**. Built with
+tokens, and send it to a subscriber list **you own**. Built with
 **React + Tailwind CSS + Hono + D1**, deploys to Cloudflare Workers via
 [Clawnify](https://clawnify.com).
 
 A self-hostable, open-source alternative to **Mailchimp**, **beehiiv**,
 **Substack**, and **ConvertKit** — the AI editor, the brand controls, and the
 sending pipeline, fully yours. No per-subscriber pricing, no lock-in.
+
+Your contacts live in **your own database**, not in a sending provider's
+account. The provider is just delivery, and it's swappable.
 
 ## Features
 
@@ -25,10 +28,17 @@ sending pipeline, fully yours. No per-subscriber pricing, no lock-in.
   renderer exactly.
 - **Template library** — three shipped looks (Classic Editorial, Minimal
   Mono, Bold Bulletin); **Save as…** turns any mail into your own template.
-- **Resend sending** — send to a Resend audience (broadcast), send a test to
-  yourself, or schedule for later. Manage contacts from the Audience view.
-- **Email-safe rendering** — table-wrapped, inline-styled HTML with an
-  unsubscribe footer (`{{{RESEND_UNSUBSCRIBE_URL}}}`).
+- **Your subscriber list, in your database** — audiences and contacts live in
+  D1. Manage them from the Audience view; export them whenever you like.
+- **Double opt-in** — signups land as `pending` and only become subscribers
+  when the person confirms by email. Only confirmed contacts are ever sent to,
+  so an import can't quietly start mailing people who never asked.
+- **Embeddable signup widget** — drop `<script src=".../widget.js">` on your
+  own site; it starts the same opt-in flow.
+- **Sending** — send now, or send a test to yourself. Bring your own API key.
+- **Email-safe rendering** — table-wrapped, inline-styled HTML with a
+  per-subscriber unsubscribe footer, plus the `List-Unsubscribe` headers
+  mailbox providers expect from bulk senders.
 
 ## How it works
 
@@ -39,9 +49,14 @@ flowchart TD
     mail --> renderer["renderer"]
     tokens["DESIGN.md tokens"] --> renderer
     renderer --> html["email-safe HTML"]
-    html --> broadcast["Resend broadcast"]
-    broadcast --> audience(["your audience"])
+    contacts[("Contacts · D1")] --> send["one message per subscriber"]
+    html --> send
+    send --> provider["your sending provider"]
 ```
+
+One message per subscriber rather than a single broadcast, so each carries its
+own unsubscribe link — a shared link would let whoever clicks it unsubscribe
+everyone.
 
 A **template** = a `DESIGN.md` token set + a content skeleton. Each mail can
 override the template's tokens; the design panel edits that override live and
@@ -53,8 +68,8 @@ override the template's tokens; the design panel edits that override live and
 |-------|-----------|
 | **Frontend** | React, TypeScript, Tailwind CSS v4, Vite, shadcn/ui |
 | **Backend** | Hono (Cloudflare Worker) |
-| **Database** | D1 (mails, templates, settings) |
-| **Email** | Resend (Broadcasts + Contacts API) |
+| **Database** | D1 (mails, templates, settings, audiences, contacts) |
+| **Email** | Bring your own provider — Resend wired today |
 | **AI** | OpenRouter (configurable model) |
 | **Icons** | Lucide |
 
@@ -88,9 +103,30 @@ Restart `pnpm dev` after editing `.dev.vars`.
 ### Sender setup
 
 In **Settings**, set your publication name and a **from address on a domain
-you've verified in Resend**. Audiences are Resend's "segments" — create one in
-the [Resend dashboard](https://resend.com/audiences), then it appears in the
-Audience view and the send dialog.
+you've verified with your sending provider**. Sending is refused from an
+unverified domain, and you'll be told which one and where to fix it.
+
+Audiences and contacts are yours — create an audience in the **Audience** view;
+no provider dashboard involved.
+
+### Growing the list
+
+Point people at the embeddable widget, or `POST /api/subscribe` from your own
+form:
+
+```html
+<div data-newsletter-subscribe></div>
+<script src="https://<your-app>/widget.js"></script>
+```
+
+Either way it's **double opt-in**: the contact is created `pending` and only
+becomes a subscriber once they click the confirmation link. Sends go to
+confirmed subscribers only.
+
+Adding someone by hand from the Audience view also lands them `pending`. If
+you're migrating a list that already has recorded consent, pass
+`consent_evidence` to `POST /api/audiences/:id/contacts` to record how it was
+obtained and mark them subscribed.
 
 ## Deploy (Clawnify)
 
@@ -102,7 +138,7 @@ npx clawnify deploy
 
 | Env | Required | Purpose |
 |-----|----------|---------|
-| `RESEND_API_KEY` | yes | Send broadcasts + manage contacts |
+| `RESEND_API_KEY` | for sending | Your own key — delivery only; contacts stay in D1 |
 | `OPENROUTER_API_KEY` | for AI | The Generate button |
 | `NEWSLETTER_MODEL` | no | Override the generation model |
 
@@ -117,12 +153,14 @@ src/
     design.ts        — DESIGN.md token model, panel metadata, CSS-var + serializer
     templates.ts     — built-in templates (runtime mirror of templates/*/DESIGN.md)
     markdown.ts      — email-safe Markdown → HTML
-    types.ts         — Mail, Template, Settings, Resend types
+    types.ts         — Mail, Template, Settings, Contact types
   server/
-    index.ts         — Hono API (mails, templates, settings, audiences, generate, send)
+    index.ts         — Hono API (mails, templates, settings, audiences,
+                       subscribe/confirm/unsubscribe, widget, generate, send)
+    contacts.ts      — audiences + contacts + the consent lifecycle
     render.ts        — mail + tokens → email-safe inlined HTML
     ai.ts            — OpenRouter generation
-    providers/       — EmailProvider interface + Resend adapter (add providers here)
+    providers/       — EmailProvider interface (send-only) + adapters
     schema.sql       — D1 schema
   client/
     app.tsx          — shell + nav
