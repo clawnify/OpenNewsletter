@@ -11,16 +11,16 @@
     "framework": "react+hono",
     "database": true,
     "storage": true,
-    "credentials": ["resend"],
-    "api": {
-      "public_routes": [
-        "/api/subscribe",
-        "/api/confirm",
-        "/api/unsubscribe",
-        "/widget.js",
-        "/api/jobs/send-mail"
-      ]
-    }
+    "credentials": ["resend"]
+  },
+  "api": {
+    "public_routes": [
+      { "path": "/api/subscribe", "methods": ["POST", "OPTIONS"] },
+      { "path": "/api/confirm", "methods": ["GET"] },
+      { "path": "/api/unsubscribe", "methods": ["GET", "POST"] },
+      { "path": "/widget.js", "methods": ["GET"] },
+      { "path": "/api/jobs/send-mail", "methods": ["POST"] }
+    ]
   },
   "env": {
     "oneOf": [["OPENROUTER_API_KEY"]],
