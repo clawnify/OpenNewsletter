@@ -6,6 +6,7 @@ import * as contacts from "./contacts";
 import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
+import { sendVerdict } from "./schedule";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle } from "../shared/blocks";
@@ -832,11 +833,23 @@ async function enqueueSend(c: any, mailId: number, runAt: string, from: string):
   const origin = new URL(c.req.url).origin;
   await enqueueJob(c.env, {
     targetUrl: `${origin}/api/jobs/send-mail`,
-    payload: { mail_id: mailId, from },
+    // scheduled_for is what the callback compares against the mail row to
+    // decide whether this job is still the operator's current intent.
+    payload: { mail_id: mailId, from, scheduled_for: runAt },
     runAt,
-    // Re-scheduling the same issue replaces rather than stacks, so an operator
-    // changing their mind twice doesn't send it twice.
-    idempotencyKey: `send-mail-${mailId}`,
+    // Keyed on the issue AND its time. Scheduling the same issue for the same
+    // instant twice dedupes (a double-click); moving it creates a genuinely new
+    // job, which is the only way a reschedule can ever fire at the new time.
+    //
+    // It previously keyed on the issue alone, with the comment "re-scheduling
+    // replaces rather than stacks". It does not replace: the platform's unique
+    // index is (org_id, idempotency_key) with no status predicate, so a repeat
+    // returns the EXISTING row untouched — original run_at and all. The API
+    // answered 200, this app then wrote the new scheduled_at, the UI showed the
+    // new time, and the issue went out at the old one.
+    //
+    // The old job still exists and still fires; sendVerdict() is what stops it.
+    idempotencyKey: `send-mail-${mailId}@${runAt}`,
   });
 }
 
@@ -849,13 +862,32 @@ async function sendMailNow(
   c: any,
   id: number,
   fromOverride?: string,
+  // Set only on the queue path, to the instant that job was created to fire at
+  // (null for pre-existing jobs whose payload predates the field). undefined
+  // means an operator pressed send just now, which needs no such check — they
+  // are looking at the issue and their intent is the request itself.
+  scheduledFor?: string | null,
 ): Promise<{ status: 200 | 400 | 404 | 502; body: Record<string, unknown> }> {
-  const p = await provider(c);
-  if (!p) return { status: 400, body: { error: "No sending backend is configured." } };
-
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   if (!row) return { status: 404, body: { error: "Not found" } };
   const mail = parseMail(row);
+
+  // Before anything with a side effect or a cost: is this job still wanted?
+  // 200 deliberately — a superseded job did the right thing by not sending, and
+  // any non-2xx would have the platform retry it with backoff and finally
+  // record a failure for correct behaviour.
+  if (scheduledFor !== undefined) {
+    const verdict = sendVerdict(
+      { status: String(row.status ?? ""), scheduled_at: row.scheduled_at ?? null },
+      scheduledFor,
+    );
+    if (!verdict.send) {
+      return { status: 200, body: { ok: true, skipped: verdict.reason, sent: 0 } };
+    }
+  }
+
+  const p = await provider(c);
+  if (!p) return { status: 400, body: { error: "No sending backend is configured." } };
   if (!mail.audience_id) {
     return { status: 400, body: { error: "Pick an audience before sending." } };
   }
@@ -1002,7 +1034,7 @@ app.post("/api/jobs/send-mail", async (c) => {
   });
   if (!ok) return c.json({ error: "unauthorized" }, 401);
 
-  let body: { mail_id?: number; from?: string };
+  let body: { mail_id?: number; from?: string; scheduled_for?: string };
   try {
     body = JSON.parse(raw);
   } catch {
@@ -1011,7 +1043,10 @@ app.post("/api/jobs/send-mail", async (c) => {
   const id = Number(body.mail_id);
   if (!Number.isFinite(id)) return c.json({ error: "bad_request" }, 400);
 
-  const r = await sendMailNow(c, id, body.from);
+  // Jobs enqueued before the payload carried scheduled_for are still in flight
+  // across this deploy. null keeps their status guards and skips only the
+  // timestamp compare they cannot answer — see sendVerdict.
+  const r = await sendMailNow(c, id, body.from, body.scheduled_for ?? null);
   return c.json(r.body, r.status);
 });
 
