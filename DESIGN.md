@@ -1,7 +1,7 @@
 ---
 version: alpha
 name: Classic Editorial
-description: The default newsletter brand for Open Newsletter. A quiet, editorial look — serif headlines, generous line-height, a single accent color for rules and buttons. Each issue and each saved template carries its own DESIGN.md tokens that override these.
+description: The default newsletter brand for OpenNewsletter. A quiet, editorial look — serif headlines, generous line-height, a single accent color for rules and buttons. Each issue and each saved template carries its own DESIGN.md tokens that override these.
 colors:
   background: "#FFFFFF"
   foreground: "#111111"
@@ -31,7 +31,7 @@ options:
 
 # Classic Editorial
 
-The platform-default brand for newsletters created in **Open Newsletter**.
+The platform-default brand for newsletters created in **OpenNewsletter**.
 The format follows [Google Labs' DESIGN.md spec](https://github.com/google-labs-code/design.md):
 tokens in the YAML frontmatter give the renderer exact values; the prose
 below explains *when* to use each token and when to deviate.

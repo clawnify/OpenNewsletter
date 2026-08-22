@@ -1,6 +1,6 @@
 {
   "$schema": "https://app.clawnify.com/schema/v1/clawnify.json",
-  "name": "Open Newsletter",
+  "name": "OpenNewsletter",
   "icon": "icon.svg",
   "description": "Generation-first newsletter studio. Draft issues with AI, design them with live DESIGN.md tokens, and send to a subscriber list you own. An open-source alternative to Mailchimp, beehiiv, Substack, and ConvertKit.",
   "template": {
