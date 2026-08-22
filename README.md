@@ -1,6 +1,6 @@
-<img src="readme-banner.png" alt="Open Newsletter preview" width="100%" />
+<img src="readme-banner.png" alt="OpenNewsletter preview" width="100%" />
 
-# Open Newsletter — The Open-Source Mailchimp & beehiiv Alternative
+# OpenNewsletter — The Open-Source Mailchimp & beehiiv Alternative
 
 [![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-newsletter)
 
