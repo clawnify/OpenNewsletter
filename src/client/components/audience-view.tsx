@@ -58,25 +58,13 @@ export function AudienceView() {
     }
   };
 
-  if (!status?.resend_connected) {
-    return (
-      <div className="mx-auto max-w-3xl px-8 py-8">
-        <h1 className="text-2xl font-semibold">Audience</h1>
-        <div className="mt-4 rounded-2xl border bg-background p-6 text-sm text-muted-foreground">
-          Connect Resend to manage your audience. Add <code className="rounded bg-muted px-1">RESEND_API_KEY</code> to your
-          Clawnify environment, then reload. Audiences (Resend “segments”) are the source of truth — this view reads and
-          writes them directly.
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="mx-auto max-w-4xl px-8 py-8">
       <header className="mb-6 flex items-end justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Audience</h1>
-          <p className="text-sm text-muted-foreground">Subscribers live in Resend. Pick an audience to manage its contacts.</p>
+          <p className="text-sm text-muted-foreground">Your subscribers, stored in this app. Only confirmed contacts receive sends.</p>
         </div>
         <Button variant="outline" size="icon" onClick={() => load(selected)} aria-label="Refresh">
           <RefreshCw size={16} />
@@ -86,7 +74,7 @@ export function AudienceView() {
       <div className="mb-4 w-72">
         <Select value={selected} onValueChange={setSelected}>
           <SelectTrigger>
-            <SelectValue placeholder={audiences.length ? "Select audience" : "No audiences — create one in Resend"} />
+            <SelectValue placeholder={audiences.length ? "Select audience" : "No audiences yet"} />
           </SelectTrigger>
           <SelectContent>
             {audiences.map((a: ResendAudience) => (
