@@ -58,14 +58,8 @@ export interface SendBulkResult {
 }
 
 export interface EmailProvider {
-  /** Provider id, e.g. "clawnify" or "resend". */
+  /** Provider id, e.g. "resend". */
   readonly name: string;
-  /**
-   * Whether the backend enforces unsubscribes itself and adds the RFC 8058
-   * List-Unsubscribe headers. When false the app is solely responsible for
-   * both — its own footer link and its own suppression check.
-   */
-  readonly managesUnsubscribes: boolean;
   /** Verified sending domains on the account (status: "verified", …). */
   listDomains(): Promise<{ name: string; status: string }[]>;
   /** Send a one-off email (used for "send test"). */

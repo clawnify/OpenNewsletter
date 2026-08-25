@@ -203,7 +203,6 @@ app.get("/api/status", async (c) => {
   return c.json({
     resend_connected: !!provider,
     provider: provider?.name ?? null,
-    manages_unsubscribes: provider?.managesUnsubscribes ?? false,
     ai_available: !!env.OPENROUTER_API_KEY,
     github_connected: !!env.GITHUB_TOKEN,
     audiences,

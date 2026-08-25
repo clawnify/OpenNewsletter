@@ -27,7 +27,6 @@ const CONCURRENCY = 4;
 
 export class ResendProvider implements EmailProvider {
   readonly name = "resend";
-  readonly managesUnsubscribes = false;
 
   constructor(private apiKey: string) {}
 

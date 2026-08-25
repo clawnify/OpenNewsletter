@@ -47,7 +47,7 @@ export function SettingsView() {
 
       <section className="mt-6 space-y-2 rounded-2xl border bg-background p-5">
         <h2 className="text-sm font-semibold">Connections</h2>
-        <Status ok={!!status?.resend_connected} label="Resend" detail={status?.resend_connected ? `${status.audiences.length} audience(s)` : "Connect Resend in your Clawnify dashboard (Settings → Integrations), or set RESEND_API_KEY"} />
+        <Status ok={!!status?.resend_connected} label="Resend" detail={status?.resend_connected ? "Connected" : "Connect Resend in your Clawnify dashboard (Settings → Integrations), or set RESEND_API_KEY"} />
         <Status ok={!!status?.ai_available} label="AI generation (OpenRouter)" detail={status?.ai_available ? "Ready" : "Set OPENROUTER_API_KEY to enable Generate"} />
         <Status
           ok={!!status?.github_connected}
