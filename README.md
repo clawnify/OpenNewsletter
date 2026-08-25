@@ -1,8 +1,8 @@
-<img src="readme-banner.png" alt="Open Newsletter preview" width="100%" />
+<img src="readme-banner.png" alt="OpenNewsletter preview" width="100%" />
 
-# Open Newsletter — The Open-Source Mailchimp & beehiiv Alternative
+# OpenNewsletter — The Open-Source Mailchimp & beehiiv Alternative
 
-[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-newsletter)
+[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/OpenNewsletter)
 
 A **generation-first newsletter studio**. Describe a newsletter and let AI draft
 it, design it live with [DESIGN.md](https://github.com/google-labs-code/design.md)
@@ -76,7 +76,7 @@ override the template's tokens; the design panel edits that override live and
 ## Quickstart
 
 ```bash
-git clone https://github.com/clawnify/open-newsletter.git
+git clone https://github.com/clawnify/OpenNewsletter.git
 cd open-newsletter
 pnpm install
 pnpm dev          # Vite on :5173, Worker + local D1 on :8787

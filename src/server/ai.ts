@@ -52,7 +52,7 @@ export async function generateDraft(env: Record<string, string>, input: GenInput
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
       "HTTP-Referer": "https://clawnify.com",
-      "X-Title": "Open Newsletter",
+      "X-Title": "OpenNewsletter",
     },
     body: JSON.stringify({
       model,
@@ -94,7 +94,7 @@ export async function completeText(env: Record<string, string>, system: string, 
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
       "HTTP-Referer": "https://clawnify.com",
-      "X-Title": "Open Newsletter",
+      "X-Title": "OpenNewsletter",
     },
     body: JSON.stringify({
       model,
@@ -164,7 +164,7 @@ Content rules by type:
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
       "HTTP-Referer": "https://clawnify.com",
-      "X-Title": "Open Newsletter",
+      "X-Title": "OpenNewsletter",
     },
     body: JSON.stringify({
       model,
@@ -229,7 +229,7 @@ export async function generateField(env: Record<string, string>, input: FieldInp
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
       "HTTP-Referer": "https://clawnify.com",
-      "X-Title": "Open Newsletter",
+      "X-Title": "OpenNewsletter",
     },
     body: JSON.stringify({
       model,
