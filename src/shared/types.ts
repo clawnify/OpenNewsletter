@@ -117,6 +117,8 @@ export interface StatusInfo {
   resend_connected: boolean;
   ai_available: boolean;
   github_connected: boolean;
+  /** A CRM in the same workspace is reachable; enables "Import from CRM". */
+  crm_connected?: boolean;
   audiences: ResendAudience[];
 }
 
@@ -144,5 +146,7 @@ export interface ResendContact {
   status?: "pending" | "subscribed" | "unsubscribed" | "bounced";
   consent_source?: string;
   consent_at?: string | null;
+  /** Set when imported from the workspace CRM; the CRM keeps the person. */
+  crm_contact_id?: string | null;
   created_at?: string;
 }

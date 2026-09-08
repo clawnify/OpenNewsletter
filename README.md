@@ -128,6 +128,26 @@ you're migrating a list that already has recorded consent, pass
 `consent_evidence` to `POST /api/audiences/:id/contacts` to record how it was
 obtained and mark them subscribed.
 
+### Importing from your CRM
+
+When OpenNewsletter runs next to a CRM in the same Clawnify workspace, set
+`CRM_APP_ID` to that app's id (a bundle install does this for you) and the
+Audience view gains **Import from CRM**. It reads contacts live from the CRM,
+lets you pick them, and asks how they agreed to hear from you before anyone is
+imported. That sentence is stored on every row as `consent_evidence` with
+`consent_source = 'crm_sync'`, and the CRM contact id is kept, so an
+unsubscribe here leaves a note on that person's CRM timeline.
+
+The CRM stays the system of record for the person. This app stays the system
+of record for consent and membership. Nothing is mailed straight out of the
+CRM, and people who unsubscribed here are never re-imported.
+
+- `GET /api/crm/contacts?search=&page=&audience_id=` — the picker's read
+- `POST /api/audiences/:id/import-crm { contact_ids, consent_evidence }` — up to 200 at a time; evidence is required
+
+Without `CRM_APP_ID` neither route exists and the app behaves as a single
+install.
+
 ## Deploy (Clawnify)
 
 ```bash

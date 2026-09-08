@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, RefreshCw } from "lucide-react";
+import { Plus, Trash2, RefreshCw, Database } from "lucide-react";
 import { api } from "../api";
 import { useStore } from "../store";
 import type { ResendAudience, ResendContact } from "../../shared/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { CrmImportDialog } from "./crm-import-dialog";
 
 export function AudienceView() {
   const { status, setError } = useStore();
@@ -15,6 +16,7 @@ export function AudienceView() {
   const [loading, setLoading] = useState(false);
   const [email, setEmail] = useState("");
   const [first, setFirst] = useState("");
+  const [crmOpen, setCrmOpen] = useState(false);
 
   useEffect(() => {
     if (!selected && audiences.length) setSelected(audiences[0].id);
@@ -66,10 +68,27 @@ export function AudienceView() {
           <h1 className="text-2xl font-semibold">Audience</h1>
           <p className="text-sm text-muted-foreground">Your subscribers, stored in this app. Only confirmed contacts receive sends.</p>
         </div>
-        <Button variant="outline" size="icon" onClick={() => load(selected)} aria-label="Refresh">
-          <RefreshCw size={16} />
-        </Button>
+        <div className="flex items-center gap-2">
+          {status?.crm_connected ? (
+            <Button variant="outline" disabled={!selected} onClick={() => setCrmOpen(true)}>
+              <Database size={15} /> Import from CRM
+            </Button>
+          ) : null}
+          <Button variant="outline" size="icon" onClick={() => load(selected)} aria-label="Refresh">
+            <RefreshCw size={16} />
+          </Button>
+        </div>
       </header>
+
+      {status?.crm_connected && selected ? (
+        <CrmImportDialog
+          open={crmOpen}
+          onOpenChange={setCrmOpen}
+          audienceId={selected}
+          audienceName={audiences.find((a: ResendAudience) => a.id === selected)?.name ?? ""}
+          onImported={() => load(selected)}
+        />
+      ) : null}
 
       <div className="mb-4 w-72">
         <Select value={selected} onValueChange={setSelected}>
@@ -107,6 +126,11 @@ export function AudienceView() {
                     <div className="truncate text-xs text-muted-foreground">{[c.first_name, c.last_name].filter(Boolean).join(" ")}</div>
                   ) : null}
                 </div>
+                {c.consent_source === "crm_sync" ? (
+                  <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground" title="Imported from your CRM with recorded consent">
+                    CRM
+                  </span>
+                ) : null}
                 {c.status && c.status !== "subscribed" ? (
                   <span
                     className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground"

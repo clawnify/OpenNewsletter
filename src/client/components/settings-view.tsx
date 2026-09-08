@@ -50,6 +50,15 @@ export function SettingsView() {
         <Status ok={!!status?.resend_connected} label="Resend" detail={status?.resend_connected ? "Connected" : "Connect Resend in your Clawnify dashboard (Settings → Integrations), or set RESEND_API_KEY"} />
         <Status ok={!!status?.ai_available} label="AI generation (OpenRouter)" detail={status?.ai_available ? "Ready" : "Set OPENROUTER_API_KEY to enable Generate"} />
         <Status
+          ok={!!status?.crm_connected}
+          label="CRM"
+          detail={
+            status?.crm_connected
+              ? "Connected — import contacts from your CRM in the Audience view"
+              : "Installed with a CRM in the same workspace, this app can import contacts from it"
+          }
+        />
+        <Status
           ok={!!status?.github_connected}
           label="GitHub (Hints)"
           detail={
