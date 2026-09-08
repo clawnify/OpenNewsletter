@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.196",
+    "@clawnify/app": "^0.2.0",
     "@clawnify/connections": "^0.3.0",
     "@clawnify/db": "^0.4.1",
     "@clawnify/queue": "^0.1.0",
