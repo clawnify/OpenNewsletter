@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { crmConfigured, crmProxyUrl, pickIds, validateEvidence, MAX_IMPORT } from "./crm";
+import { crmConfigured, crmProxyUrl, pickIds, unwrapContact, validateEvidence, MAX_IMPORT } from "./crm";
 
 describe("crm", () => {
   it("is connected only when both the app id and the org token are present", () => {
@@ -30,5 +30,13 @@ describe("crm", () => {
     expect(pickIds("x")).toBeNull();
     expect(pickIds(["a", " a ", "b", 3, ""])).toEqual(["a", "b"]);
     expect(pickIds(Array.from({ length: MAX_IMPORT + 1 }, (_, i) => `c${i}`))).toBeNull();
+  });
+
+  it("unwraps the CRM's { contact } envelope and rejects anything without an id", () => {
+    const row = { id: "c1", first_name: "Ada", last_name: "Lovelace", email: "ada@example.com" };
+    expect(unwrapContact({ contact: row })).toEqual(row);
+    expect(unwrapContact(row)).toEqual(row);
+    expect(unwrapContact({ error: "Not found" })).toBeNull();
+    expect(unwrapContact(null)).toBeNull();
   });
 });

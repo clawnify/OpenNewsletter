@@ -96,10 +96,18 @@ export async function listCrmContacts(
   return crmFetch<CrmPage>(env, `/api/contacts?${q.toString()}`);
 }
 
+/** The CRM answers single-contact reads as `{ contact }`; lists as `{ contacts }`. */
+export function unwrapContact(data: unknown): CrmContact | null {
+  if (!data || typeof data !== "object") return null;
+  const d = data as { contact?: unknown; id?: unknown };
+  const row = (d.contact && typeof d.contact === "object" ? d.contact : d) as { id?: unknown };
+  return typeof row.id === "string" ? (row as CrmContact) : null;
+}
+
 /** Re-read each picked contact from the CRM so the import records what the CRM holds, not what a form posted. */
 export async function getCrmContact(env: CrmEnv, id: string): Promise<CrmContact | null> {
   try {
-    return await crmFetch<CrmContact>(env, `/api/contacts/${encodeURIComponent(id)}`);
+    return unwrapContact(await crmFetch<unknown>(env, `/api/contacts/${encodeURIComponent(id)}`));
   } catch {
     return null;
   }
