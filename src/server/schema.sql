@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS contacts (
   -- Double opt-in token; cleared once confirmed.
   confirm_token TEXT,
   unsubscribed_at TEXT,
+  -- Set when the row was imported from the workspace's CRM: the CRM keeps the
+  -- person, this row keeps the consent, and the id lets unsubscribes report
+  -- back to the CRM timeline.
+  crm_contact_id TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -93,5 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_mails_updated ON mails(updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_email ON contacts(audience_id, email);
 -- Drives "who gets this send" — the only hot query on this table.
 CREATE INDEX IF NOT EXISTS idx_contacts_status ON contacts(audience_id, status);
+CREATE INDEX IF NOT EXISTS idx_contacts_crm ON contacts(audience_id, crm_contact_id)
+  WHERE crm_contact_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_confirm
   ON contacts(confirm_token) WHERE confirm_token IS NOT NULL;

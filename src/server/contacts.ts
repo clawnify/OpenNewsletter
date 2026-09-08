@@ -37,11 +37,12 @@ export interface Contact {
   consent_source: ConsentSource;
   consent_at: string | null;
   unsubscribed_at: string | null;
+  crm_contact_id: string | null;
   created_at: string;
 }
 
 const CONTACT_COLS =
-  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, created_at";
+  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, created_at";
 
 const now = () => new Date().toISOString();
 const normalize = (email: string) => email.trim().toLowerCase();
@@ -96,7 +97,7 @@ export async function listContacts(audienceId: string): Promise<Contact[]> {
  */
 export async function addContact(
   audienceId: string,
-  input: { email: string; first_name?: string; last_name?: string },
+  input: { email: string; first_name?: string; last_name?: string; crm_contact_id?: string },
   consent: { source: ConsentSource; status?: ContactStatus; evidence?: string } = {
     source: "manual",
   },
@@ -115,7 +116,8 @@ export async function addContact(
     if (existing.status === "unsubscribed") return existing;
     await run(
       `UPDATE contacts SET first_name = ?, last_name = ?, status = ?,
-              consent_source = ?, consent_at = ?, consent_evidence = ?
+              consent_source = ?, consent_at = ?, consent_evidence = ?,
+              crm_contact_id = COALESCE(?, crm_contact_id)
          WHERE id = ?`,
       [
         input.first_name ?? existing.first_name,
@@ -124,6 +126,7 @@ export async function addContact(
         consent.source,
         status === "subscribed" ? (existing.consent_at ?? now()) : existing.consent_at,
         consent.evidence ?? "",
+        input.crm_contact_id ?? null,
         existing.id,
       ],
     );
@@ -135,8 +138,8 @@ export async function addContact(
   const id = `con_${crypto.randomUUID().replace(/-/g, "")}`;
   await run(
     `INSERT INTO contacts (id, audience_id, email, first_name, last_name, status,
-                           consent_source, consent_at, consent_evidence)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                           consent_source, consent_at, consent_evidence, crm_contact_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       audienceId,
@@ -147,6 +150,7 @@ export async function addContact(
       consent.source,
       status === "subscribed" ? now() : null,
       consent.evidence ?? "",
+      input.crm_contact_id ?? null,
     ],
   );
   return (await get(`SELECT ${CONTACT_COLS} FROM contacts WHERE id = ?`, [id])) as Contact;

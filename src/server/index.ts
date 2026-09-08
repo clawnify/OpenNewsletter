@@ -3,6 +3,7 @@ import type { CredentialBinding } from "@clawnify/connections";
 import { enqueueJob, verifyDelivery } from "@clawnify/queue";
 import { initDB, query, get, run } from "./db";
 import * as contacts from "./contacts";
+import * as crm from "./crm";
 import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
@@ -25,6 +26,10 @@ type Env = {
     OPENROUTER_API_KEY?: string;
     NEWSLETTER_MODEL?: string;
     GITHUB_TOKEN?: string;
+    // Set by the platform when this app is installed next to a CRM (bundle
+    // install). Absent on a single install; see ./crm.ts.
+    CRM_APP_ID?: string;
+    CLAWNIFY_TOKEN?: string;
   };
 };
 
@@ -56,6 +61,7 @@ async function ensureSeed() {
     `ALTER TABLE mails ADD COLUMN conversation TEXT NOT NULL DEFAULT '[]'`,
     `ALTER TABLE settings ADD COLUMN logo TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN senders TEXT NOT NULL DEFAULT '[]'`,
+    `ALTER TABLE contacts ADD COLUMN crm_contact_id TEXT`,
   ]) {
     try {
       await run(sql);
@@ -205,6 +211,7 @@ app.get("/api/status", async (c) => {
     provider: provider?.name ?? null,
     ai_available: !!env.OPENROUTER_API_KEY,
     github_connected: !!env.GITHUB_TOKEN,
+    crm_connected: crm.crmConfigured(c.env),
     audiences,
     sending_domains,
   });
@@ -652,6 +659,86 @@ app.delete("/api/audiences/:id/contacts/:contactId", async (c) => {
   return c.json({ ok: true });
 });
 
+// ── import from the workspace CRM ────────────────────────────────────
+//
+// Only mounted in spirit: both routes answer 409 unless CRM_APP_ID is set, so
+// a single install has no CRM surface at all. The CRM is read live for the
+// picker; a contact becomes a subscriber here only with stated consent
+// evidence, and keeps the CRM id so an unsubscribe can be noted back there.
+
+app.get("/api/crm/contacts", async (c) => {
+  if (!crm.crmConfigured(c.env)) return c.json({ error: "No CRM connected to this workspace" }, 409);
+  const page = Number(c.req.query("page") || "1") || 1;
+  const search = c.req.query("search") || undefined;
+  const audienceId = c.req.query("audience_id") || "";
+  const result = await crm.listCrmContacts(c.env, { page, limit: 50, search });
+
+  // Mark what is already in the target audience so the picker can say so.
+  const local = audienceId ? await contacts.listContacts(audienceId) : [];
+  const byEmail = new Map(local.map((r) => [r.email.toLowerCase(), r.status]));
+  const rows = result.contacts
+    .filter((r) => !!r.email?.trim())
+    .map((r) => ({
+      id: r.id,
+      first_name: r.first_name,
+      last_name: r.last_name,
+      email: r.email,
+      company_name: r.company_name ?? null,
+      title: r.title ?? "",
+      in_audience: byEmail.get(r.email.trim().toLowerCase()) ?? null,
+    }));
+  return c.json({ contacts: rows, total: result.total, page: result.page, limit: result.limit });
+});
+
+app.post("/api/audiences/:id/import-crm", async (c) => {
+  if (!crm.crmConfigured(c.env)) return c.json({ error: "No CRM connected to this workspace" }, 409);
+  type ImportBody = { contact_ids?: unknown; consent_evidence?: unknown };
+  const b = await c.req.json<ImportBody>().catch(() => ({}) as ImportBody);
+  const ids = crm.pickIds(b.contact_ids);
+  if (!ids) return c.json({ error: `Pick between 1 and ${crm.MAX_IMPORT} contacts` }, 400);
+  const evidence = crm.validateEvidence(b.consent_evidence);
+  if (!evidence) {
+    return c.json(
+      { error: "Say how these people agreed to receive this newsletter (at least a short sentence). Without it they stay in the CRM only." },
+      400,
+    );
+  }
+
+  const audienceId = c.req.param("id");
+  const audience = (await contacts.listAudiences()).find((a) => a.id === audienceId);
+  if (!audience) return c.json({ error: "Audience not found" }, 404);
+
+  const imported: contacts.Contact[] = [];
+  const skipped: { id: string; reason: string }[] = [];
+  for (const id of ids) {
+    const row = await crm.getCrmContact(c.env, id);
+    if (!row || !row.email?.trim()) {
+      skipped.push({ id, reason: row ? "no email in CRM" : "not found in CRM" });
+      continue;
+    }
+    const before = await contacts.listContacts(audienceId);
+    const wasUnsubscribed = before.some(
+      (x) => x.email === row.email.trim().toLowerCase() && x.status === "unsubscribed",
+    );
+    if (wasUnsubscribed) {
+      skipped.push({ id, reason: "unsubscribed here before; they must opt in again" });
+      continue;
+    }
+    const contact = await contacts.addContact(
+      audienceId,
+      { email: row.email, first_name: row.first_name, last_name: row.last_name, crm_contact_id: row.id },
+      { source: "crm_sync", status: "subscribed", evidence },
+    );
+    imported.push(contact);
+    await crm.logCrmActivity(
+      c.env,
+      row.id,
+      `Added to newsletter audience "${audience.name}". Consent: ${evidence}`,
+    );
+  }
+  return c.json({ imported: imported.length, skipped, contacts: imported });
+});
+
 // ── signup (double opt-in) ───────────────────────────────────────────
 //
 // Public so a signup form on the publication's own site can post here.
@@ -1066,6 +1153,17 @@ async function unsubscribeContact(c: any, contactId: string) {
   // Mirror into the platform ledger so the send path itself refuses them, not
   // just this app. Best-effort: the local status above is what this app hon-
   // ours, and a ledger blip must not leave the subscriber still subscribed.
+  // If this person came from the workspace CRM, leave the fact on their
+  // timeline there. The CRM never changes the subscription; it only learns.
+  if (row.crm_contact_id) {
+    const s = await getSettings();
+    await crm.logCrmActivity(
+      c.env,
+      row.crm_contact_id,
+      `Unsubscribed from newsletter "${s.publication_name || "newsletter"}"`,
+    );
+  }
+
   const token = (c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN;
   if (token) {
     try {
