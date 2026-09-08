@@ -1,4 +1,3 @@
-import { Mail } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { PanelLeft } from "lucide-react";
 import { AppNav, reportLocation, type AppNavItem } from "@clawnify/app/client";
@@ -17,10 +16,10 @@ export type View = "home" | "mail" | "templates" | "audience" | "settings";
 // sidebar when embedded there. Each view has a path so a reload, and the
 // dashboard, land on the same screen.
 const NAV: (AppNavItem & { view: View })[] = [
-  { id: "home", view: "home", label: "Home", href: "/", icon: "house", home: true },
-  { id: "mail", view: "mail", label: "Mail", href: "/mail", icon: "mail" },
-  { id: "templates", view: "templates", label: "Templates", href: "/templates", icon: "layout-grid" },
-  { id: "audience", view: "audience", label: "Audience", href: "/audience", icon: "users" },
+  { id: "home", view: "home", label: "Home", href: "/", icon: "home", home: true },
+  { id: "mail", view: "mail", label: "Mail", href: "/mail", icon: "send", color: "sky" },
+  { id: "templates", view: "templates", label: "Templates", href: "/templates", icon: "layout-grid", color: "violet" },
+  { id: "audience", view: "audience", label: "Audience", href: "/audience", icon: "users", color: "blue" },
   { id: "settings", view: "settings", label: "Settings", href: "/settings", icon: "settings" },
 ];
 
@@ -84,7 +83,7 @@ function Shell() {
         </button>
       <AppNav
         title="OpenNewsletter"
-        icon={<span className="flex size-7 items-center justify-center rounded-md bg-accent-brand text-white"><Mail size={16} strokeWidth={2.25} /></span>}
+        icon="mail"
         groups={groups}
         active={editing === null ? view : undefined}
         onNavigate={(item) => navigate(NAV.find((n) => n.id === item.id)?.view ?? "home")}
