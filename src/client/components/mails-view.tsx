@@ -20,24 +20,25 @@ export function MailsView({ openMail }: { openMail: (id: number) => void }) {
   };
 
   return (
-    <div className="mx-auto max-w-4xl px-8 py-8">
-      <header className="mb-6 flex items-center justify-between">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-6">
         <div>
-          <h1 className="text-2xl font-semibold">Mail</h1>
+          <h1 className="text-[1.375rem] font-semibold tracking-[-0.01em]">Mail</h1>
           <p className="text-sm text-muted-foreground">Draft, design, and send your newsletter.</p>
         </div>
         <Button onClick={() => setPicking(true)}>
           <Plus size={16} /> New mail
         </Button>
       </header>
+      <div className="mx-auto w-full max-w-4xl px-8 py-6">
 
       {mails.length === 0 ? (
-        <div className="rounded-2xl border border-dashed p-12 text-center">
+        <div className="rounded-md border border-dashed border-border p-12 text-center">
           <p className="text-muted-foreground">No mail yet.</p>
           <Button className="mt-3" onClick={() => setPicking(true)}>Create your first newsletter</Button>
         </div>
       ) : (
-        <ul className="divide-y overflow-hidden rounded-2xl border bg-background">
+        <ul className="divide-y divide-border overflow-hidden rounded-md bg-card shadow-edge">
           {mails.map((i) => (
             <MailRow key={i.id} mail={i} onOpen={() => openMail(i.id)} onDelete={() => deleteMail(i.id)} />
           ))}
@@ -51,7 +52,7 @@ export function MailsView({ openMail }: { openMail: (id: number) => void }) {
           </DialogHeader>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3">
             <button
-              className="rounded-xl border border-dashed p-4 text-left transition hover:border-primary hover:bg-muted"
+              className="rounded-md border border-dashed border-border p-4 text-left transition hover:border-foreground hover:bg-muted"
               onClick={() => start("blank")}
             >
               <div className="font-medium">Blank</div>
@@ -60,7 +61,7 @@ export function MailsView({ openMail }: { openMail: (id: number) => void }) {
             {templates.map((t) => (
               <button
                 key={t.slug}
-                className="rounded-xl border p-4 text-left transition hover:border-primary hover:bg-muted"
+                className="rounded-md p-4 text-left shadow-edge transition hover:bg-muted"
                 onClick={() => start(t.slug)}
               >
                 <div className="font-medium">{t.name}</div>
@@ -70,6 +71,7 @@ export function MailsView({ openMail }: { openMail: (id: number) => void }) {
           </div>
         </DialogContent>
       </Dialog>
+      </div>
     </div>
   );
 }
@@ -77,9 +79,9 @@ export function MailsView({ openMail }: { openMail: (id: number) => void }) {
 function MailRow({ mail, onOpen, onDelete }: { mail: Mail; onOpen: () => void; onDelete: () => void }) {
   const badge =
     mail.status === "sent"
-      ? "bg-green-100 text-green-700"
+      ? "bg-success-tint text-success"
       : mail.status === "scheduled"
-        ? "bg-amber-100 text-amber-700"
+        ? "bg-info-tint text-info"
         : "bg-muted text-muted-foreground";
   return (
     <li className="flex items-center gap-3 px-4 py-3 hover:bg-muted">
@@ -87,8 +89,8 @@ function MailRow({ mail, onOpen, onDelete }: { mail: Mail; onOpen: () => void; o
         <div className="truncate font-medium">{mail.title || "Untitled"}</div>
         <div className="truncate text-xs text-muted-foreground">{mail.subtitle || mail.eyebrow}</div>
       </button>
-      <span className={`rounded-md px-2 py-0.5 text-xs font-medium capitalize ${badge}`}>{mail.status}</span>
-      <button className="rounded-lg p-2 text-muted-foreground hover:bg-background hover:text-destructive" onClick={onDelete} aria-label="Delete">
+      <span className={`rounded-full px-2.5 py-1 text-xs font-medium capitalize ${badge}`}>{mail.status}</span>
+      <button className="inline-flex size-7 items-center justify-center rounded-[0.5rem] text-muted-foreground hover:bg-destructive-tint hover:text-destructive" onClick={onDelete} aria-label="Delete">
         <Trash2 size={16} />
       </button>
     </li>

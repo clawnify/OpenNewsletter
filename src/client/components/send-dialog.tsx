@@ -73,7 +73,7 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
         ) : (
           <div className="space-y-4">
             {!fromReady ? (
-              <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-700">Add a sender in Settings before sending.</p>
+              <p className="rounded-sm bg-warning-tint p-3 text-sm text-warning">Add a sender in Settings before sending.</p>
             ) : (
               <div className="space-y-1.5">
                 <Label>From</Label>
@@ -96,7 +96,7 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
               </Select>
             </div>
 
-            <div className="rounded-lg border p-3">
+            <div className="rounded-md p-3 shadow-edge">
               <Label className="mb-1.5 block">Send a test</Label>
               <div className="flex gap-2">
                 <Input placeholder="you@example.com" value={testTo} onChange={(e) => setTestTo(e.target.value)} />
@@ -114,7 +114,7 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
         )}
 
         {err ? <p className="text-sm text-destructive">{err}</p> : null}
-        {msg ? <p className="text-sm text-green-600">{msg}</p> : null}
+        {msg ? <p className="text-sm text-success">{msg}</p> : null}
 
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>

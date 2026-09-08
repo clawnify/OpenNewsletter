@@ -35,7 +35,7 @@ export function DesignPanel({ design, onChange }: { design: DesignTokens; onChan
         {groups.map((g) =>
           g.fields.length === 0 ? null : (
             <section key={g.title} className="py-2">
-              <h3 className="px-1 py-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{g.title}</h3>
+              <h3 className="px-1 py-2 text-[0.8125rem] font-medium text-muted-foreground">{g.title}</h3>
               <div className="space-y-1">
                 {g.fields.map((f) => (
                   <Row key={f.path} field={f} value={getPath(design, f.path)} onChange={(v) => set(f.path, v)} />
@@ -93,8 +93,8 @@ function Control({ field, value, onChange }: { field: Field; value: unknown; onC
 
 function ColorControl({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   return (
-    <div className="flex items-center gap-1.5 rounded-lg border bg-background py-1 pl-1 pr-2">
-      <label className="relative h-6 w-6 cursor-pointer overflow-hidden rounded-md border">
+    <div className="flex items-center gap-1.5 rounded-sm bg-card py-1 pl-1 pr-2 shadow-edge">
+      <label className="relative h-6 w-6 cursor-pointer overflow-hidden rounded-xs shadow-edge">
         <span className="absolute inset-0" style={{ background: value }} />
         <input type="color" className="absolute inset-0 cursor-pointer opacity-0" value={toHex(value)} onChange={(e) => onChange(e.target.value.toUpperCase())} />
       </label>
