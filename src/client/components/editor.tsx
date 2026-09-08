@@ -8,6 +8,8 @@ import { newBlock, markdownToBlocks, deriveTitle, blockId } from "../../shared/b
 import type { Block, BlockType, Mail } from "../../shared/types";
 import { Preview, type EditHandlers } from "./preview";
 import { DesignPanel } from "./design-panel";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { SendDialog } from "./send-dialog";
 import { Chat, type ChatContext, type ApplyTool } from "./chat";
 import { Button } from "@/components/ui/button";
@@ -215,10 +217,13 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
     }
   };
 
-  const saveAsTemplate = async () => {
-    if (!mail) return;
-    const name = window.prompt("Template name", mail.title?.slice(0, 40) || "My template");
-    if (!name) return;
+  // Naming happens in a dialog with the input first and focused, never window.prompt.
+  const [templateName, setTemplateName] = useState<string | null>(null);
+  const saveAsTemplate = () => { if (mail) setTemplateName(mail.title?.slice(0, 40) || "My template"); };
+  const confirmSaveAsTemplate = async () => {
+    const name = templateName?.trim();
+    setTemplateName(null);
+    if (!mail || !name) return;
     try {
       await api("POST", "/api/templates", { name, from_mail_id: mail.id });
       await store.refreshTemplates();
@@ -238,13 +243,13 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
 
   return (
     <div className="flex h-full min-w-0 flex-col" onClick={() => !selectMode && setSelected(null)}>
-      <header className="relative flex items-center gap-3 border-b bg-background px-4 py-2.5">
+      <header className="relative flex h-14 shrink-0 items-center gap-3 border-b border-border bg-background px-4">
         <Button variant="ghost" size="icon" onClick={onBack} aria-label="Back"><ArrowLeft size={18} /></Button>
         <div className="flex items-center gap-2 text-sm">
           <Badge variant="secondary">Mail</Badge>
           <span className="max-w-[260px] truncate font-medium">{mail.title || "Untitled"}</span>
           <span className="text-xs text-muted-foreground">{saved ? "Saved" : "Saving…"}</span>
-          {sent ? <Badge className="bg-green-100 capitalize text-green-700">{mail.status}</Badge> : null}
+          {sent ? <Badge className="bg-success-tint capitalize text-success">{mail.status}</Badge> : null}
         </div>
         <div className="ml-auto flex items-center gap-2">
           <div className="flex items-center">
@@ -285,12 +290,13 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
           />
         </aside>
 
+        {/* design-lint: allow — a document canvas: the email preview sits on a desk */}
         <div className="flex min-w-0 flex-1 flex-col bg-muted">
           {device === "mobile" ? (
-            <div className="flex items-center justify-center gap-2 border-b border-amber-200 bg-amber-50 py-1.5 text-xs text-amber-700">
+            <div className="flex items-center justify-center gap-2 border-b border-border bg-warning-tint py-1.5 text-xs text-warning">
               <Smartphone size={13} /> Editing <strong>mobile overrides</strong> — changes here only affect phones.
               {mail.design_mobile && Object.keys(mail.design_mobile).length ? (
-                <button className="ml-1 inline-flex items-center gap-1 rounded border border-amber-300 px-1.5 py-0.5 hover:bg-amber-100" onClick={resetMobile}><RotateCcw size={11} /> reset</button>
+                <button className="ml-1 inline-flex items-center gap-1 rounded-xs px-1.5 py-0.5 shadow-edge hover:bg-card" onClick={resetMobile}><RotateCcw size={11} /> reset</button>
               ) : null}
             </div>
           ) : null}
@@ -312,6 +318,20 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
         </aside>
       </div>
 
+      {templateName !== null && (
+        <Dialog open onOpenChange={(o) => { if (!o) setTemplateName(null); }}>
+          <DialogContent className="max-w-sm">
+            <form onSubmit={(e) => { e.preventDefault(); void confirmSaveAsTemplate(); }} className="flex flex-col gap-4">
+              <DialogHeader><DialogTitle>Save as template</DialogTitle></DialogHeader>
+              <Input autoFocus value={templateName} onChange={(e) => setTemplateName(e.target.value)} placeholder="Template name" aria-label="Template name" />
+              <DialogFooter>
+                <DialogClose asChild><Button type="button" variant="ghost">Cancel <kbd className="ml-1 rounded-xs bg-muted px-1 text-[10px] text-muted-foreground">Esc</kbd></Button></DialogClose>
+                <Button type="submit" disabled={!templateName?.trim()}>Save <kbd className="ml-1 rounded-xs bg-white/15 px-1 text-[10px]">⏎</kbd></Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
       {showSend ? <SendDialog mail={mail} onClose={() => setShowSend(false)} onSent={(i) => { setMail(i); setShowSend(false); store.refreshMails(); }} /> : null}
     </div>
   );
@@ -352,7 +372,7 @@ function Segmented<T extends string>({ options, value, onChange }: { options: { 
   return (
     <div className="flex items-center gap-0.5 rounded-lg bg-muted p-0.5">
       {options.map((o) => (
-        <button key={o.v} onClick={() => onChange(o.v)} className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-sm font-medium transition ${value === o.v ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>
+        <button key={o.v} onClick={() => onChange(o.v)} className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-sm font-medium transition ${value === o.v ? "bg-card text-foreground shadow-raised" : "text-muted-foreground"}`}>
           {o.icon}{o.label}
         </button>
       ))}

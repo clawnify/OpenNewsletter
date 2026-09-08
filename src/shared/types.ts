@@ -126,6 +126,8 @@ export interface ResendAudience {
   id: string;
   name: string;
   contact_count?: number;
+  /** Confirmed subscribers, as reported by /api/status. */
+  subscribed_count?: number;
 }
 
 /**

@@ -28,18 +28,20 @@ export function TemplatesView({ openMail }: { openMail: (id: number) => void }) 
   };
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold">Template library</h1>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <header className="flex h-14 shrink-0 items-center border-b border-border px-6">
+        <h1 className="text-[1.375rem] font-semibold tracking-[-0.01em]">Template library</h1>
         <p className="text-sm text-muted-foreground">
           A template is a DESIGN.md look + a content skeleton. “Save as…” in the editor adds your own.
         </p>
       </header>
+      <div className="mx-auto w-full max-w-5xl px-8 py-6">
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {templates.map((t) => (
           <Card key={t.slug} template={t} onUse={() => use(t.slug)} onDelete={() => remove(t.slug)} />
         ))}
+      </div>
       </div>
     </div>
   );
@@ -48,9 +50,11 @@ export function TemplatesView({ openMail }: { openMail: (id: number) => void }) 
 function Card({ template, onUse, onDelete }: { template: Template; onUse: () => void; onDelete: () => void }) {
   const d = template.design as DesignTokens;
   return (
-    <div className="flex flex-col overflow-hidden rounded-2xl border bg-background">
-      <div className="p-5" style={{ background: d.colors.page }}>
-        <div className="mx-auto" style={{ maxWidth: 260, background: d.colors.background, borderRadius: d.layout.cardRadius, padding: 16 }}>
+    <div className="flex flex-col overflow-hidden rounded-md bg-card shadow-edge">
+      {/* A sunken well, then the email as a sheet with its own edge: the preview is
+          the template's design, the well and the card are ours. */}
+      <div className="bg-muted p-5">
+        <div className="mx-auto shadow-edge" style={{ maxWidth: 260, background: d.colors.background, borderRadius: d.layout.cardRadius, padding: 16 }}>
           <div style={{ color: d.colors.primary, fontSize: 10, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase" }}>
             {template.skeleton.eyebrow || "NEWSLETTER"}
           </div>
@@ -64,14 +68,14 @@ function Card({ template, onUse, onDelete }: { template: Template; onUse: () => 
           </div>
         </div>
       </div>
-      <div className="flex flex-1 flex-col border-t p-4">
+      <div className="flex flex-1 flex-col border-t border-border p-4">
         <div className="flex items-center gap-2">
           <h3 className="font-medium">{template.name}</h3>
-          {template.builtin ? <Badge variant="secondary" className="text-[10px] uppercase">Built-in</Badge> : null}
+          {template.builtin ? <Badge variant="secondary" className="text-xs">Built-in</Badge> : null}
         </div>
         <p className="mt-1 flex-1 text-xs text-muted-foreground">{template.description}</p>
-        <div className="mt-3 flex items-center gap-2">
-          <Button className="flex-1" onClick={onUse}>Use template</Button>
+        <div className="mt-3 flex items-center justify-end gap-2">
+          <Button variant="outline" size="sm" onClick={onUse}>Use template</Button>
           {!template.builtin ? (
             <Button variant="outline" size="icon" onClick={onDelete} aria-label="Delete template">
               <Trash2 size={15} />

@@ -84,9 +84,9 @@ function AttachmentPreviews() {
       {att.files.map((f) => (
         <div key={f.id} className="relative">
           {f.url ? (
-            <img src={f.url} alt={f.filename || ""} className="size-12 rounded-md border object-cover" />
+            <img src={f.url} alt={f.filename || ""} className="size-12 rounded-sm object-cover shadow-edge" />
           ) : (
-            <div className="size-12 rounded-md border bg-muted" />
+            <div className="size-12 rounded-sm bg-muted shadow-edge" />
           )}
           <button
             type="button"
@@ -233,7 +233,7 @@ export function Chat({
         </Conversation>
 
         {selectedCount > 0 ? (
-          <div className="mx-3 mb-1 flex items-center gap-1.5 rounded-md border border-primary/30 bg-accent px-2.5 py-1.5 text-xs">
+          <div className="mx-3 mb-1 flex items-center gap-1.5 rounded-sm bg-accent-tint px-2.5 py-1.5 text-xs text-accent-text">
             <Sparkles size={12} className="text-primary" />
             <span>
               <strong>{selectedCount}</strong> block{selectedCount === 1 ? "" : "s"} in focus — edits will target them.
@@ -375,7 +375,7 @@ function AddHintPill({ onAdd, repos }: { onAdd: (h: Omit<Hint, "id" | "active">)
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <button className="inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-full border border-dashed px-2.5 text-xs text-muted-foreground transition hover:bg-accent hover:text-foreground">
+        <button className="inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-sm border border-dashed border-border px-2.5 text-xs text-muted-foreground transition hover:bg-accent hover:text-foreground">
           <Plus className="size-3.5" /> Hint
         </button>
       </PopoverTrigger>

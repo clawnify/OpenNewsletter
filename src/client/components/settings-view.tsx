@@ -42,10 +42,13 @@ export function SettingsView() {
   );
 
   return (
-    <div className="mx-auto max-w-2xl px-8 py-8">
-      <h1 className="text-2xl font-semibold">Settings</h1>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <header className="flex h-14 shrink-0 items-center border-b border-border px-6">
+        <h1 className="text-[1.375rem] font-semibold tracking-[-0.01em]">Settings</h1>
+      </header>
+      <div className="mx-auto w-full max-w-2xl px-8 py-6">
 
-      <section className="mt-6 space-y-2 rounded-2xl border bg-background p-5">
+      <section className="mt-6 space-y-2 rounded-md bg-card p-5 shadow-edge">
         <h2 className="text-sm font-semibold">Connections</h2>
         <Status ok={!!status?.resend_connected} label="Resend" detail={status?.resend_connected ? "Connected" : "Connect Resend in your Clawnify dashboard (Settings → Integrations), or set RESEND_API_KEY"} />
         <Status ok={!!status?.ai_available} label="AI generation (OpenRouter)" detail={status?.ai_available ? "Ready" : "Set OPENROUTER_API_KEY to enable Generate"} />
@@ -69,7 +72,7 @@ export function SettingsView() {
         />
       </section>
 
-      <section className="mt-6 space-y-4 rounded-2xl border bg-background p-5">
+      <section className="mt-6 space-y-4 rounded-md bg-card p-5 shadow-edge">
         <h2 className="text-sm font-semibold">Sender</h2>
         {field("Publication name", "publication_name", "The Editorial Review")}
         {field("Logo URL", "logo", "https://…/logo.png")}
@@ -98,16 +101,16 @@ export function SettingsView() {
         {field("Footer text", "footer_text", "123 Main St · You can unsubscribe anytime.")}
       </section>
 
-      <section className="mt-6 space-y-3 rounded-2xl border bg-background p-5">
+      <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
         <h2 className="text-sm font-semibold">Senders</h2>
         <p className="text-xs text-muted-foreground">From-addresses you can send and test from. The domain must be verified in Resend.</p>
         {form.senders.length ? (
           <div className="space-y-1.5">
             {form.senders.map((s, i) => (
-              <div key={i} className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm">
+              <div key={i} className="flex items-center gap-2 rounded-sm shadow-edge px-3 py-2 text-sm">
                 <span className="font-medium">{s.name}</span>
                 <span className="text-muted-foreground">{s.email}</span>
-                <button className="ml-auto text-muted-foreground hover:text-red-600" onClick={() => setForm({ ...form, senders: form.senders.filter((_, j) => j !== i) })} aria-label="Remove sender">
+                <button className="ml-auto text-muted-foreground hover:text-destructive" onClick={() => setForm({ ...form, senders: form.senders.filter((_, j) => j !== i) })} aria-label="Remove sender">
                   <Trash2 size={14} />
                 </button>
               </div>
@@ -121,7 +124,8 @@ export function SettingsView() {
 
       <div className="mt-5 flex items-center gap-3">
         <Button onClick={save}>Save settings</Button>
-        {savedAt ? <span className="text-sm text-green-600">Saved</span> : null}
+        {savedAt ? <span className="text-sm text-success">Saved</span> : null}
+      </div>
       </div>
     </div>
   );
@@ -134,7 +138,7 @@ function AddSender({ domains, onAdd }: { domains: { name: string; status: string
   const [domain, setDomain] = useState("");
 
   if (!verified.length) {
-    return <p className="text-xs text-amber-600">Verify a domain in Resend to add a sender.</p>;
+    return <p className="text-xs text-warning">Verify a domain in Resend to add a sender.</p>;
   }
   const valid = name.trim() && /^[\w.+-]+$/.test(local.trim()) && domain;
   const add = () => {
@@ -170,7 +174,7 @@ function AddSender({ domains, onAdd }: { domains: { name: string; status: string
 function Status({ ok, label, detail }: { ok: boolean; label: string; detail: string }) {
   return (
     <div className="flex items-center gap-2 text-sm">
-      {ok ? <CheckCircle2 size={17} className="text-green-600" /> : <XCircle size={17} className="text-muted-foreground" />}
+      {ok ? <CheckCircle2 size={17} className="text-success" /> : <XCircle size={17} className="text-muted-foreground" />}
       <span className="font-medium">{label}</span>
       <span className="text-muted-foreground">— {detail}</span>
     </div>

@@ -62,10 +62,10 @@ export function AudienceView() {
 
 
   return (
-    <div className="mx-auto max-w-4xl px-8 py-8">
-      <header className="mb-6 flex items-end justify-between">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-6">
         <div>
-          <h1 className="text-2xl font-semibold">Audience</h1>
+          <h1 className="text-[1.375rem] font-semibold tracking-[-0.01em]">Audience</h1>
           <p className="text-sm text-muted-foreground">Your subscribers, stored in this app. Only confirmed contacts receive sends.</p>
         </div>
         <div className="flex items-center gap-2">
@@ -79,6 +79,7 @@ export function AudienceView() {
           </Button>
         </div>
       </header>
+      <div className="mx-auto w-full max-w-4xl px-8 py-6">
 
       {status?.crm_connected && selected ? (
         <CrmImportDialog
@@ -103,7 +104,7 @@ export function AudienceView() {
         </Select>
       </div>
 
-      <div className="mb-4 flex gap-2 rounded-xl border bg-background p-3">
+      <div className="mb-4 flex gap-2 rounded-md bg-card p-3 shadow-edge">
         <Input placeholder="email@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
         <Input className="w-40" placeholder="First name" value={first} onChange={(e) => setFirst(e.target.value)} />
         <Button disabled={!selected || !email.trim()} onClick={add}>
@@ -111,7 +112,7 @@ export function AudienceView() {
         </Button>
       </div>
 
-      <div className="overflow-hidden rounded-2xl border bg-background">
+      <div className="overflow-hidden rounded-md bg-card shadow-edge">
         {loading ? (
           <div className="p-6 text-center text-sm text-muted-foreground">Loading…</div>
         ) : contacts.length === 0 ? (
@@ -127,13 +128,13 @@ export function AudienceView() {
                   ) : null}
                 </div>
                 {c.consent_source === "crm_sync" ? (
-                  <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground" title="Imported from your CRM with recorded consent">
+                  <span className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground" title="Imported from your CRM with recorded consent">
                     CRM
                   </span>
                 ) : null}
                 {c.status && c.status !== "subscribed" ? (
                   <span
-                    className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground"
+                    className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
                     title={
                       c.status === "pending"
                         ? "Signed up but hasn't confirmed — not included in sends"
@@ -152,6 +153,7 @@ export function AudienceView() {
             ))}
           </ul>
         )}
+      </div>
       </div>
     </div>
   );

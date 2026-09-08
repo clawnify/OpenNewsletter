@@ -144,7 +144,7 @@ export function CrmImportDialog({
           </Button>
         </div>
 
-        <div className="max-h-72 overflow-auto rounded-xl border">
+        <div className="max-h-72 overflow-auto rounded-md shadow-edge">
           {loading ? (
             <div className="p-6 text-center text-sm text-muted-foreground">Loading from CRM…</div>
           ) : !data || data.contacts.length === 0 ? (
@@ -188,7 +188,7 @@ export function CrmImportDialog({
                       <div className="truncate text-xs text-muted-foreground">{c.email}</div>
                     </div>
                     {c.in_audience ? (
-                      <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+                      <span className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
                         {c.in_audience === "subscribed" ? "Already in" : c.in_audience === "unsubscribed" ? "Opted out" : c.in_audience}
                       </span>
                     ) : null}
