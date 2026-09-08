@@ -62,11 +62,13 @@ function Shell() {
   const subscribers = (status?.audiences ?? []).reduce((n, a) => n + (a.subscribed_count ?? 0), 0);
   const groups = [{ items: NAV.map(({ view: _v, ...n }) => (n.id === "audience" && subscribers ? { ...n, count: subscribers } : n)) }];
 
-  if (loading) return <div className="flex h-full items-center justify-center text-muted-foreground">Loading…</div>;
-
   // Collapse folds the SDK sidebar to icons. The toggle lives here, not in
-  // <AppNav>, because 0.2.0 has no slot for it; the proper home is the SDK.
+  // <AppNav>, because the SDK has no slot for it; the proper home is the SDK.
+  // Declared before the loading return: a hook after an early return changes
+  // the hook order when loading flips, and React unmounts the tree (blank app).
   const [navCollapsed, setNavCollapsed] = useState(false);
+
+  if (loading) return <div className="flex h-full items-center justify-center text-muted-foreground">Loading…</div>;
 
   return (
     <div className="flex h-full flex-col md:flex-row" data-nav-collapsed={navCollapsed || undefined}>
