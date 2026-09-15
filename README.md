@@ -44,7 +44,7 @@ account. The provider is just delivery, and it's swappable.
 
 ```mermaid
 flowchart TD
-    prompt(["Prompt"]) --> draft["AI draft · OpenRouter"]
+    prompt(["Prompt"]) --> draft["AI draft · any OpenAI/Anthropic-compatible endpoint"]
     draft --> mail[("Mail · D1")]
     mail --> renderer["renderer"]
     tokens["DESIGN.md tokens"] --> renderer
@@ -70,7 +70,7 @@ override the template's tokens; the design panel edits that override live and
 | **Backend** | Hono (Cloudflare Worker) |
 | **Database** | D1 (mails, templates, settings, audiences, contacts) |
 | **Email** | Bring your own provider — Resend wired today |
-| **AI** | OpenRouter (configurable model) |
+| **AI** | Any OpenAI- or Anthropic-compatible endpoint (configurable) |
 | **Icons** | Lucide |
 
 ## Quickstart
@@ -94,8 +94,10 @@ cp .dev.vars.example .dev.vars
 
 ```
 RESEND_API_KEY=re_xxxxxxxx        # https://resend.com/api-keys
-OPENROUTER_API_KEY=sk-or-xxxxxxxx # https://openrouter.ai/keys
-# NEWSLETTER_MODEL=anthropic/claude-sonnet-4   (optional override)
+AI_API_KEY=sk-xxxxxxxx            # any OpenAI-/Anthropic-compatible endpoint
+AI_PROVIDER=openai                # or "anthropic"
+AI_MODEL=gpt-4.1                  # e.g. claude-sonnet-4-5, llama3.1
+# AI_BASE_URL=https://api.openai.com/v1   (default for AI_PROVIDER=openai)
 ```
 
 Restart `pnpm dev` after editing `.dev.vars`.
@@ -159,8 +161,12 @@ npx clawnify deploy
 | Env | Required | Purpose |
 |-----|----------|---------|
 | `RESEND_API_KEY` | for sending | Your own key — delivery only; contacts stay in D1 |
-| `OPENROUTER_API_KEY` | for AI | The Generate button |
-| `NEWSLETTER_MODEL` | no | Override the generation model |
+| `AI_API_KEY` | for AI | The Generate button and the assistant |
+| `AI_PROVIDER` | no | `openai` (default) or `anthropic` — the protocol your endpoint speaks |
+| `AI_BASE_URL` | no | The endpoint; defaults per protocol |
+| `AI_MODEL` | no | The model id (defaults per protocol) |
+| `OPENROUTER_API_KEY` | no | Legacy alias for `AI_API_KEY`, still honoured |
+| `NEWSLETTER_MODEL` | no | Legacy alias for `AI_MODEL`, still honoured |
 
 On Clawnify these are injected automatically from your org's API keys /
 environment variables at deploy time — no secrets in the app.
@@ -179,7 +185,9 @@ src/
                        subscribe/confirm/unsubscribe, widget, generate, send)
     contacts.ts      — audiences + contacts + the consent lifecycle
     render.ts        — mail + tokens → email-safe inlined HTML
-    ai.ts            — OpenRouter generation
+    ai.ts            — generation (prompt → draft) over the configured endpoint
+    llm.ts           — which endpoint/protocol/model, from the environment
+    agent.ts         — the editor assistant (streaming, tool-calling)
     providers/       — EmailProvider interface (send-only) + adapters
     schema.sql       — D1 schema
   client/
