@@ -6,6 +6,7 @@ import type { Settings, Sender } from "../../shared/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Spinner } from "@/components/ui/spinner";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 export function SettingsView() {
@@ -16,7 +17,7 @@ export function SettingsView() {
   const [savedAt, setSavedAt] = useState(false);
   const [domains, setDomains] = useState<{ name: string; status: string }[]>([]);
   useEffect(() => {
-    api<{ domains: { name: string; status: string }[] }>("GET", "/api/senders").then((d) => setDomains(d.domains || [])).catch(() => {});
+    api<{ domains: { name: string; status: string }[] }>("GET", "/api/senders").then((d) => setDomains(d.domains || [])).catch(() => { });
   }, []);
 
   const save = async () => {
@@ -48,84 +49,84 @@ export function SettingsView() {
       </header>
       <div className="mx-auto w-full max-w-2xl px-8 py-6">
 
-      <section className="mt-6 space-y-2 rounded-md bg-card p-5 shadow-edge">
-        <h2 className="text-sm font-semibold">Connections</h2>
-        <Status ok={!!status?.resend_connected} label="Resend" detail={status?.resend_connected ? "Connected" : "Connect Resend in your Clawnify dashboard (Settings → Integrations), or set RESEND_API_KEY"} />
-        <Status ok={!!status?.ai_available} label="AI generation (OpenRouter)" detail={status?.ai_available ? "Ready" : "Set OPENROUTER_API_KEY to enable Generate"} />
-        <Status
-          ok={!!status?.crm_connected}
-          label="CRM"
-          detail={
-            status?.crm_connected
-              ? "Connected — import contacts from your CRM in the Audience view"
-              : "Installed with a CRM in the same workspace, this app can import contacts from it"
-          }
-        />
-        <Status
-          ok={!!status?.github_connected}
-          label="GitHub (Hints)"
-          detail={
-            status?.github_connected
-              ? "Connected — your repos appear when adding a hint"
-              : "Set GITHUB_TOKEN in your Clawnify environment (Contents: read) to list private repos. Public repos work without it."
-          }
-        />
-      </section>
+        <section className="mt-6 space-y-2 rounded-md bg-card p-5 shadow-edge">
+          <h2 className="text-sm font-semibold">Connections</h2>
+          <Status ok={!!status?.resend_connected} label="Resend" detail={status?.resend_connected ? "Connected" : "Connect Resend in your Clawnify dashboard (Settings → Integrations), or set RESEND_API_KEY"} />
+          <AiStatus />
+          <Status
+            ok={!!status?.crm_connected}
+            label="CRM"
+            detail={
+              status?.crm_connected
+                ? "Connected — import contacts from your CRM in the Audience view"
+                : "Installed with a CRM in the same workspace, this app can import contacts from it"
+            }
+          />
+          <Status
+            ok={!!status?.github_connected}
+            label="GitHub (Hints)"
+            detail={
+              status?.github_connected
+                ? "Connected — your repos appear when adding a hint"
+                : "Set GITHUB_TOKEN in your Clawnify environment (Contents: read) to list private repos. Public repos work without it."
+            }
+          />
+        </section>
 
-      <section className="mt-6 space-y-4 rounded-md bg-card p-5 shadow-edge">
-        <h2 className="text-sm font-semibold">Sender</h2>
-        {field("Publication name", "publication_name", "The Editorial Review")}
-        {field("Logo URL", "logo", "https://…/logo.png")}
-        <div className="grid grid-cols-2 gap-4">
-          {field("From name", "from_name", "Jane from Acme")}
-          {field("From email", "from_email", "hello@yourdomain.com", "email")}
-        </div>
-        <p className="text-xs text-muted-foreground">The from address must be on a domain you've verified in Resend.</p>
-
-        <div className="space-y-1.5">
-          <Label>Default audience</Label>
-          <Select
-            value={form.default_audience_id || "none"}
-            onValueChange={(v) => setForm({ ...form, default_audience_id: v === "none" ? null : v })}
-          >
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="none">None</SelectItem>
-              {(status?.audiences || []).map((a) => (
-                <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        {field("Footer text", "footer_text", "123 Main St · You can unsubscribe anytime.")}
-      </section>
-
-      <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
-        <h2 className="text-sm font-semibold">Senders</h2>
-        <p className="text-xs text-muted-foreground">From-addresses you can send and test from. The domain must be verified in Resend.</p>
-        {form.senders.length ? (
-          <div className="space-y-1.5">
-            {form.senders.map((s, i) => (
-              <div key={i} className="flex items-center gap-2 rounded-sm shadow-edge px-3 py-2 text-sm">
-                <span className="font-medium">{s.name}</span>
-                <span className="text-muted-foreground">{s.email}</span>
-                <button className="ml-auto text-muted-foreground hover:text-destructive" onClick={() => setForm({ ...form, senders: form.senders.filter((_, j) => j !== i) })} aria-label="Remove sender">
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))}
+        <section className="mt-6 space-y-4 rounded-md bg-card p-5 shadow-edge">
+          <h2 className="text-sm font-semibold">Sender</h2>
+          {field("Publication name", "publication_name", "The Editorial Review")}
+          {field("Logo URL", "logo", "https://…/logo.png")}
+          <div className="grid grid-cols-2 gap-4">
+            {field("From name", "from_name", "Jane from Acme")}
+            {field("From email", "from_email", "hello@yourdomain.com", "email")}
           </div>
-        ) : (
-          <p className="text-xs text-muted-foreground">No senders yet — add one below.</p>
-        )}
-        <AddSender domains={domains} onAdd={(s) => setForm({ ...form, senders: [...form.senders, s] })} />
-      </section>
+          <p className="text-xs text-muted-foreground">The from address must be on a domain you've verified in Resend.</p>
 
-      <div className="mt-5 flex items-center gap-3">
-        <Button onClick={save}>Save settings</Button>
-        {savedAt ? <span className="text-sm text-success">Saved</span> : null}
-      </div>
+          <div className="space-y-1.5">
+            <Label>Default audience</Label>
+            <Select
+              value={form.default_audience_id || "none"}
+              onValueChange={(v) => setForm({ ...form, default_audience_id: v === "none" ? null : v })}
+            >
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">None</SelectItem>
+                {(status?.audiences || []).map((a) => (
+                  <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {field("Footer text", "footer_text", "123 Main St · You can unsubscribe anytime.")}
+        </section>
+
+        <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
+          <h2 className="text-sm font-semibold">Senders</h2>
+          <p className="text-xs text-muted-foreground">From-addresses you can send and test from. The domain must be verified in Resend.</p>
+          {form.senders.length ? (
+            <div className="space-y-1.5">
+              {form.senders.map((s, i) => (
+                <div key={i} className="flex items-center gap-2 rounded-sm shadow-edge px-3 py-2 text-sm">
+                  <span className="font-medium">{s.name}</span>
+                  <span className="text-muted-foreground">{s.email}</span>
+                  <button className="ml-auto text-muted-foreground hover:text-destructive" onClick={() => setForm({ ...form, senders: form.senders.filter((_, j) => j !== i) })} aria-label="Remove sender">
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">No senders yet — add one below.</p>
+          )}
+          <AddSender domains={domains} onAdd={(s) => setForm({ ...form, senders: [...form.senders, s] })} />
+        </section>
+
+        <div className="mt-5 flex items-center gap-3">
+          <Button onClick={save}>Save settings</Button>
+          {savedAt ? <span className="text-sm text-success">Saved</span> : null}
+        </div>
       </div>
     </div>
   );
@@ -177,6 +178,55 @@ function Status({ ok, label, detail }: { ok: boolean; label: string; detail: str
       {ok ? <CheckCircle2 size={17} className="text-success" /> : <XCircle size={17} className="text-muted-foreground" />}
       <span className="font-medium">{label}</span>
       <span className="text-muted-foreground">— {detail}</span>
+    </div>
+  );
+}
+
+/**
+ * The AI endpoint, with a way to actually reach it.
+ *
+ * Every other connection here is a service we know the shape of. The model
+ * endpoint is whatever the operator pointed us at, so "the env looks complete"
+ * is not the same as "it works" — a wrong key or an unknown model id would
+ * otherwise only show up as a failed Generate. The probe answers that directly
+ * and reports the endpoint's own error when it doesn't.
+ */
+function AiStatus() {
+  const { status } = useStore();
+  const [probe, setProbe] = useState<{ state: "idle" | "testing" | "ok" | "error"; message?: string }>({ state: "idle" });
+
+  const detail = !status?.ai_available
+    ? "Set AI_API_KEY, plus AI_PROVIDER / AI_BASE_URL / AI_MODEL for any OpenAI- or Anthropic-compatible endpoint"
+    : probe.state === "ok"
+      ? `Reachable — ${probe.message}`
+      : probe.state === "error"
+        ? probe.message || "The endpoint refused the request."
+        : `${status.ai_provider} · ${status.ai_model} at ${status.ai_base_url}`;
+
+  const test = async () => {
+    setProbe({ state: "testing" });
+    try {
+      const r = await api<{ ok: boolean; error?: string; reply?: string }>("POST", "/api/ai/test", {});
+      setProbe(r.ok ? { state: "ok", message: r.reply || "model replied" } : { state: "error", message: r.error });
+    } catch (e) {
+      setProbe({ state: "error", message: (e as Error).message });
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-2 text-sm">
+      {status?.ai_available && probe.state !== "error" ? (
+        <CheckCircle2 size={17} className="text-success" />
+      ) : (
+        <XCircle size={17} className={probe.state === "error" ? "text-destructive" : "text-muted-foreground"} />
+      )}
+      <span className="font-medium">AI generation</span>
+      <span className={probe.state === "error" ? "text-destructive" : "text-muted-foreground"}>— {detail}</span>
+      {status?.ai_available ? (
+        <Button variant="outline" size="sm" className="ml-auto shrink-0" onClick={test} disabled={probe.state === "testing"}>
+          {probe.state === "testing" ? <Spinner /> : null} Test
+        </Button>
+      ) : null}
     </div>
   );
 }

@@ -136,10 +136,10 @@ export function Chat({
   useEffect(() => {
     api<{ repos: { full_name: string }[] }>("GET", "/api/github/repos")
       .then((d) => setRepos(d.repos.map((r) => r.full_name)))
-      .catch(() => {});
+      .catch(() => { });
   }, []);
 
-  const { messages, sendMessage, status, addToolOutput, setMessages } = useChat({
+  const { messages, sendMessage, status, error, addToolOutput, setMessages } = useChat({
     transport: new DefaultChatTransport({
       api: "/api/chat",
       prepareSendMessagesRequest: ({ messages }) => ({
@@ -175,13 +175,13 @@ export function Chat({
     loadedRef.current = false;
     api<{ messages: typeof messages }>("GET", `/api/mails/${mailId}/conversation`)
       .then((d) => setMessages(d.messages || []))
-      .catch(() => {})
+      .catch(() => { })
       .finally(() => { loadedRef.current = true; });
   }, [mailId]);
   useEffect(() => {
     if (!loadedRef.current) return;
     const t = setTimeout(() => {
-      api("PUT", `/api/mails/${mailId}/conversation`, { messages }).catch(() => {});
+      api("PUT", `/api/mails/${mailId}/conversation`, { messages }).catch(() => { });
     }, 800);
     return () => clearTimeout(t);
   }, [messages, mailId]);
@@ -214,7 +214,7 @@ export function Chat({
                 description={
                   available
                     ? "Describe the newsletter you want, or ask for edits to what's on the canvas."
-                    : "Connect OPENROUTER_API_KEY to chat."
+                    : "Connect a model endpoint to chat — set AI_API_KEY, AI_PROVIDER, AI_BASE_URL and AI_MODEL."
                 }
               />
             ) : null}
@@ -228,6 +228,14 @@ export function Chat({
                 </MessageContent>
               </Message>
             ))}
+            {/* A model endpoint that's misconfigured (wrong key, unknown model,
+                unreachable host) fails as a stream error, which never renders
+                as a message — show it, or the panel just sits there. */}
+            {error ? (
+              <div className="rounded-sm bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {error.message || "The assistant couldn't reach the model endpoint."}
+              </div>
+            ) : null}
           </ConversationContent>
           <ConversationScrollButton />
         </Conversation>
@@ -280,7 +288,7 @@ export function Chat({
               <PromptInputTextarea
                 value={input}
                 disabled={!available}
-                placeholder={available ? "Describe a newsletter, attach an image, or ask for an edit…" : "Connect OPENROUTER_API_KEY"}
+                placeholder={available ? "Describe a newsletter, attach an image, or ask for an edit…" : "Connect a model endpoint (AI_API_KEY / AI_BASE_URL / AI_MODEL)"}
                 onChange={(e) => setInput(e.target.value)}
               />
             </PromptInputBody>
