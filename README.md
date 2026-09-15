@@ -192,6 +192,12 @@ An import never touches someone it should not:
 - `POST /api/audiences/:id/import-csv { rows, consent_evidence, mark_subscribed }` — up to 1000 rows; `consent_evidence` is required when `mark_subscribed` is true
 - `POST /api/audiences/:id/contact-statuses { emails }` — who is already on the list, so the dialog can warn before the import rather than after
 
+`demo/subscribers-sample.csv` is a ten-row file to try the importer with. It is
+fictional and deliberately awkward: quoted commas, accented names, an
+apostrophe, a `+` tag, mixed-case and a blank company cell, so the parts that
+usually break a parser are in the file you first test with. Every address is on
+`.example`, a reserved domain, so nothing in it can receive real mail.
+
 ### Importing from your CRM
 
 When OpenNewsletter runs next to a CRM in the same Clawnify workspace, set
