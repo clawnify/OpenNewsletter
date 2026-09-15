@@ -1,11 +1,16 @@
 /**
  * Generation-first authoring. A prompt → a structured editorial draft
- * ({ eyebrow, title, subtitle, body_md }). Uses OpenRouter with the
- * org's injected OPENROUTER_API_KEY (the platform standard); the model
- * is overridable via NEWSLETTER_MODEL.
+ * ({ eyebrow, title, subtitle, body_md }).
+ *
+ * The model comes from ./llm.ts, which reads the endpoint out of the
+ * environment — any OpenAI- or Anthropic-compatible API, so nothing here is
+ * tied to one vendor.
  */
+import { generateText } from "ai";
+import { aiModel, describeAiError, type AiEnv } from "./llm";
 
-const DEFAULT_MODEL = "anthropic/claude-sonnet-4";
+/** Sampling temperature shared by every generation call. */
+const TEMPERATURE = 0.7;
 
 export interface GenInput {
   prompt: string;
@@ -32,11 +37,58 @@ Output rules:
 - "subtitle": one-sentence deck/standfirst that expands the title.
 - "body_md": the mail body in Markdown. Use ## and ### for sections, short paragraphs, occasional bullet lists, and at most one > blockquote pull-quote. Do NOT include the title or subtitle in the body. Do NOT add a sign-off/unsubscribe (the template adds the footer). Aim for 250-500 words unless the prompt asks otherwise.`;
 
-export async function generateDraft(env: Record<string, string>, input: GenInput): Promise<GenDraft> {
-  const apiKey = env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("AI generation unavailable: OPENROUTER_API_KEY is not set.");
-  const model = env.NEWSLETTER_MODEL || DEFAULT_MODEL;
+/**
+ * One completion from the configured endpoint. The single place a model is
+ * called, so every generation path shares the same settings and the same
+ * error translation.
+ */
+async function generate(env: AiEnv, req: { system: string; prompt: string }): Promise<string> {
+  const { config, model } = aiModel(env);
+  let result: Awaited<ReturnType<typeof generateText>>;
+  try {
+    result = await generateText({
+      model,
+      system: req.system,
+      prompt: req.prompt,
+      temperature: TEMPERATURE,
+      // A whole newsletter comes back in one response, and endpoints that
+      // don't recognise the model id fall back to a few-thousand-token
+      // ceiling — which silently truncates the body mid-sentence.
+      maxOutputTokens: config.maxOutputTokens,
+    });
+  } catch (e) {
+    // Endpoint misconfiguration is the common failure now, so name the
+    // endpoint and model instead of echoing a raw upstream body.
+    throw new Error(describeAiError(e, config));
+  }
+  if (result.finishReason === "length") {
+    throw new Error(
+      `The response was cut off at the ${config.maxOutputTokens}-token ceiling. Shorten the request or raise maxOutputTokens in server/llm.ts.`,
+    );
+  }
+  const text = result.text.trim();
+  if (!text) throw new Error(`The endpoint at ${config.baseURL} returned an empty response.`);
+  return text;
+}
 
+/** Models sometimes wrap output in a code fence despite being told not to. */
+function stripFences(s: string): string {
+  return s.replace(/^```[a-z]*\n?|\n?```$/gi, "").trim();
+}
+
+/** Tolerant JSON-object extraction — strips code fences / surrounding prose. */
+function parseJsonObject(text: string): Record<string, string> {
+  const cleaned = stripFences(text);
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const a = cleaned.indexOf("{");
+    const b = cleaned.lastIndexOf("}");
+    return a >= 0 && b > a ? JSON.parse(cleaned.slice(a, b + 1)) : {};
+  }
+}
+
+export async function generateDraft(env: AiEnv, input: GenInput): Promise<GenDraft> {
   const userParts: string[] = [];
   if (input.publication) userParts.push(`Publication: ${input.publication}`);
   if (input.current?.title || input.current?.body_md) {
@@ -46,35 +98,7 @@ export async function generateDraft(env: Record<string, string>, input: GenInput
   }
   userParts.push(`Instruction: ${input.prompt}`);
 
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://clawnify.com",
-      "X-Title": "OpenNewsletter",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: SYSTEM },
-        { role: "user", content: userParts.join("\n\n") },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-    }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`OpenRouter error ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("OpenRouter returned no content.");
-
-  const parsed = parseDraft(content);
+  const parsed = parseDraft(await generate(env, { system: SYSTEM, prompt: userParts.join("\n\n") }));
   return {
     eyebrow: parsed.eyebrow?.trim() || "",
     title: parsed.title?.trim() || "Untitled",
@@ -84,35 +108,8 @@ export async function generateDraft(env: Record<string, string>, input: GenInput
 }
 
 /** Low-level single-shot completion (plain text out). */
-export async function completeText(env: Record<string, string>, system: string, user: string): Promise<string> {
-  const apiKey = env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("AI generation unavailable: OPENROUTER_API_KEY is not set.");
-  const model = env.NEWSLETTER_MODEL || DEFAULT_MODEL;
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://clawnify.com",
-      "X-Title": "OpenNewsletter",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: 0.7,
-    }),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`OpenRouter error ${res.status}: ${text.slice(0, 300)}`);
-  }
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error("OpenRouter returned no content.");
-  return content.replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+export async function completeText(env: AiEnv, system: string, user: string): Promise<string> {
+  return stripFences(await generate(env, { system, prompt: user }));
 }
 
 // ── Multi-block batch rewrite (structured per-section output) ────────
@@ -130,15 +127,11 @@ export interface BatchSection {
  * otherwise.
  */
 export async function rewriteBatch(
-  env: Record<string, string>,
+  env: AiEnv,
   prompt: string,
   sections: BatchSection[],
   publication?: string,
 ): Promise<Record<string, string>> {
-  const apiKey = env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("AI generation unavailable: OPENROUTER_API_KEY is not set.");
-  const model = env.NEWSLETTER_MODEL || DEFAULT_MODEL;
-
   const system = `You are an expert newsletter editor. You will be given several SECTIONS of one newsletter, each with an id and a type. Rewrite each section per the instruction so they read as a coherent whole.
 
 Return ONLY a JSON object mapping each section id to its new content:
@@ -158,38 +151,7 @@ Content rules by type:
     .filter(Boolean)
     .join("\n\n");
 
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://clawnify.com",
-      "X-Title": "OpenNewsletter",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-    }),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`OpenRouter error ${res.status}: ${text.slice(0, 300)}`);
-  }
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content || "{}";
-  const cleaned = content.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const a = cleaned.indexOf("{");
-    const b = cleaned.lastIndexOf("}");
-    return a >= 0 && b > a ? JSON.parse(cleaned.slice(a, b + 1)) : {};
-  }
+  return parseJsonObject(await generate(env, { system, prompt: user }));
 }
 
 // ── Single-field (re)generation ──────────────────────────────────────
@@ -209,11 +171,7 @@ export interface FieldInput {
 }
 
 /** Regenerate a single field, given the rest of the mail as context. */
-export async function generateField(env: Record<string, string>, input: FieldInput): Promise<string> {
-  const apiKey = env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("AI generation unavailable: OPENROUTER_API_KEY is not set.");
-  const model = env.NEWSLETTER_MODEL || DEFAULT_MODEL;
-
+export async function generateField(env: AiEnv, input: FieldInput): Promise<string> {
   const ctx = [
     input.publication ? `Publication: ${input.publication}` : "",
     `Current title: ${input.context.title}`,
@@ -223,38 +181,18 @@ export async function generateField(env: Record<string, string>, input: FieldInp
     .filter(Boolean)
     .join("\n");
 
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://clawnify.com",
-      "X-Title": "OpenNewsletter",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: `You are an expert newsletter editor. ${FIELD_GUIDANCE[input.field]}` },
-        { role: "user", content: `${ctx}\n\nInstruction: ${input.prompt}` },
-      ],
-      temperature: 0.7,
-    }),
+  const text = await generate(env, {
+    system: `You are an expert newsletter editor. ${FIELD_GUIDANCE[input.field]}`,
+    prompt: `${ctx}\n\nInstruction: ${input.prompt}`,
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`OpenRouter error ${res.status}: ${text.slice(0, 300)}`);
-  }
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error("OpenRouter returned no content.");
   // Strip accidental code fences / surrounding quotes for short fields.
-  const cleaned = content.replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+  const cleaned = stripFences(text);
   return input.field === "body" ? cleaned : cleaned.replace(/^["']|["']$/g, "");
 }
 
 /** Tolerant JSON extraction — strips code fences / surrounding prose. */
 function parseDraft(content: string): Partial<GenDraft> {
-  const cleaned = content.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  const cleaned = stripFences(content);
   try {
     return JSON.parse(cleaned);
   } catch {
@@ -267,7 +205,9 @@ function parseDraft(content: string): Partial<GenDraft> {
         /* fall through */
       }
     }
-    // Last resort: treat the whole thing as the body.
-    return { body_md: content };
+    // Last resort: treat the whole thing as the body. Models that ignore the
+    // JSON instruction still return usable prose, and losing the draft
+    // entirely is worse than a draft with no eyebrow or title.
+    return { body_md: cleaned };
   }
 }

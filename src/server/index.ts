@@ -6,6 +6,7 @@ import * as contacts from "./contacts";
 import * as crm from "./crm";
 import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
+import { resolveAiConfig, describeAiError, MODEL_ENV_VARS, API_KEY_ENV_VARS, type AiConfig } from "./llm";
 import { renderEmailHtml } from "./render";
 import { sendVerdict } from "./schedule";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
@@ -23,6 +24,13 @@ type Env = {
     CREDENTIALS?: CredentialBinding;
     CLAWNIFY_ORG_ID?: string;
     RESEND_API_KEY?: string;
+    // The language model endpoint — any OpenAI- or Anthropic-compatible API.
+    // See ./llm.ts for how these resolve; OPENROUTER_API_KEY / NEWSLETTER_MODEL
+    // are older aliases that still work.
+    AI_PROVIDER?: string;
+    AI_BASE_URL?: string;
+    AI_API_KEY?: string;
+    AI_MODEL?: string;
     OPENROUTER_API_KEY?: string;
     NEWSLETTER_MODEL?: string;
     GITHUB_TOKEN?: string;
@@ -84,17 +92,19 @@ app.use("*", async (c, next) => {
 // mail there, so every edit lands on the editor's undo stack.
 app.post("/api/chat", async (c) => {
   const env = c.env;
-  if (!env.OPENROUTER_API_KEY) return c.json({ error: "Connect OPENROUTER_API_KEY to use the assistant." }, 400);
+  const { config, error } = aiState(envOf(c));
+  if (!config) return c.json({ error }, 400);
   const body = await c.req.json<{ messages: Parameters<typeof streamNewsletterChat>[0]["messages"]; context?: ChatContext; hints?: Hint[] }>();
   const hintsText = await buildHintsContext(body.hints, env);
   const repos = (body.hints || []).filter((h) => h.kind === "github" && h.repo).map((h) => h.repo.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, ""));
   return streamNewsletterChat({
-    apiKey: env.OPENROUTER_API_KEY,
-    model: env.NEWSLETTER_MODEL,
+    env,
     messages: body.messages,
     context: body.context,
     hintsText,
     github: repos.length ? { repos, token: env.GITHUB_TOKEN } : undefined,
+    // Stops paying for tokens once the user closes the tab mid-answer.
+    abortSignal: c.req.raw.signal,
     readers: {
       list: async () => {
         const rows = await query<{ id: number; title: string; status: string }>("SELECT id, title, status FROM mails ORDER BY updated_at DESC LIMIT 30");
@@ -130,6 +140,28 @@ app.put("/api/mails/:id/conversation", async (c) => {
 
 function envOf(c: any): Record<string, string> {
   return c.env as unknown as Record<string, string>;
+}
+
+/**
+ * One message for "no model is configured", shared by the pre-flight checks so
+ * the client, the Settings pane and a blocked request all say the same thing.
+ */
+function notConfiguredMessage(): string {
+  return `No AI model configured. Set ${API_KEY_ENV_VARS.join(" or ")} (plus AI_PROVIDER / AI_BASE_URL / AI_MODEL for anything other than the default endpoint).`;
+}
+
+/**
+ * Resolve the AI config without throwing. `/api/status` must never 500 on a
+ * typo'd `AI_PROVIDER`, and the generation routes want a 400 with the reason —
+ * so a bad value comes back as `error` rather than as an exception.
+ */
+function aiState(env: ReturnType<typeof envOf>): { config: AiConfig | null; error: string | null } {
+  try {
+    const config = resolveAiConfig(env);
+    return config ? { config, error: null } : { config: null, error: notConfiguredMessage() };
+  } catch (e) {
+    return { config: null, error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 function parseMail(row: any): Mail {
@@ -184,11 +216,14 @@ function fromAddress(s: Settings): string | null {
   return s.from_name ? `${s.from_name} <${s.from_email}>` : s.from_email;
 }
 
+/** Confirmation prompt: cheap, and answers "is the endpoint reachable?" only. */
+const AI_PROBE_PROMPT = 'Reply with the single word "ok".';
+
 // ── status ───────────────────────────────────────────────────────────
 
 app.get("/api/status", async (c) => {
-  const env = envOf(c);
   const provider = await getEmailProvider(c.env);
+  const { config: ai } = aiState(envOf(c));
   let audiences: any[] = [];
   // Audiences are local now; they exist whether or not a backend is connected.
   audiences = await contacts.listAudiences();
@@ -209,12 +244,35 @@ app.get("/api/status", async (c) => {
   return c.json({
     resend_connected: !!provider,
     provider: provider?.name ?? null,
-    ai_available: !!env.OPENROUTER_API_KEY,
-    github_connected: !!env.GITHUB_TOKEN,
+    ai_available: !!ai,
+    // Surfaced so Settings can show which endpoint and model are actually in
+    // use — with a configurable provider, "is AI on?" is rarely the question.
+    ai_provider: ai?.protocol ?? null,
+    ai_model: ai?.model ?? null,
+    ai_base_url: ai?.baseURL ?? null,
+    ai_model_env_var: MODEL_ENV_VARS.find((k) => !!c.env[k]) ?? "AI_MODEL",
+    github_connected: !!c.env.GITHUB_TOKEN,
     crm_connected: crm.crmConfigured(c.env),
     audiences,
     sending_domains,
   });
+});
+
+// Ask the configured model one trivial question. `/api/status` can only report
+// that the env is well-formed, and with an arbitrary endpoint that says nothing
+// about whether the key works or the model exists — a typo otherwise only
+// surfaces as a failed Generate.
+app.post("/api/ai/test", async (c) => {
+  const env = envOf(c);
+  const { config, error } = aiState(env);
+  if (!config) return c.json({ ok: false, error }, 400);
+  try {
+    // describeAiError already ran inside completeText, so `message` is copy.
+    const reply = await completeText(env, "You are a health check. Obey exactly.", AI_PROBE_PROMPT);
+    return c.json({ ok: true, provider: config.protocol, model: config.model, base_url: config.baseURL, reply: reply.slice(0, 80) });
+  } catch (e: any) {
+    return c.json({ ok: false, provider: config.protocol, model: config.model, base_url: config.baseURL, error: e?.message || "The endpoint failed." }, 502);
+  }
 });
 
 // Repos the GITHUB_TOKEN can see — lets the chat offer a picker instead of
@@ -413,7 +471,8 @@ app.post("/api/mails/:id/generate", async (c) => {
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   if (!row) return c.json({ error: "Not found" }, 404);
   const env = envOf(c);
-  if (!env.OPENROUTER_API_KEY) return c.json({ error: "AI generation unavailable: connect an OpenRouter API key." }, 400);
+  const { config: ai, error: aiError } = aiState(env);
+  if (!ai) return c.json({ error: aiError }, 400);
 
   const { prompt, target } = await c.req.json<{
     prompt: string;
@@ -465,7 +524,8 @@ app.post("/api/mails/:id/blocks/:blockId/rewrite", async (c) => {
   const id = Number(c.req.param("id"));
   const blockId = c.req.param("blockId");
   const env = envOf(c);
-  if (!env.OPENROUTER_API_KEY) return c.json({ error: "AI generation unavailable: connect an OpenRouter API key." }, 400);
+  const { config: ai, error: aiError } = aiState(env);
+  if (!ai) return c.json({ error: aiError }, 400);
   const { prompt } = await c.req.json<{ prompt: string }>();
   if (!prompt?.trim()) return c.json({ error: "Prompt required" }, 400);
 
@@ -506,7 +566,8 @@ app.post("/api/mails/:id/blocks/:blockId/rewrite", async (c) => {
 app.post("/api/mails/:id/blocks/rewrite-batch", async (c) => {
   const id = Number(c.req.param("id"));
   const env = envOf(c);
-  if (!env.OPENROUTER_API_KEY) return c.json({ error: "AI generation unavailable: connect an OpenRouter API key." }, 400);
+  const { config: ai, error: aiError } = aiState(env);
+  if (!ai) return c.json({ error: aiError }, 400);
   const { ids, prompt } = await c.req.json<{ ids: string[]; prompt: string }>();
   if (!prompt?.trim()) return c.json({ error: "Prompt required" }, 400);
   if (!ids?.length) return c.json({ error: "Select at least one block" }, 400);
@@ -872,8 +933,8 @@ app.get("/api/confirm", async (c) => {
     : `<h1>Link expired</h1><p>This confirmation link is no longer valid. Try subscribing again.</p>`;
   return c.html(
     `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-      `<title>Subscription</title>` +
-      `<div style="font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:32rem;margin:20vh auto;padding:0 1.5rem">${body}</div>`,
+    `<title>Subscription</title>` +
+    `<div style="font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:32rem;margin:20vh auto;padding:0 1.5rem">${body}</div>`,
     contact ? 200 : 400,
   );
 });
@@ -1186,8 +1247,8 @@ app.get("/api/unsubscribe", async (c) => {
   const name = escapeHtml(s.publication_name || "this newsletter");
   const body = row
     ? `<h1>Unsubscribe</h1><p>Stop sending ${name} to ${escapeHtml(row.email)}?</p>` +
-      `<form method="post" action="/api/unsubscribe?c=${encodeURIComponent(id)}">` +
-      `<button type="submit" style="font:inherit;padding:.6rem 1.1rem;border:0;border-radius:.5rem;background:#111;color:#fff;cursor:pointer">Unsubscribe</button></form>`
+    `<form method="post" action="/api/unsubscribe?c=${encodeURIComponent(id)}">` +
+    `<button type="submit" style="font:inherit;padding:.6rem 1.1rem;border:0;border-radius:.5rem;background:#111;color:#fff;cursor:pointer">Unsubscribe</button></form>`
     : `<h1>Link expired</h1><p>This unsubscribe link is no longer valid.</p>`;
   return c.html(page(body), row ? 200 : 400);
 });
@@ -1200,7 +1261,7 @@ app.post("/api/unsubscribe", async (c) => {
   return c.html(
     page(
       `<h1>Unsubscribed</h1><p>${escapeHtml(row.email)} will no longer receive ` +
-        `${escapeHtml(s.publication_name || "this newsletter")}.</p>`,
+      `${escapeHtml(s.publication_name || "this newsletter")}.</p>`,
     ),
   );
 });

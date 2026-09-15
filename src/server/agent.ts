@@ -1,15 +1,14 @@
 /**
  * The newsletter assistant — an AI SDK agent that drives the editor through
- * conversation. OpenRouter is the model provider. The editing tools have no
- * `execute`: the model emits them as tool-calls that stream to the browser and
- * are applied to the live mail state there (so edits ride the editor's undo
- * stack and the user watches blocks change as the assistant works).
+ * conversation. The model comes from ./llm.ts, so the endpoint is whatever the
+ * environment configures (any OpenAI- or Anthropic-compatible API). The editing
+ * tools have no `execute`: the model emits them as tool-calls that stream to the
+ * browser and are applied to the live mail state there (so edits ride the
+ * editor's undo stack and the user watches blocks change as the assistant works).
  */
 import { streamText, tool, convertToModelMessages, stepCountIs, type UIMessage } from "ai";
-import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { z } from "zod";
-
-export const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
+import { aiModel, describeAiError, type AiEnv } from "./llm";
 
 const INSTRUCTIONS = `You are the assistant inside OpenNewsletter, a generation-first newsletter studio.
 
@@ -209,15 +208,17 @@ function readerTools(readers: MailReaders) {
 
 /** Stream a chat turn as a UI-message stream response for `useChat`. */
 export async function streamNewsletterChat(opts: {
-  apiKey: string;
-  model?: string;
+  /** The Worker env — the model endpoint is read from it. */
+  env: AiEnv;
   messages: UIMessage[];
   context?: ChatContext;
   hintsText?: string;
   github?: { repos: string[]; token?: string };
   readers?: MailReaders;
+  /** Aborts the upstream call when the client goes away. */
+  abortSignal?: AbortSignal;
 }): Promise<Response> {
-  const openrouter = createOpenRouter({ apiKey: opts.apiKey });
+  const { config, model } = aiModel(opts.env);
   const repos = opts.github?.repos || [];
   const tools = {
     ...NEWSLETTER_TOOLS,
@@ -225,11 +226,19 @@ export async function streamNewsletterChat(opts: {
     ...(repos.length ? { search_commits: searchCommitsTool(repos, opts.github?.token) } : {}),
   };
   const result = streamText({
-    model: openrouter(opts.model || DEFAULT_MODEL),
+    model,
     system: `${INSTRUCTIONS}\n\n${contextMessage(opts.context)}${opts.hintsText || ""}`,
     messages: await convertToModelMessages(opts.messages),
     tools,
     stopWhen: stepCountIs(8),
+    // Without this the provider's own default applies (4096 tokens on some
+    // endpoints), which cuts a multi-tool turn short mid-sentence.
+    maxOutputTokens: config.maxOutputTokens,
+    abortSignal: opts.abortSignal,
   });
-  return result.toUIMessageStreamResponse();
+  return result.toUIMessageStreamResponse({
+    // Mid-stream failures never reach the route's error handler, and the SDK's
+    // default copy is "An error occurred." — say what actually went wrong.
+    onError: (error) => describeAiError(error, config),
+  });
 }
