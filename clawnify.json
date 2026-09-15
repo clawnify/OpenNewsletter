@@ -54,10 +54,14 @@
   "env": {
     "oneOf": [
       [
+        "AI_API_KEY",
         "OPENROUTER_API_KEY"
       ]
     ],
     "optional": [
+      "AI_PROVIDER",
+      "AI_BASE_URL",
+      "AI_MODEL",
       "RESEND_API_KEY",
       "NEWSLETTER_MODEL",
       "CRM_APP_ID"

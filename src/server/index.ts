@@ -6,12 +6,16 @@ import * as contacts from "./contacts";
 import * as crm from "./crm";
 import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
+import { resolveAiConfig, describeAiError, MODEL_ENV_VARS, API_KEY_ENV_VARS, type AiConfig } from "./llm";
 import { renderEmailHtml } from "./render";
 import { sendVerdict } from "./schedule";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle } from "../shared/blocks";
 import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
+import * as csv from "../shared/csv";
+import { parseContactQuery } from "../shared/contact-query";
+import { validateEvidence, EVIDENCE_REQUIRED_MESSAGE } from "../shared/consent";
 import type { Block, Mail, Settings, Template } from "../shared/types";
 
 type Env = {
@@ -23,6 +27,13 @@ type Env = {
     CREDENTIALS?: CredentialBinding;
     CLAWNIFY_ORG_ID?: string;
     RESEND_API_KEY?: string;
+    // The language model endpoint — any OpenAI- or Anthropic-compatible API.
+    // See ./llm.ts for how these resolve; OPENROUTER_API_KEY / NEWSLETTER_MODEL
+    // are older aliases that still work.
+    AI_PROVIDER?: string;
+    AI_BASE_URL?: string;
+    AI_API_KEY?: string;
+    AI_MODEL?: string;
     OPENROUTER_API_KEY?: string;
     NEWSLETTER_MODEL?: string;
     GITHUB_TOKEN?: string;
@@ -62,6 +73,9 @@ async function ensureSeed() {
     `ALTER TABLE settings ADD COLUMN logo TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN senders TEXT NOT NULL DEFAULT '[]'`,
     `ALTER TABLE contacts ADD COLUMN crm_contact_id TEXT`,
+    // Which door a contact came through (local | csv | crm). Added after the
+    // CRM import shipped, so it has to be offered to existing databases too.
+    `ALTER TABLE contacts ADD COLUMN origin TEXT NOT NULL DEFAULT 'local'`,
   ]) {
     try {
       await run(sql);
@@ -84,17 +98,19 @@ app.use("*", async (c, next) => {
 // mail there, so every edit lands on the editor's undo stack.
 app.post("/api/chat", async (c) => {
   const env = c.env;
-  if (!env.OPENROUTER_API_KEY) return c.json({ error: "Connect OPENROUTER_API_KEY to use the assistant." }, 400);
+  const { config, error } = aiState(envOf(c));
+  if (!config) return c.json({ error }, 400);
   const body = await c.req.json<{ messages: Parameters<typeof streamNewsletterChat>[0]["messages"]; context?: ChatContext; hints?: Hint[] }>();
   const hintsText = await buildHintsContext(body.hints, env);
   const repos = (body.hints || []).filter((h) => h.kind === "github" && h.repo).map((h) => h.repo.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, ""));
   return streamNewsletterChat({
-    apiKey: env.OPENROUTER_API_KEY,
-    model: env.NEWSLETTER_MODEL,
+    env,
     messages: body.messages,
     context: body.context,
     hintsText,
     github: repos.length ? { repos, token: env.GITHUB_TOKEN } : undefined,
+    // Stops paying for tokens once the user closes the tab mid-answer.
+    abortSignal: c.req.raw.signal,
     readers: {
       list: async () => {
         const rows = await query<{ id: number; title: string; status: string }>("SELECT id, title, status FROM mails ORDER BY updated_at DESC LIMIT 30");
@@ -130,6 +146,28 @@ app.put("/api/mails/:id/conversation", async (c) => {
 
 function envOf(c: any): Record<string, string> {
   return c.env as unknown as Record<string, string>;
+}
+
+/**
+ * One message for "no model is configured", shared by the pre-flight checks so
+ * the client, the Settings pane and a blocked request all say the same thing.
+ */
+function notConfiguredMessage(): string {
+  return `No AI model configured. Set ${API_KEY_ENV_VARS.join(" or ")} (plus AI_PROVIDER / AI_BASE_URL / AI_MODEL for anything other than the default endpoint).`;
+}
+
+/**
+ * Resolve the AI config without throwing. `/api/status` must never 500 on a
+ * typo'd `AI_PROVIDER`, and the generation routes want a 400 with the reason —
+ * so a bad value comes back as `error` rather than as an exception.
+ */
+function aiState(env: ReturnType<typeof envOf>): { config: AiConfig | null; error: string | null } {
+  try {
+    const config = resolveAiConfig(env);
+    return config ? { config, error: null } : { config: null, error: notConfiguredMessage() };
+  } catch (e) {
+    return { config: null, error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 function parseMail(row: any): Mail {
@@ -184,11 +222,14 @@ function fromAddress(s: Settings): string | null {
   return s.from_name ? `${s.from_name} <${s.from_email}>` : s.from_email;
 }
 
+/** Confirmation prompt: cheap, and answers "is the endpoint reachable?" only. */
+const AI_PROBE_PROMPT = 'Reply with the single word "ok".';
+
 // ── status ───────────────────────────────────────────────────────────
 
 app.get("/api/status", async (c) => {
-  const env = envOf(c);
   const provider = await getEmailProvider(c.env);
+  const { config: ai } = aiState(envOf(c));
   let audiences: any[] = [];
   // Audiences are local now; they exist whether or not a backend is connected.
   audiences = await contacts.listAudiences();
@@ -209,12 +250,35 @@ app.get("/api/status", async (c) => {
   return c.json({
     resend_connected: !!provider,
     provider: provider?.name ?? null,
-    ai_available: !!env.OPENROUTER_API_KEY,
-    github_connected: !!env.GITHUB_TOKEN,
+    ai_available: !!ai,
+    // Surfaced so Settings can show which endpoint and model are actually in
+    // use — with a configurable provider, "is AI on?" is rarely the question.
+    ai_provider: ai?.protocol ?? null,
+    ai_model: ai?.model ?? null,
+    ai_base_url: ai?.baseURL ?? null,
+    ai_model_env_var: MODEL_ENV_VARS.find((k) => !!c.env[k]) ?? "AI_MODEL",
+    github_connected: !!c.env.GITHUB_TOKEN,
     crm_connected: crm.crmConfigured(c.env),
     audiences,
     sending_domains,
   });
+});
+
+// Ask the configured model one trivial question. `/api/status` can only report
+// that the env is well-formed, and with an arbitrary endpoint that says nothing
+// about whether the key works or the model exists — a typo otherwise only
+// surfaces as a failed Generate.
+app.post("/api/ai/test", async (c) => {
+  const env = envOf(c);
+  const { config, error } = aiState(env);
+  if (!config) return c.json({ ok: false, error }, 400);
+  try {
+    // describeAiError already ran inside completeText, so `message` is copy.
+    const reply = await completeText(env, "You are a health check. Obey exactly.", AI_PROBE_PROMPT);
+    return c.json({ ok: true, provider: config.protocol, model: config.model, base_url: config.baseURL, reply: reply.slice(0, 80) });
+  } catch (e: any) {
+    return c.json({ ok: false, provider: config.protocol, model: config.model, base_url: config.baseURL, error: e?.message || "The endpoint failed." }, 502);
+  }
 });
 
 // Repos the GITHUB_TOKEN can see — lets the chat offer a picker instead of
@@ -413,7 +477,8 @@ app.post("/api/mails/:id/generate", async (c) => {
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   if (!row) return c.json({ error: "Not found" }, 404);
   const env = envOf(c);
-  if (!env.OPENROUTER_API_KEY) return c.json({ error: "AI generation unavailable: connect an OpenRouter API key." }, 400);
+  const { config: ai, error: aiError } = aiState(env);
+  if (!ai) return c.json({ error: aiError }, 400);
 
   const { prompt, target } = await c.req.json<{
     prompt: string;
@@ -465,7 +530,8 @@ app.post("/api/mails/:id/blocks/:blockId/rewrite", async (c) => {
   const id = Number(c.req.param("id"));
   const blockId = c.req.param("blockId");
   const env = envOf(c);
-  if (!env.OPENROUTER_API_KEY) return c.json({ error: "AI generation unavailable: connect an OpenRouter API key." }, 400);
+  const { config: ai, error: aiError } = aiState(env);
+  if (!ai) return c.json({ error: aiError }, 400);
   const { prompt } = await c.req.json<{ prompt: string }>();
   if (!prompt?.trim()) return c.json({ error: "Prompt required" }, 400);
 
@@ -506,7 +572,8 @@ app.post("/api/mails/:id/blocks/:blockId/rewrite", async (c) => {
 app.post("/api/mails/:id/blocks/rewrite-batch", async (c) => {
   const id = Number(c.req.param("id"));
   const env = envOf(c);
-  if (!env.OPENROUTER_API_KEY) return c.json({ error: "AI generation unavailable: connect an OpenRouter API key." }, 400);
+  const { config: ai, error: aiError } = aiState(env);
+  if (!ai) return c.json({ error: aiError }, 400);
   const { ids, prompt } = await c.req.json<{ ids: string[]; prompt: string }>();
   if (!prompt?.trim()) return c.json({ error: "Prompt required" }, 400);
   if (!ids?.length) return c.json({ error: "Select at least one block" }, 400);
@@ -625,8 +692,24 @@ app.post("/api/audiences", async (c) => {
   return c.json(await contacts.createAudience(b.name.trim(), b.description ?? ""), 201);
 });
 
+/**
+ * One page of a list's contacts, narrowed by the reader's filters.
+ *
+ * Server-side rather than "send everything and filter in the browser": a list
+ * with fifty thousand subscribers would otherwise ship all of them to render
+ * fifty, and the search box would go dead on exactly the lists that need it.
+ *
+ * The query string is parsed by the shared `parseContactQuery`, so the URL the
+ * client builds and the interpretation here cannot drift apart.
+ */
 app.get("/api/audiences/:id/contacts", async (c) => {
-  return c.json(await contacts.listContacts(c.req.param("id")));
+  const id = c.req.param("id");
+  // Scope to a list that exists: without this a typo'd id returns an empty page
+  // with `total: 0`, which reads as "this list is empty" rather than "no such
+  // list", and the reader has no way to tell the difference.
+  const audiences = await contacts.listAudiences();
+  if (!audiences.some((a) => a.id === id)) return c.json({ error: "Audience not found" }, 404);
+  return c.json(await contacts.pageContacts(id, parseContactQuery(new URL(c.req.url).searchParams)));
 });
 
 app.post("/api/audiences/:id/contacts", async (c) => {
@@ -657,6 +740,28 @@ app.post("/api/audiences/:id/contacts", async (c) => {
 app.delete("/api/audiences/:id/contacts/:contactId", async (c) => {
   await contacts.removeContact(c.req.param("id"), c.req.param("contactId"));
   return c.json({ ok: true });
+});
+
+// Which of these addresses are already on the list, and in what state.
+//
+// Exists so the CSV dialog can show "12 here, 3 opted out, 2 already subscribed"
+// *before* the operator commits, rather than reporting it afterwards. Answered
+// as a map keyed by address, because that is how the preview looks rows up.
+app.post("/api/audiences/:id/contact-statuses", async (c) => {
+  const audienceId = c.req.param("id");
+  const audience = (await contacts.listAudiences()).find((a) => a.id === audienceId);
+  if (!audience) return c.json({ error: "Audience not found" }, 404);
+
+  const b = await c.req.json<{ emails?: unknown }>().catch(() => ({}) as { emails?: unknown });
+  // Generously bounded so a whole large file can be checked in one round trip
+  // (the dialog sends every candidate), while still refusing an unbounded body.
+  const emails = Array.isArray(b.emails)
+    ? b.emails.filter((e): e is string => typeof e === "string").slice(0, 20_000)
+    : [];
+  if (emails.length === 0) return c.json({ statuses: {} });
+
+  const found = await contacts.statusesForEmails(audienceId, emails);
+  return c.json({ statuses: Object.fromEntries(found) });
 });
 
 // ── import from the workspace CRM ────────────────────────────────────
@@ -726,7 +831,7 @@ app.post("/api/audiences/:id/import-crm", async (c) => {
     }
     const contact = await contacts.addContact(
       audienceId,
-      { email: row.email, first_name: row.first_name, last_name: row.last_name, crm_contact_id: row.id },
+      { email: row.email, first_name: row.first_name, last_name: row.last_name, crm_contact_id: row.id, origin: "crm" },
       { source: "crm_sync", status: "subscribed", evidence },
     );
     imported.push(contact);
@@ -737,6 +842,86 @@ app.post("/api/audiences/:id/import-crm", async (c) => {
     );
   }
   return c.json({ imported: imported.length, skipped, contacts: imported });
+});
+
+// ── import from a local CSV ──────────────────────────────────────────
+//
+// The browser reads and parses the file (see ../shared/csv.ts) so a large
+// export never has to fit in a request body, then posts the rows the operator
+// previewed. This route re-checks every row rather than trusting the client:
+// it is the only thing standing between a hand-rolled request and the contacts
+// table, and the client is not the part that has to be defensible.
+//
+// Consent works here exactly as it does for the CRM import. A row in a file is
+// not consent, so the operator states how these people agreed, and only that
+// sentence plus an explicit tick turns the rows into `subscribed` contacts.
+// Without both, the rows land `pending` — on the list, mailed to nobody — which
+// is the honest outcome for an import nobody has vouched for.
+
+app.post("/api/audiences/:id/import-csv", async (c) => {
+  type ImportBody = {
+    rows?: unknown;
+    consent_evidence?: unknown;
+    mark_subscribed?: unknown;
+  };
+  const b = await c.req.json<ImportBody>().catch(() => ({}) as ImportBody);
+
+  const audienceId = c.req.param("id");
+  const audience = (await contacts.listAudiences()).find((a) => a.id === audienceId);
+  if (!audience) return c.json({ error: "Audience not found" }, 404);
+
+  const { rows, invalid } = csv.stageImportRows(b.rows);
+  if (rows.length === 0) {
+    return c.json({ error: "No importable rows — map a column to the email address first." }, 400);
+  }
+  if (rows.length > csv.MAX_IMPORT_ROWS) {
+    // Refused rather than truncated: dropping rows silently is worse than
+    // making the operator split the file.
+    return c.json(
+      { error: `${rows.length} rows is over the ${csv.MAX_IMPORT_ROWS}-row limit for one import. Split the file and import it in parts.` },
+      400,
+    );
+  }
+
+  const subscribed = b.mark_subscribed === true;
+  let evidence = "";
+  if (subscribed) {
+    const validated = validateEvidence(b.consent_evidence);
+    if (!validated) return c.json({ error: EVIDENCE_REQUIRED_MESSAGE }, 400);
+    evidence = validated;
+  }
+
+  // One query for what is already on the list, instead of one per row.
+  const existing = await contacts.statusesForEmails(audienceId, rows.map((r) => r.email));
+
+  const imported: contacts.Contact[] = [];
+  const skipped: { line: number; email: string; reason: string }[] = [];
+  for (const row of rows) {
+    const verdict = csv.importVerdict(existing.get(row.email));
+    if (!verdict.import) {
+      skipped.push({ line: row.line, email: row.email, reason: verdict.reason ?? "skipped" });
+      continue;
+    }
+    // A contact already here keeps the name it has (`addContact` only fills
+    // blanks on update), so a thin CSV can't overwrite a good record.
+    const contact = await contacts.addContact(
+      audienceId,
+      { email: row.email, first_name: row.first_name, last_name: row.last_name, origin: "csv" },
+      subscribed
+        ? { source: "import", status: "subscribed", evidence }
+        : { source: "import", status: "pending" },
+    );
+    imported.push(contact);
+  }
+
+  return c.json({
+    imported: imported.length,
+    subscribed: subscribed ? imported.length : 0,
+    pending: subscribed ? 0 : imported.length,
+    skipped,
+    invalid,
+    contacts: imported,
+  });
 });
 
 // ── signup (double opt-in) ───────────────────────────────────────────
@@ -872,8 +1057,8 @@ app.get("/api/confirm", async (c) => {
     : `<h1>Link expired</h1><p>This confirmation link is no longer valid. Try subscribing again.</p>`;
   return c.html(
     `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-      `<title>Subscription</title>` +
-      `<div style="font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:32rem;margin:20vh auto;padding:0 1.5rem">${body}</div>`,
+    `<title>Subscription</title>` +
+    `<div style="font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:32rem;margin:20vh auto;padding:0 1.5rem">${body}</div>`,
     contact ? 200 : 400,
   );
 });
@@ -1186,8 +1371,8 @@ app.get("/api/unsubscribe", async (c) => {
   const name = escapeHtml(s.publication_name || "this newsletter");
   const body = row
     ? `<h1>Unsubscribe</h1><p>Stop sending ${name} to ${escapeHtml(row.email)}?</p>` +
-      `<form method="post" action="/api/unsubscribe?c=${encodeURIComponent(id)}">` +
-      `<button type="submit" style="font:inherit;padding:.6rem 1.1rem;border:0;border-radius:.5rem;background:#111;color:#fff;cursor:pointer">Unsubscribe</button></form>`
+    `<form method="post" action="/api/unsubscribe?c=${encodeURIComponent(id)}">` +
+    `<button type="submit" style="font:inherit;padding:.6rem 1.1rem;border:0;border-radius:.5rem;background:#111;color:#fff;cursor:pointer">Unsubscribe</button></form>`
     : `<h1>Link expired</h1><p>This unsubscribe link is no longer valid.</p>`;
   return c.html(page(body), row ? 200 : 400);
 });
@@ -1200,7 +1385,7 @@ app.post("/api/unsubscribe", async (c) => {
   return c.html(
     page(
       `<h1>Unsubscribed</h1><p>${escapeHtml(row.email)} will no longer receive ` +
-        `${escapeHtml(s.publication_name || "this newsletter")}.</p>`,
+      `${escapeHtml(s.publication_name || "this newsletter")}.</p>`,
     ),
   );
 });

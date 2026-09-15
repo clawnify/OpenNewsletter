@@ -5,8 +5,47 @@
 # Required: send newsletters via Resend (https://resend.com/api-keys)
 RESEND_API_KEY=re_xxxxxxxxxxxxxxxxxxxx
 
-# Required for AI generation (https://openrouter.ai/keys)
-OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxxxxxx
+# ── AI (generation + the assistant) ──────────────────────────────────────────
+# Any OpenAI- or Anthropic-compatible endpoint works — a hosted API, a gateway,
+# or a local server. AI_PROVIDER picks the *protocol* the endpoint speaks (not
+# who hosts it), so one setting covers OpenAI, Anthropic, OpenRouter, Ollama,
+# vLLM, LM Studio, Azure-style gateways and anything else that mimics either API.
+#
+#   AI_PROVIDER   "openai" (default) or "anthropic"
+#   AI_BASE_URL   the endpoint; defaults per protocol
+#   AI_API_KEY    the credential for that endpoint
+#   AI_MODEL      the model id, e.g. gpt-4.1 / claude-sonnet-4-5
+#
+# Only AI_API_KEY is strictly required — the rest fall back to a sensible default.
 
-# Optional: override the generation model (default: anthropic/claude-sonnet-4)
+# --- OpenAI (or anything speaking the OpenAI protocol) ---
+AI_PROVIDER=openai
+AI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxx
+AI_MODEL=gpt-4.1
+# AI_BASE_URL=https://api.openai.com/v1     (default for AI_PROVIDER=openai)
+
+# --- Anthropic (or anything speaking the Anthropic protocol) ---
+# AI_PROVIDER=anthropic
+# AI_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxx
+# AI_MODEL=claude-sonnet-4-5
+# AI_BASE_URL=https://api.anthropic.com/v1  (default for AI_PROVIDER=anthropic)
+
+# --- OpenRouter ---
+# AI_PROVIDER=openai
+# AI_API_KEY=sk-or-xxxxxxxxxxxxxxxxxxxx
+# AI_MODEL=anthropic/claude-sonnet-4       (OpenRouter ids are namespaced)
+# AI_BASE_URL=https://openrouter.ai/api/v1
+
+# --- Local (Ollama, LM Studio, vLLM, …) — most need no real key ---
+# AI_PROVIDER=openai
+# AI_BASE_URL=http://localhost:11434/v1
+# AI_MODEL=llama3.1
+# AI_API_KEY=ollama
+
+# A trailing /v1 is added for a bare host, and a pasted full URL such as
+# .../v1/chat/completions is trimmed back, so either form is fine.
+
+# Older names, still honoured — checked only when their AI_* counterpart is
+# unset, so an existing install keeps working without changes:
+# OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxxxxxx
 # NEWSLETTER_MODEL=anthropic/claude-sonnet-4

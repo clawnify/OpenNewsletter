@@ -15,9 +15,17 @@
  * these helpers call query/get/run directly without threading a handle.
  */
 import { query, get, run } from "./db";
+import {
+  contactQuery,
+  CONTACT_PAGE_SIZE,
+  type ContactQueryArgs,
+  type ContactFilters,
+} from "../shared/contact-query";
 
 export type ContactStatus = "pending" | "subscribed" | "unsubscribed" | "bounced";
 export type ConsentSource = "signup_form" | "import" | "manual" | "crm_sync";
+/** Which door a contact came through. `consent_source` says how, this says where. */
+export type ContactOrigin = "local" | "csv" | "crm";
 
 export interface Audience {
   id: string;
@@ -38,11 +46,12 @@ export interface Contact {
   consent_at: string | null;
   unsubscribed_at: string | null;
   crm_contact_id: string | null;
+  origin: ContactOrigin;
   created_at: string;
 }
 
 const CONTACT_COLS =
-  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, created_at";
+  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, origin, created_at";
 
 const now = () => new Date().toISOString();
 const normalize = (email: string) => email.trim().toLowerCase();
@@ -80,12 +89,84 @@ export async function defaultAudience(): Promise<Audience> {
 
 // ── Contacts ────────────────────────────────────────────────────────────────
 
+/**
+ * Every contact in a list, unpaginated.
+ *
+ * Only for callers that genuinely need the whole set — today that is the CRM
+ * import, which checks whether each candidate is already here. Anything that
+ * *displays* contacts should use `pageContacts`, which cannot pull a
+ * fifty-thousand-row list into memory to show fifty of them.
+ *
+ * Ordered through the shared helper so the tiebreaker applies here too:
+ * `created_at` is second-precision, so a bulk import leaves runs of rows whose
+ * relative order SQLite may otherwise return differently per query.
+ */
 export async function listContacts(audienceId: string): Promise<Contact[]> {
+  const { where, params, orderBy } = contactQuery(audienceId, { sort: "date_desc" });
   return (await query(
-    `SELECT ${CONTACT_COLS} FROM contacts WHERE audience_id = ? ORDER BY created_at DESC`,
-    [audienceId],
+    `SELECT ${CONTACT_COLS} FROM contacts WHERE ${where} ORDER BY ${orderBy}`,
+    params,
   )) as unknown as Contact[];
 }
+
+export interface ContactPage {
+  contacts: Contact[];
+  /** Rows matching the filters, ignoring the page window. */
+  total: number;
+  page: number;
+  limit: number;
+}
+
+/** Unfiltered first page — what the list shows before anyone types anything. */
+const FIRST_PAGE: ContactQueryArgs = {
+  search: "",
+  from: "",
+  to: "",
+  sort: "date_desc",
+  page: 1,
+  limit: CONTACT_PAGE_SIZE,
+};
+
+/**
+ * One page of a filtered contact list, plus the total it was drawn from.
+ *
+ * The count and the page run from the *same* WHERE clause and the same
+ * parameter list, built once by `contactQuery`. Computing the total any other
+ * way — a second hand-written query, a cached count — is how a pager ends up
+ * offering page 7 of 6 rows.
+ *
+ * A `from` later than `to` matches nothing and reports `total: 0`. That is not
+ * worth rejecting in the API: an empty result with an accurate total is a
+ * truthful answer, and the UI can explain it better than an error can.
+ */
+export async function pageContacts(
+  audienceId: string,
+  args: ContactQueryArgs = FIRST_PAGE,
+): Promise<ContactPage> {
+  const { search, from, to, sort, page, limit } = args;
+  const filters: ContactFilters = { search, from, to, sort };
+  const { where, params, orderBy } = contactQuery(audienceId, filters);
+
+  const counted = (await get(`SELECT COUNT(*) AS n FROM contacts WHERE ${where}`, params)) as
+    | { n: number }
+    | null;
+  const total = counted?.n ?? 0;
+
+  // A search can shrink the result set below the page the reader is on — e.g.
+  // they are on page 9, then type a term with 12 matches. Clamp rather than
+  // return an empty page for a filter that does have rows.
+  const lastPage = Math.max(1, Math.ceil(total / limit));
+  const safePage = Math.min(page, lastPage);
+
+  const contacts = (await query(
+    `SELECT ${CONTACT_COLS} FROM contacts WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+    [...params, limit, (safePage - 1) * limit],
+  )) as unknown as Contact[];
+
+  return { contacts, total, page: safePage, limit };
+}
+
+export type { ContactQueryArgs, ContactSort } from "../shared/contact-query";
 
 /**
  * Add a contact directly (operator action or import).
@@ -97,7 +178,13 @@ export async function listContacts(audienceId: string): Promise<Contact[]> {
  */
 export async function addContact(
   audienceId: string,
-  input: { email: string; first_name?: string; last_name?: string; crm_contact_id?: string },
+  input: {
+    email: string;
+    first_name?: string;
+    last_name?: string;
+    crm_contact_id?: string;
+    origin?: ContactOrigin;
+  },
   consent: { source: ConsentSource; status?: ContactStatus; evidence?: string } = {
     source: "manual",
   },
@@ -113,11 +200,15 @@ export async function addContact(
   if (existing) {
     // Never silently resurrect someone who opted out — that is precisely the
     // re-import that generates spam complaints. They must opt in again.
+    // (`bounced` is protected the same way, but on the import paths — see
+    // `importVerdict` — where the row arrived from a file rather than from
+    // someone deliberately re-adding one person.)
     if (existing.status === "unsubscribed") return existing;
     await run(
       `UPDATE contacts SET first_name = ?, last_name = ?, status = ?,
               consent_source = ?, consent_at = ?, consent_evidence = ?,
-              crm_contact_id = COALESCE(?, crm_contact_id)
+              crm_contact_id = COALESCE(?, crm_contact_id),
+              origin = COALESCE(?, origin)
          WHERE id = ?`,
       [
         input.first_name ?? existing.first_name,
@@ -127,6 +218,7 @@ export async function addContact(
         status === "subscribed" ? (existing.consent_at ?? now()) : existing.consent_at,
         consent.evidence ?? "",
         input.crm_contact_id ?? null,
+        input.origin ?? null,
         existing.id,
       ],
     );
@@ -138,8 +230,8 @@ export async function addContact(
   const id = `con_${crypto.randomUUID().replace(/-/g, "")}`;
   await run(
     `INSERT INTO contacts (id, audience_id, email, first_name, last_name, status,
-                           consent_source, consent_at, consent_evidence, crm_contact_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                           consent_source, consent_at, consent_evidence, crm_contact_id, origin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       audienceId,
@@ -151,6 +243,7 @@ export async function addContact(
       status === "subscribed" ? now() : null,
       consent.evidence ?? "",
       input.crm_contact_id ?? null,
+      input.origin ?? (input.crm_contact_id ? "crm" : "local"),
     ],
   );
   return (await get(`SELECT ${CONTACT_COLS} FROM contacts WHERE id = ?`, [id])) as Contact;
@@ -171,6 +264,36 @@ export async function subscribedRecipients(audienceId: string): Promise<Contact[
       WHERE audience_id = ? AND status = 'subscribed' ORDER BY created_at`,
     [audienceId],
   )) as unknown as Contact[];
+}
+
+/**
+ * Existing status for a set of addresses, keyed by normalized email.
+ *
+ * An import has to decide, per row, whether the person is already on the list —
+ * and there can be a thousand rows against a list that is already large, so
+ * reading the whole audience per row is the difference between a few queries
+ * and a few thousand. Chunked to stay well inside D1's bound-parameter limit.
+ */
+export async function statusesForEmails(
+  audienceId: string,
+  emails: string[],
+): Promise<Map<string, ContactStatus>> {
+  const out = new Map<string, ContactStatus>();
+  const unique = Array.from(new Set(emails.map(normalize)));
+  const CHUNK = 90; // 90 placeholders + audience_id stays under the limit.
+
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const slice = unique.slice(i, i + CHUNK);
+    const rows = (await query(
+      `SELECT email, status FROM contacts
+        WHERE audience_id = ? AND email IN (${slice.map(() => "?").join(",")})`,
+      [audienceId, ...slice],
+    )) as unknown as { email: string; status: ContactStatus }[];
+    // Last write wins only if the same address somehow appears twice; the
+    // unique index on (audience_id, email) means it cannot.
+    for (const r of rows) out.set(r.email, r.status);
+  }
+  return out;
 }
 
 // ── Consent transitions ─────────────────────────────────────────────────────

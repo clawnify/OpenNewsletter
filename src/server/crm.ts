@@ -7,6 +7,11 @@
 // consent was obtained, and only then do they become subscribers, keyed back
 // to the CRM by id. Without CRM_APP_ID every function reports "not connected"
 // and the rest of the app behaves as a single install.
+import { validateEvidence } from "../shared/consent";
+
+// Re-exported so the CRM import keeps one import site for its own rules; the
+// rule itself is shared with the CSV import and the manual add.
+export { validateEvidence };
 
 export interface CrmEnv {
   CRM_APP_ID?: string;
@@ -41,17 +46,6 @@ export function crmConfigured(env: CrmEnv): boolean {
 export function crmProxyUrl(appId: string, path: string): string {
   const p = path.startsWith("/") ? path : `/${path}`;
   return `https://provision.clawnify.com/v1/apps/${encodeURIComponent(appId)}/proxy${p}`;
-}
-
-/**
- * Evidence is the one field that turns a CRM row into a subscriber, so it is
- * validated here rather than trusted from the form: short strings like "ok"
- * are exactly the non-evidence that makes a list indefensible.
- */
-export function validateEvidence(text: unknown): string | null {
-  if (typeof text !== "string") return null;
-  const t = text.trim();
-  return t.length >= 12 ? t : null;
 }
 
 export function pickIds(input: unknown): string[] | null {

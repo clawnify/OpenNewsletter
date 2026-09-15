@@ -88,6 +88,12 @@ CREATE TABLE IF NOT EXISTS contacts (
   -- person, this row keeps the consent, and the id lets unsubscribes report
   -- back to the CRM timeline.
   crm_contact_id TEXT,
+  -- Where the row came from when it was not the CRM: the CSV import or the
+  -- operator typing an address in. `consent_source` says how consent was
+  -- obtained; this says which door the person arrived through, which is the
+  -- question you actually ask when a list turns out to be bad.
+  origin TEXT NOT NULL DEFAULT 'local'
+    CHECK (origin IN ('local', 'csv', 'crm')),
   created_at TEXT DEFAULT (datetime('now'))
 );
 

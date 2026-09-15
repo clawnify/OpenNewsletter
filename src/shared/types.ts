@@ -16,15 +16,15 @@ export type Block =
   | (BlockBase & { type: "heading"; level: 1 | 2 | 3; text: string; align?: "left" | "center" })
   // Body / styled text. Eyebrow & subtitle are just text with color + scale.
   | (BlockBase & {
-      type: "text";
-      md: string;
-      color?: TextColor;
-      /** Font-size multiplier of the body size (1 = body, 0.82 = eyebrow, 1.25 = deck). */
-      scale?: number;
-      uppercase?: boolean;
-      italic?: boolean;
-      align?: "left" | "center";
-    })
+    type: "text";
+    md: string;
+    color?: TextColor;
+    /** Font-size multiplier of the body size (1 = body, 0.82 = eyebrow, 1.25 = deck). */
+    scale?: number;
+    uppercase?: boolean;
+    italic?: boolean;
+    align?: "left" | "center";
+  })
   | (BlockBase & { type: "image"; src: string; alt: string; caption: string; href: string })
   | (BlockBase & { type: "button"; text: string; href: string; align: "left" | "center" | "right" })
   | (BlockBase & { type: "list"; ordered: boolean; items: string[] })
@@ -116,6 +116,14 @@ export interface Settings {
 export interface StatusInfo {
   resend_connected: boolean;
   ai_available: boolean;
+  /** Protocol of the configured model endpoint: "openai" | "anthropic". */
+  ai_provider: string | null;
+  /** The model id actually in use — a bare name, not a vendor-prefixed one. */
+  ai_model: string | null;
+  /** The endpoint the model lives at, so Settings can show where calls go. */
+  ai_base_url: string | null;
+  /** Which env var supplied the model id, so Settings names the one to edit. */
+  ai_model_env_var: string;
   github_connected: boolean;
   /** A CRM in the same workspace is reachable; enables "Import from CRM". */
   crm_connected?: boolean;
@@ -150,5 +158,21 @@ export interface ResendContact {
   consent_at?: string | null;
   /** Set when imported from the workspace CRM; the CRM keeps the person. */
   crm_contact_id?: string | null;
+  /** Which door the contact came through: typed in, a CSV file, or the CRM. */
+  origin?: "local" | "csv" | "crm";
   created_at?: string;
+}
+
+/**
+ * One page of a subscriber list, as `GET /api/audiences/:id/contacts` returns.
+ *
+ * `total` always describes the *filtered* set, not the whole list: it is what
+ * the pager divides, and it is computed from the same WHERE clause as
+ * `contacts`, so the two cannot disagree.
+ */
+export interface ResendContactPage {
+  contacts: ResendContact[];
+  total: number;
+  page: number;
+  limit: number;
 }
