@@ -18,6 +18,8 @@ import { query, get, run } from "./db";
 
 export type ContactStatus = "pending" | "subscribed" | "unsubscribed" | "bounced";
 export type ConsentSource = "signup_form" | "import" | "manual" | "crm_sync";
+/** Which door a contact came through. `consent_source` says how, this says where. */
+export type ContactOrigin = "local" | "csv" | "crm";
 
 export interface Audience {
   id: string;
@@ -38,11 +40,12 @@ export interface Contact {
   consent_at: string | null;
   unsubscribed_at: string | null;
   crm_contact_id: string | null;
+  origin: ContactOrigin;
   created_at: string;
 }
 
 const CONTACT_COLS =
-  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, created_at";
+  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, origin, created_at";
 
 const now = () => new Date().toISOString();
 const normalize = (email: string) => email.trim().toLowerCase();
@@ -97,7 +100,13 @@ export async function listContacts(audienceId: string): Promise<Contact[]> {
  */
 export async function addContact(
   audienceId: string,
-  input: { email: string; first_name?: string; last_name?: string; crm_contact_id?: string },
+  input: {
+    email: string;
+    first_name?: string;
+    last_name?: string;
+    crm_contact_id?: string;
+    origin?: ContactOrigin;
+  },
   consent: { source: ConsentSource; status?: ContactStatus; evidence?: string } = {
     source: "manual",
   },
@@ -113,11 +122,15 @@ export async function addContact(
   if (existing) {
     // Never silently resurrect someone who opted out — that is precisely the
     // re-import that generates spam complaints. They must opt in again.
+    // (`bounced` is protected the same way, but on the import paths — see
+    // `importVerdict` — where the row arrived from a file rather than from
+    // someone deliberately re-adding one person.)
     if (existing.status === "unsubscribed") return existing;
     await run(
       `UPDATE contacts SET first_name = ?, last_name = ?, status = ?,
               consent_source = ?, consent_at = ?, consent_evidence = ?,
-              crm_contact_id = COALESCE(?, crm_contact_id)
+              crm_contact_id = COALESCE(?, crm_contact_id),
+              origin = COALESCE(?, origin)
          WHERE id = ?`,
       [
         input.first_name ?? existing.first_name,
@@ -127,6 +140,7 @@ export async function addContact(
         status === "subscribed" ? (existing.consent_at ?? now()) : existing.consent_at,
         consent.evidence ?? "",
         input.crm_contact_id ?? null,
+        input.origin ?? null,
         existing.id,
       ],
     );
@@ -138,8 +152,8 @@ export async function addContact(
   const id = `con_${crypto.randomUUID().replace(/-/g, "")}`;
   await run(
     `INSERT INTO contacts (id, audience_id, email, first_name, last_name, status,
-                           consent_source, consent_at, consent_evidence, crm_contact_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                           consent_source, consent_at, consent_evidence, crm_contact_id, origin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       audienceId,
@@ -151,6 +165,7 @@ export async function addContact(
       status === "subscribed" ? now() : null,
       consent.evidence ?? "",
       input.crm_contact_id ?? null,
+      input.origin ?? (input.crm_contact_id ? "crm" : "local"),
     ],
   );
   return (await get(`SELECT ${CONTACT_COLS} FROM contacts WHERE id = ?`, [id])) as Contact;
@@ -171,6 +186,36 @@ export async function subscribedRecipients(audienceId: string): Promise<Contact[
       WHERE audience_id = ? AND status = 'subscribed' ORDER BY created_at`,
     [audienceId],
   )) as unknown as Contact[];
+}
+
+/**
+ * Existing status for a set of addresses, keyed by normalized email.
+ *
+ * An import has to decide, per row, whether the person is already on the list —
+ * and there can be a thousand rows against a list that is already large, so
+ * reading the whole audience per row is the difference between a few queries
+ * and a few thousand. Chunked to stay well inside D1's bound-parameter limit.
+ */
+export async function statusesForEmails(
+  audienceId: string,
+  emails: string[],
+): Promise<Map<string, ContactStatus>> {
+  const out = new Map<string, ContactStatus>();
+  const unique = Array.from(new Set(emails.map(normalize)));
+  const CHUNK = 90; // 90 placeholders + audience_id stays under the limit.
+
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const slice = unique.slice(i, i + CHUNK);
+    const rows = (await query(
+      `SELECT email, status FROM contacts
+        WHERE audience_id = ? AND email IN (${slice.map(() => "?").join(",")})`,
+      [audienceId, ...slice],
+    )) as unknown as { email: string; status: ContactStatus }[];
+    // Last write wins only if the same address somehow appears twice; the
+    // unique index on (audience_id, email) means it cannot.
+    for (const r of rows) out.set(r.email, r.status);
+  }
+  return out;
 }
 
 // ── Consent transitions ─────────────────────────────────────────────────────

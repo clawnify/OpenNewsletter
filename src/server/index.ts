@@ -13,6 +13,8 @@ import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle } from "../shared/blocks";
 import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
+import * as csv from "../shared/csv";
+import { validateEvidence, EVIDENCE_REQUIRED_MESSAGE } from "../shared/consent";
 import type { Block, Mail, Settings, Template } from "../shared/types";
 
 type Env = {
@@ -70,6 +72,9 @@ async function ensureSeed() {
     `ALTER TABLE settings ADD COLUMN logo TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN senders TEXT NOT NULL DEFAULT '[]'`,
     `ALTER TABLE contacts ADD COLUMN crm_contact_id TEXT`,
+    // Which door a contact came through (local | csv | crm). Added after the
+    // CRM import shipped, so it has to be offered to existing databases too.
+    `ALTER TABLE contacts ADD COLUMN origin TEXT NOT NULL DEFAULT 'local'`,
   ]) {
     try {
       await run(sql);
@@ -720,6 +725,28 @@ app.delete("/api/audiences/:id/contacts/:contactId", async (c) => {
   return c.json({ ok: true });
 });
 
+// Which of these addresses are already on the list, and in what state.
+//
+// Exists so the CSV dialog can show "12 here, 3 opted out, 2 already subscribed"
+// *before* the operator commits, rather than reporting it afterwards. Answered
+// as a map keyed by address, because that is how the preview looks rows up.
+app.post("/api/audiences/:id/contact-statuses", async (c) => {
+  const audienceId = c.req.param("id");
+  const audience = (await contacts.listAudiences()).find((a) => a.id === audienceId);
+  if (!audience) return c.json({ error: "Audience not found" }, 404);
+
+  const b = await c.req.json<{ emails?: unknown }>().catch(() => ({}) as { emails?: unknown });
+  // Generously bounded so a whole large file can be checked in one round trip
+  // (the dialog sends every candidate), while still refusing an unbounded body.
+  const emails = Array.isArray(b.emails)
+    ? b.emails.filter((e): e is string => typeof e === "string").slice(0, 20_000)
+    : [];
+  if (emails.length === 0) return c.json({ statuses: {} });
+
+  const found = await contacts.statusesForEmails(audienceId, emails);
+  return c.json({ statuses: Object.fromEntries(found) });
+});
+
 // ── import from the workspace CRM ────────────────────────────────────
 //
 // Only mounted in spirit: both routes answer 409 unless CRM_APP_ID is set, so
@@ -787,7 +814,7 @@ app.post("/api/audiences/:id/import-crm", async (c) => {
     }
     const contact = await contacts.addContact(
       audienceId,
-      { email: row.email, first_name: row.first_name, last_name: row.last_name, crm_contact_id: row.id },
+      { email: row.email, first_name: row.first_name, last_name: row.last_name, crm_contact_id: row.id, origin: "crm" },
       { source: "crm_sync", status: "subscribed", evidence },
     );
     imported.push(contact);
@@ -798,6 +825,86 @@ app.post("/api/audiences/:id/import-crm", async (c) => {
     );
   }
   return c.json({ imported: imported.length, skipped, contacts: imported });
+});
+
+// ── import from a local CSV ──────────────────────────────────────────
+//
+// The browser reads and parses the file (see ../shared/csv.ts) so a large
+// export never has to fit in a request body, then posts the rows the operator
+// previewed. This route re-checks every row rather than trusting the client:
+// it is the only thing standing between a hand-rolled request and the contacts
+// table, and the client is not the part that has to be defensible.
+//
+// Consent works here exactly as it does for the CRM import. A row in a file is
+// not consent, so the operator states how these people agreed, and only that
+// sentence plus an explicit tick turns the rows into `subscribed` contacts.
+// Without both, the rows land `pending` — on the list, mailed to nobody — which
+// is the honest outcome for an import nobody has vouched for.
+
+app.post("/api/audiences/:id/import-csv", async (c) => {
+  type ImportBody = {
+    rows?: unknown;
+    consent_evidence?: unknown;
+    mark_subscribed?: unknown;
+  };
+  const b = await c.req.json<ImportBody>().catch(() => ({}) as ImportBody);
+
+  const audienceId = c.req.param("id");
+  const audience = (await contacts.listAudiences()).find((a) => a.id === audienceId);
+  if (!audience) return c.json({ error: "Audience not found" }, 404);
+
+  const { rows, invalid } = csv.stageImportRows(b.rows);
+  if (rows.length === 0) {
+    return c.json({ error: "No importable rows — map a column to the email address first." }, 400);
+  }
+  if (rows.length > csv.MAX_IMPORT_ROWS) {
+    // Refused rather than truncated: dropping rows silently is worse than
+    // making the operator split the file.
+    return c.json(
+      { error: `${rows.length} rows is over the ${csv.MAX_IMPORT_ROWS}-row limit for one import. Split the file and import it in parts.` },
+      400,
+    );
+  }
+
+  const subscribed = b.mark_subscribed === true;
+  let evidence = "";
+  if (subscribed) {
+    const validated = validateEvidence(b.consent_evidence);
+    if (!validated) return c.json({ error: EVIDENCE_REQUIRED_MESSAGE }, 400);
+    evidence = validated;
+  }
+
+  // One query for what is already on the list, instead of one per row.
+  const existing = await contacts.statusesForEmails(audienceId, rows.map((r) => r.email));
+
+  const imported: contacts.Contact[] = [];
+  const skipped: { line: number; email: string; reason: string }[] = [];
+  for (const row of rows) {
+    const verdict = csv.importVerdict(existing.get(row.email));
+    if (!verdict.import) {
+      skipped.push({ line: row.line, email: row.email, reason: verdict.reason ?? "skipped" });
+      continue;
+    }
+    // A contact already here keeps the name it has (`addContact` only fills
+    // blanks on update), so a thin CSV can't overwrite a good record.
+    const contact = await contacts.addContact(
+      audienceId,
+      { email: row.email, first_name: row.first_name, last_name: row.last_name, origin: "csv" },
+      subscribed
+        ? { source: "import", status: "subscribed", evidence }
+        : { source: "import", status: "pending" },
+    );
+    imported.push(contact);
+  }
+
+  return c.json({
+    imported: imported.length,
+    subscribed: subscribed ? imported.length : 0,
+    pending: subscribed ? 0 : imported.length,
+    skipped,
+    invalid,
+    contacts: imported,
+  });
 });
 
 // ── signup (double opt-in) ───────────────────────────────────────────

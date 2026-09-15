@@ -158,5 +158,7 @@ export interface ResendContact {
   consent_at?: string | null;
   /** Set when imported from the workspace CRM; the CRM keeps the person. */
   crm_contact_id?: string | null;
+  /** Which door the contact came through: typed in, a CSV file, or the CRM. */
+  origin?: "local" | "csv" | "crm";
   created_at?: string;
 }

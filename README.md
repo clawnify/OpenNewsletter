@@ -30,6 +30,10 @@ account. The provider is just delivery, and it's swappable.
   Mono, Bold Bulletin); **Save as…** turns any mail into your own template.
 - **Your subscriber list, in your database** — audiences and contacts live in
   D1. Manage them from the Audience view; export them whenever you like.
+- **Import subscribers from a CSV or your CRM** — the file is parsed in your
+  browser and you approve the result row by row, including everything that will
+  be skipped. Consent is a deliberate choice either way, never a side effect of
+  a file existing.
 - **Double opt-in** — signups land as `pending` and only become subscribers
   when the person confirms by email. Only confirmed contacts are ever sent to,
   so an import can't quietly start mailing people who never asked.
@@ -130,6 +134,35 @@ you're migrating a list that already has recorded consent, pass
 `consent_evidence` to `POST /api/audiences/:id/contacts` to record how it was
 obtained and mark them subscribed.
 
+### Importing from a CSV
+
+**Import CSV** in the Audience view reads a file from your machine. The parsing
+happens in the browser: commas and newlines inside quoted names, `;`-separated
+European exports, CRLF from Excel and a UTF-8 BOM are all handled, and the
+delimiter is detected (with an override) rather than assumed. You then map
+columns to first name / last name / email and see the result before anything is
+saved — every row that will be imported, and every row that will not, with the
+reason.
+
+By default the rows land **`pending`**: on the list, mailed to nobody. Turn on
+**Mark these people as subscribed** and give a sentence describing how they
+agreed, and they are imported as subscribers instead — that sentence is stored
+on every row as `consent_evidence` with `consent_source = 'import'`.
+
+An import never touches someone it should not:
+
+- **Unsubscribed** — never re-imported. A file is not a new consent, and
+  re-adding someone who opted out is what turns a migration into spam
+  complaints.
+- **Already subscribed** — skipped, and their existing consent record is left
+  alone rather than overwritten with a row from a spreadsheet.
+- **Bounced** — skipped; the address is known bad.
+- **Duplicate in the same file** — collapsed to the first occurrence, matched
+  case- and whitespace-insensitively.
+
+- `POST /api/audiences/:id/import-csv { rows, consent_evidence, mark_subscribed }` — up to 1000 rows; `consent_evidence` is required when `mark_subscribed` is true
+- `POST /api/audiences/:id/contact-statuses { emails }` — who is already on the list, so the dialog can warn before the import rather than after
+
 ### Importing from your CRM
 
 When OpenNewsletter runs next to a CRM in the same Clawnify workspace, set
@@ -179,11 +212,14 @@ src/
     design.ts        — DESIGN.md token model, panel metadata, CSS-var + serializer
     templates.ts     — built-in templates (runtime mirror of templates/*/DESIGN.md)
     markdown.ts      — email-safe Markdown → HTML
+    csv.ts           — CSV parsing, column mapping and import rules (browser + server)
+    consent.ts       — what counts as consent evidence, shared by every import path
     types.ts         — Mail, Template, Settings, Contact types
   server/
     index.ts         — Hono API (mails, templates, settings, audiences,
                        subscribe/confirm/unsubscribe, widget, generate, send)
     contacts.ts      — audiences + contacts + the consent lifecycle
+    crm.ts           — the sibling CRM's contacts, via the platform proxy
     render.ts        — mail + tokens → email-safe inlined HTML
     ai.ts            — generation (prompt → draft) over the configured endpoint
     llm.ts           — which endpoint/protocol/model, from the environment
@@ -197,6 +233,8 @@ src/
       editor.tsx       — top bar, preview/edit, generation bar
       preview.tsx      — live canvas (mirrors render.ts)
       design-panel.tsx — the DESIGN.md token editor
+      csv-import-dialog.tsx  — local CSV import: map columns, review, consent
+      crm-import-dialog.tsx  — the same, reading a sibling CRM
       …                — mails, templates, audience, settings views
 DESIGN.md            — the default brand (Classic Editorial), Google Labs format
 templates/<slug>/    — each template as DESIGN.md + content.md

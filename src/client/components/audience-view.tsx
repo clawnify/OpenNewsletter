@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, RefreshCw, Database } from "lucide-react";
+import { Plus, Trash2, RefreshCw, Database, Upload } from "lucide-react";
 import { api } from "../api";
 import { useStore } from "../store";
 import type { ResendAudience, ResendContact } from "../../shared/types";
@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CrmImportDialog } from "./crm-import-dialog";
+import { CsvImportDialog } from "./csv-import-dialog";
 
 export function AudienceView() {
   const { status, setError } = useStore();
@@ -17,6 +18,7 @@ export function AudienceView() {
   const [email, setEmail] = useState("");
   const [first, setFirst] = useState("");
   const [crmOpen, setCrmOpen] = useState(false);
+  const [csvOpen, setCsvOpen] = useState(false);
 
   useEffect(() => {
     if (!selected && audiences.length) setSelected(audiences[0].id);
@@ -69,6 +71,9 @@ export function AudienceView() {
           <p className="text-sm text-muted-foreground">Your subscribers, stored in this app. Only confirmed contacts receive sends.</p>
         </div>
         <div className="flex items-center gap-2">
+          <Button variant="outline" disabled={!selected} onClick={() => setCsvOpen(true)}>
+            <Upload size={15} /> Import CSV
+          </Button>
           {status?.crm_connected ? (
             <Button variant="outline" disabled={!selected} onClick={() => setCrmOpen(true)}>
               <Database size={15} /> Import from CRM
@@ -81,79 +86,94 @@ export function AudienceView() {
       </header>
       <div className="mx-auto w-full max-w-4xl px-8 py-6">
 
-      {status?.crm_connected && selected ? (
-        <CrmImportDialog
-          open={crmOpen}
-          onOpenChange={setCrmOpen}
-          audienceId={selected}
-          audienceName={audiences.find((a: ResendAudience) => a.id === selected)?.name ?? ""}
-          onImported={() => load(selected)}
-        />
-      ) : null}
+        {status?.crm_connected && selected ? (
+          <CrmImportDialog
+            open={crmOpen}
+            onOpenChange={setCrmOpen}
+            audienceId={selected}
+            audienceName={audiences.find((a: ResendAudience) => a.id === selected)?.name ?? ""}
+            onImported={() => load(selected)}
+          />
+        ) : null}
 
-      <div className="mb-4 w-72">
-        <Select value={selected} onValueChange={setSelected}>
-          <SelectTrigger>
-            <SelectValue placeholder={audiences.length ? "Select audience" : "No audiences yet"} />
-          </SelectTrigger>
-          <SelectContent>
-            {audiences.map((a: ResendAudience) => (
-              <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+        {selected ? (
+          <CsvImportDialog
+            open={csvOpen}
+            onOpenChange={setCsvOpen}
+            audienceId={selected}
+            audienceName={audiences.find((a: ResendAudience) => a.id === selected)?.name ?? ""}
+            onImported={() => load(selected)}
+          />
+        ) : null}
 
-      <div className="mb-4 flex gap-2 rounded-md bg-card p-3 shadow-edge">
-        <Input placeholder="email@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
-        <Input className="w-40" placeholder="First name" value={first} onChange={(e) => setFirst(e.target.value)} />
-        <Button disabled={!selected || !email.trim()} onClick={add}>
-          <Plus size={15} /> Add
-        </Button>
-      </div>
+        <div className="mb-4 w-72">
+          <Select value={selected} onValueChange={setSelected}>
+            <SelectTrigger>
+              <SelectValue placeholder={audiences.length ? "Select audience" : "No audiences yet"} />
+            </SelectTrigger>
+            <SelectContent>
+              {audiences.map((a: ResendAudience) => (
+                <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
 
-      <div className="overflow-hidden rounded-md bg-card shadow-edge">
-        {loading ? (
-          <div className="p-6 text-center text-sm text-muted-foreground">Loading…</div>
-        ) : contacts.length === 0 ? (
-          <div className="p-6 text-center text-sm text-muted-foreground">No contacts in this audience yet.</div>
-        ) : (
-          <ul className="divide-y">
-            {contacts.map((c) => (
-              <li key={c.id} className="flex items-center gap-3 px-4 py-2.5">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm">{c.email}</div>
-                  {c.first_name || c.last_name ? (
-                    <div className="truncate text-xs text-muted-foreground">{[c.first_name, c.last_name].filter(Boolean).join(" ")}</div>
+        <div className="mb-4 flex gap-2 rounded-md bg-card p-3 shadow-edge">
+          <Input placeholder="email@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <Input className="w-40" placeholder="First name" value={first} onChange={(e) => setFirst(e.target.value)} />
+          <Button disabled={!selected || !email.trim()} onClick={add}>
+            <Plus size={15} /> Add
+          </Button>
+        </div>
+
+        <div className="overflow-hidden rounded-md bg-card shadow-edge">
+          {loading ? (
+            <div className="p-6 text-center text-sm text-muted-foreground">Loading…</div>
+          ) : contacts.length === 0 ? (
+            <div className="p-6 text-center text-sm text-muted-foreground">No contacts in this audience yet.</div>
+          ) : (
+            <ul className="divide-y">
+              {contacts.map((c) => (
+                <li key={c.id} className="flex items-center gap-3 px-4 py-2.5">
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm">{c.email}</div>
+                    {c.first_name || c.last_name ? (
+                      <div className="truncate text-xs text-muted-foreground">{[c.first_name, c.last_name].filter(Boolean).join(" ")}</div>
+                    ) : null}
+                  </div>
+                  {c.consent_source === "crm_sync" ? (
+                    <span className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground" title="Imported from your CRM with recorded consent">
+                      CRM
+                    </span>
                   ) : null}
-                </div>
-                {c.consent_source === "crm_sync" ? (
-                  <span className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground" title="Imported from your CRM with recorded consent">
-                    CRM
-                  </span>
-                ) : null}
-                {c.status && c.status !== "subscribed" ? (
-                  <span
-                    className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
-                    title={
-                      c.status === "pending"
-                        ? "Signed up but hasn't confirmed — not included in sends"
-                        : c.status === "bounced"
-                          ? "Delivery failed permanently"
-                          : "Unsubscribed"
-                    }
-                  >
-                    {c.status === "pending" ? "Pending" : c.status === "bounced" ? "Bounced" : "Unsub"}
-                  </span>
-                ) : null}
-                <button className="rounded-lg p-2 text-muted-foreground hover:text-destructive" onClick={() => remove(c.id)} aria-label="Remove contact">
-                  <Trash2 size={15} />
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+                  {c.origin === "csv" ? (
+                    <span className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground" title="Imported from a CSV file">
+                      CSV
+                    </span>
+                  ) : null}
+                  {c.status && c.status !== "subscribed" ? (
+                    <span
+                      className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
+                      title={
+                        c.status === "pending"
+                          ? "Signed up but hasn't confirmed — not included in sends"
+                          : c.status === "bounced"
+                            ? "Delivery failed permanently"
+                            : "Unsubscribed"
+                      }
+                    >
+                      {c.status === "pending" ? "Pending" : c.status === "bounced" ? "Bounced" : "Unsub"}
+                    </span>
+                  ) : null}
+                  <button className="rounded-lg p-2 text-muted-foreground hover:text-destructive" onClick={() => remove(c.id)} aria-label="Remove contact">
+                    <Trash2 size={15} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </div>
     </div>
   );
