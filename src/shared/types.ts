@@ -162,3 +162,17 @@ export interface ResendContact {
   origin?: "local" | "csv" | "crm";
   created_at?: string;
 }
+
+/**
+ * One page of a subscriber list, as `GET /api/audiences/:id/contacts` returns.
+ *
+ * `total` always describes the *filtered* set, not the whole list: it is what
+ * the pager divides, and it is computed from the same WHERE clause as
+ * `contacts`, so the two cannot disagree.
+ */
+export interface ResendContactPage {
+  contacts: ResendContact[];
+  total: number;
+  page: number;
+  limit: number;
+}

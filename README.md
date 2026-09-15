@@ -134,6 +134,35 @@ you're migrating a list that already has recorded consent, pass
 `consent_evidence` to `POST /api/audiences/:id/contacts` to record how it was
 obtained and mark them subscribed.
 
+### Finding people
+
+The Audience view shows one page of **50** at a time — newest first by default —
+with the count above it (`1–50 of 812`). Three filters narrow the list, and all
+three are applied by the database rather than in the browser, so a list of fifty
+thousand behaves the same as a list of fifty:
+
+- **Search** — type a term and press Enter. Matches email, first name, last name,
+  the full name, and the name reversed, so `okonkwo amara` finds Amara Okonkwo.
+  Case-insensitive; `%` and `_` are matched literally rather than as wildcards.
+- **Added** — an inclusive `from`/`to` range on the date a contact was added.
+- **Sort** — newest, oldest, or by name A–Z / Z–A.
+
+Search applies on Enter (or the Search button), not on every keystroke; the date
+and sort controls apply immediately. **Clear** resets all three.
+
+`GET /api/audiences/:id/contacts?search=&from=&to=&sort=&page=&limit=` returns
+`{ contacts, total, page, limit }`. `total` counts the *filtered* set, so it is
+what the pager divides. `limit` defaults to 50 and is capped at 200 regardless of
+what the request asks for. A `page` past the end is clamped to the last page
+rather than answered with an empty list, and an unknown audience id is a 404
+rather than an empty page — so "no such list" and "this list has nobody in it"
+stay distinguishable.
+
+Filtering and ordering are defined once, in `src/shared/contact-query.ts`, and
+used by both the browser and the worker. That is deliberate: if the two built
+their own queries, the count could describe a different set of rows than the
+ones listed.
+
 ### Importing from a CSV
 
 **Import CSV** in the Audience view reads a file from your machine. The parsing
@@ -214,6 +243,7 @@ src/
     markdown.ts      — email-safe Markdown → HTML
     csv.ts           — CSV parsing, column mapping and import rules (browser + server)
     consent.ts       — what counts as consent evidence, shared by every import path
+    contact-query.ts — subscriber list search / date filters / ordering / paging
     types.ts         — Mail, Template, Settings, Contact types
   server/
     index.ts         — Hono API (mails, templates, settings, audiences,

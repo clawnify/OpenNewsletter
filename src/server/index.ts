@@ -14,6 +14,7 @@ import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/desig
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle } from "../shared/blocks";
 import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
 import * as csv from "../shared/csv";
+import { parseContactQuery } from "../shared/contact-query";
 import { validateEvidence, EVIDENCE_REQUIRED_MESSAGE } from "../shared/consent";
 import type { Block, Mail, Settings, Template } from "../shared/types";
 
@@ -691,8 +692,24 @@ app.post("/api/audiences", async (c) => {
   return c.json(await contacts.createAudience(b.name.trim(), b.description ?? ""), 201);
 });
 
+/**
+ * One page of a list's contacts, narrowed by the reader's filters.
+ *
+ * Server-side rather than "send everything and filter in the browser": a list
+ * with fifty thousand subscribers would otherwise ship all of them to render
+ * fifty, and the search box would go dead on exactly the lists that need it.
+ *
+ * The query string is parsed by the shared `parseContactQuery`, so the URL the
+ * client builds and the interpretation here cannot drift apart.
+ */
 app.get("/api/audiences/:id/contacts", async (c) => {
-  return c.json(await contacts.listContacts(c.req.param("id")));
+  const id = c.req.param("id");
+  // Scope to a list that exists: without this a typo'd id returns an empty page
+  // with `total: 0`, which reads as "this list is empty" rather than "no such
+  // list", and the reader has no way to tell the difference.
+  const audiences = await contacts.listAudiences();
+  if (!audiences.some((a) => a.id === id)) return c.json({ error: "Audience not found" }, 404);
+  return c.json(await contacts.pageContacts(id, parseContactQuery(new URL(c.req.url).searchParams)));
 });
 
 app.post("/api/audiences/:id/contacts", async (c) => {
