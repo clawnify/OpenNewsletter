@@ -58,6 +58,16 @@ One message per subscriber rather than a single broadcast, so each carries its
 own unsubscribe link — a shared link would let whoever clicks it unsubscribe
 everyone.
 
+A send is recorded per recipient. When it starts, the issue is frozen and a
+delivery row is written for each confirmed subscriber; batches of 100 then go
+out through the provider's batch API. An attempt whose outcome is unknown is
+retried under the same idempotency key, so a timeout never mails a batch twice.
+Closing the tab or a worker restart doesn't lose the send: on Clawnify a queued
+job picks it up within a minute, and pressing Send again resumes it. If the
+provider refuses the send outright (an unverified domain, a revoked key), it
+stops as **failed** with the reason, and sending again after the fix delivers
+only to the people who haven't had it.
+
 A **template** = a `DESIGN.md` token set + a content skeleton. Each mail can
 override the template's tokens; the design panel edits that override live and
 "Save as…" serializes it back to the DESIGN.md format.
@@ -178,6 +188,7 @@ src/
     index.ts         — Hono API (mails, templates, settings, audiences,
                        subscribe/confirm/unsubscribe, widget, generate, send)
     contacts.ts      — audiences + contacts + the consent lifecycle
+    sending.ts       — the send engine: per-recipient deliveries, batches, resume
     render.ts        — mail + tokens → email-safe inlined HTML
     ai.ts            — OpenRouter generation
     providers/       — EmailProvider interface (send-only) + adapters

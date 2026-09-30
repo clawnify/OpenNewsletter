@@ -16,10 +16,15 @@ CREATE TABLE IF NOT EXISTS mails (
   template_slug TEXT,
   -- Resend segment (audience) id this mail targets.
   audience_id TEXT,
-  status TEXT NOT NULL DEFAULT 'draft',  -- draft | scheduled | sent
+  status TEXT NOT NULL DEFAULT 'draft',  -- draft | scheduled | sending | sent | failed
   broadcast_id TEXT,
   scheduled_at TEXT,
   sent_at TEXT,
+  -- Set when a send starts (see src/server/sending.ts). The snapshot is what
+  -- the send delivers, so edits made while it runs can't change it.
+  send_id TEXT,
+  send_snapshot TEXT,
+  send_error TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -90,6 +95,35 @@ CREATE TABLE IF NOT EXISTS contacts (
   crm_contact_id TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- One row per recipient of a send: who it went to, whether it arrived at the
+-- provider, and the provider's message id (which bounce and complaint events
+-- refer to). Written once when the send starts, in fixed batches of 100: an
+-- attempt with an unknown outcome is retried under the same idempotency key,
+-- so a batch's members never change after its first claim. See
+-- src/server/sending.ts.
+CREATE TABLE IF NOT EXISTS deliveries (
+  id TEXT PRIMARY KEY,
+  mail_id INTEGER NOT NULL,
+  contact_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  batch INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  claimed_at TEXT,
+  -- The idempotency key this batch's current attempt is sent under.
+  send_key TEXT,
+  provider_message_id TEXT,
+  error TEXT,
+  sent_at TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_recipient ON deliveries(mail_id, contact_id);
+CREATE INDEX IF NOT EXISTS idx_deliveries_batch ON deliveries(mail_id, status, batch);
+CREATE INDEX IF NOT EXISTS idx_deliveries_provider ON deliveries(provider_message_id)
+  WHERE provider_message_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_mails_status ON mails(status);
 CREATE INDEX IF NOT EXISTS idx_mails_updated ON mails(updated_at);

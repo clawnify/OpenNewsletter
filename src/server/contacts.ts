@@ -231,32 +231,3 @@ export async function markUnsubscribed(audienceId: string, email: string): Promi
     [now(), audienceId, normalize(email)],
   );
 }
-
-/**
- * Reconcile local contacts with the platform's suppression ledger.
- *
- * The ledger is the enforcement layer — it is what the send path actually
- * checks, and a recipient who unsubscribes does so there, not here. Without
- * pulling those back, the subscriber list shown to the publication drifts into
- * claiming people are subscribed when every send to them is refused.
- * Returns how many local rows changed.
- */
-export async function applySuppressions(audienceId: string, emails: string[]): Promise<number> {
-  if (emails.length === 0) return 0;
-  const lowered = emails.map(normalize);
-  const placeholders = lowered.map(() => "?").join(",");
-
-  const affected = (await query(
-    `SELECT id FROM contacts
-      WHERE audience_id = ? AND status <> 'unsubscribed' AND email IN (${placeholders})`,
-    [audienceId, ...lowered],
-  )) as unknown as { id: string }[];
-  if (affected.length === 0) return 0;
-
-  await run(
-    `UPDATE contacts SET status = 'unsubscribed', unsubscribed_at = ?, confirm_token = NULL
-      WHERE id IN (${affected.map(() => "?").join(",")})`,
-    [now(), ...affected.map((r) => r.id)],
-  );
-  return affected.length;
-}

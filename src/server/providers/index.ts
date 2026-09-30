@@ -19,7 +19,7 @@ import type { EmailProvider } from "./types";
 import { ResendProvider } from "./resend";
 
 export type { EmailProvider } from "./types";
-export type { BulkRecipient, SendBulkResult } from "./types";
+export type { BatchMessage, BatchOutcome } from "./types";
 
 export async function getEmailProvider(env: ConnectionsEnv): Promise<EmailProvider | null> {
   const own = (env as { RESEND_API_KEY?: string }).RESEND_API_KEY;

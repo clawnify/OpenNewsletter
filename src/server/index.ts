@@ -8,6 +8,7 @@ import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
 import { sendVerdict } from "./schedule";
+import * as sending from "./sending";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle } from "../shared/blocks";
@@ -62,6 +63,9 @@ async function ensureSeed() {
     `ALTER TABLE settings ADD COLUMN logo TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN senders TEXT NOT NULL DEFAULT '[]'`,
     `ALTER TABLE contacts ADD COLUMN crm_contact_id TEXT`,
+    `ALTER TABLE mails ADD COLUMN send_id TEXT`,
+    `ALTER TABLE mails ADD COLUMN send_snapshot TEXT`,
+    `ALTER TABLE mails ADD COLUMN send_error TEXT`,
   ]) {
     try {
       await run(sql);
@@ -69,6 +73,9 @@ async function ensureSeed() {
       /* column already exists */
     }
   }
+  // Idempotent, and outside the try: a mistake here must surface, not be read
+  // as "already exists".
+  for (const sql of sending.DELIVERIES_DDL) await run(sql);
   seeded = true;
 }
 
@@ -384,6 +391,13 @@ app.put("/api/mails/:id", async (c) => {
     status: b.status ?? existing.status,
     scheduled_at: b.scheduled_at !== undefined ? b.scheduled_at : existing.scheduled_at,
   };
+  // Once a send has started, only the send engine moves the status: an editor
+  // autosave that carries the old status must not pull a running send back to
+  // draft. Content edits are still saved; the send delivers its own snapshot.
+  if (existing.status === "sending" || existing.status === "sent") {
+    fields.status = existing.status;
+    fields.scheduled_at = existing.scheduled_at;
+  }
 
   // The email subject (and list title) is derived from the blocks, since the
   // title is now just a display-heading block.
@@ -402,7 +416,11 @@ app.put("/api/mails/:id", async (c) => {
 });
 
 app.delete("/api/mails/:id", async (c) => {
-  await run("DELETE FROM mails WHERE id = ?", [Number(c.req.param("id"))]);
+  const id = Number(c.req.param("id"));
+  const row = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
+  if (row?.status === "sending") return c.json({ error: "This issue is still sending." }, 409);
+  await run("DELETE FROM deliveries WHERE mail_id = ?", [id]);
+  await run("DELETE FROM mails WHERE id = ?", [id]);
   return c.json({ ok: true });
 });
 
@@ -939,10 +957,55 @@ async function enqueueSend(c: any, mailId: number, runAt: string, from: string):
   });
 }
 
+/** Wall-clock budget for one drain when the queue can pick up the rest. */
+const DRAIN_BUDGET_MS = 25_000;
+
+function hasQueue(c: any): boolean {
+  return !!(c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN;
+}
+
+/**
+ * Book the next drain before starting this one. If this worker dies or the
+ * operator closes the tab mid-send, the job picks the send up a minute later;
+ * if this drain finishes, the job arrives, finds nothing to do and answers 200.
+ * Keyed per minute, so several drains in the same minute book one job.
+ */
+async function bookContinuation(c: any, mailId: number, sendId: string): Promise<void> {
+  if (!hasQueue(c)) return;
+  const origin = new URL(c.req.url).origin;
+  try {
+    await enqueueJob(c.env, {
+      targetUrl: `${origin}/api/jobs/send-mail`,
+      payload: { mail_id: mailId, continue_send: sendId },
+      runAt: new Date(Date.now() + 60_000).toISOString(),
+      idempotencyKey: `send-mail-${mailId}/${sendId}/${Math.floor(Date.now() / 60_000)}`,
+    });
+  } catch (e) {
+    // The drain below still runs; only the safety net is missing.
+    console.error("[send] could not book continuation", e);
+  }
+}
+
+/** Run the send for up to the budget (or to the end, with no queue to continue it). */
+async function drain(c: any, mailId: number, sendId: string) {
+  const p = await provider(c);
+  if (!p) return null;
+  await bookContinuation(c, mailId, sendId);
+  return sending.drainSend(mailId, p, { deadline: hasQueue(c) ? Date.now() + DRAIN_BUDGET_MS : undefined });
+}
+
+function sendResponse(result: sending.SendProgress, mail: Mail) {
+  if (result.status === "failed") {
+    return { status: 502 as const, body: { ...result, error: result.error || "Send failed", mail } };
+  }
+  return { status: 200 as const, body: { ok: true, ...result, mail } };
+}
+
 /**
  * The actual send. Shared by the operator-triggered route and the queue
- * callback so a scheduled issue goes out through exactly the same path —
- * including the domain precheck and suppression reconciliation.
+ * callback so a scheduled issue goes out through exactly the same path,
+ * including the domain precheck. Sending an issue that is already sending, or
+ * that stopped as failed, resumes it rather than starting over.
  */
 async function sendMailNow(
   c: any,
@@ -953,7 +1016,7 @@ async function sendMailNow(
   // means an operator pressed send just now, which needs no such check — they
   // are looking at the issue and their intent is the request itself.
   scheduledFor?: string | null,
-): Promise<{ status: 200 | 400 | 404 | 502; body: Record<string, unknown> }> {
+): Promise<{ status: 200 | 400 | 404 | 409 | 502; body: Record<string, unknown> }> {
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   if (!row) return { status: 404, body: { error: "Not found" } };
   const mail = parseMail(row);
@@ -971,6 +1034,8 @@ async function sendMailNow(
       return { status: 200, body: { ok: true, skipped: verdict.reason, sent: 0 } };
     }
   }
+
+  if (row.status === "sent") return { status: 409, body: { error: "This issue has already been sent." } };
 
   const p = await provider(c);
   if (!p) return { status: 400, body: { error: "No sending backend is configured." } };
@@ -1013,61 +1078,29 @@ async function sendMailNow(
     // a failed precheck; the backend itself still refuses unverified domains.
   }
 
-  const recipients = await contacts.subscribedRecipients(mail.audience_id);
-  if (recipients.length === 0) {
+  const resuming = row.status === "sending" || row.status === "failed";
+  if (!resuming && (await contacts.subscribedRecipients(mail.audience_id)).length === 0) {
     return { status: 400, body: { error: "No confirmed subscribers on this audience yet." } };
   }
 
-  const design = await resolveDesign(mail);
-  const origin = new URL(c.req.url).origin;
-
-  // Rendered per recipient: the footer's unsubscribe link identifies this
-  // subscriber, so one shared body would let any recipient unsubscribe the
-  // whole list. The contact id is a UUID, so the link is unguessable.
-  const bulk = recipients.map((r) => {
-    const unsubscribeUrl = `${origin}/api/unsubscribe?c=${r.id}`;
-    return {
-      email: r.email,
-      unsubscribeUrl,
-      html: renderEmailHtml(mail, design, s, { unsubscribeUrl }),
-    };
+  const { conversation: _conversation, ...frozen } = mail as Mail & { conversation?: unknown };
+  const begun = await sending.beginSend(id, mail.audience_id, {
+    mail: frozen,
+    design: await resolveDesign(mail),
+    settings: s,
+    from,
+    origin: new URL(c.req.url).origin,
   });
-
-  try {
-    const result = await p.sendBulk({
-      from,
-      subject: mail.title,
-      recipients: bulk,
-      // The audience id is the stable list key the suppression ledger is
-      // scoped by. It must never change for a given list.
-      listKey: mail.audience_id,
-    });
-
-    // The backend refuses anyone who unsubscribed through the one-click header,
-    // which the app may not have seen yet — fold those back so the subscriber
-    // list stops claiming they're still on it.
-    if (result.suppressed.length) {
-      await contacts.applySuppressions(mail.audience_id, result.suppressed);
-    }
-
-    await run(
-      `UPDATE mails SET status=?, scheduled_at=NULL, sent_at=?, updated_at=datetime('now') WHERE id=?`,
-      ["sent", new Date().toISOString(), id],
-    );
-    const updated = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
-    return {
-      status: 200,
-      body: {
-        ok: true,
-        sent: result.sent.length,
-        suppressed: result.suppressed.length,
-        failed: result.failed,
-        mail: parseMail(updated),
-      },
-    };
-  } catch (e: any) {
-    return { status: 502, body: { error: e?.message || "Send failed" } };
+  if (!begun.ok) {
+    return begun.reason === "already-sent"
+      ? { status: 409, body: { error: "This issue has already been sent." } }
+      : { status: 404, body: { error: "Not found" } };
   }
+
+  const result = await drain(c, id, begun.sendId);
+  if (!result) return { status: 400, body: { error: "No sending backend is configured." } };
+  const updated = parseMail(await get<any>("SELECT * FROM mails WHERE id = ?", [id]));
+  return sendResponse(result, updated);
 }
 
 app.post("/api/mails/:id/send", async (c) => {
@@ -1080,6 +1113,11 @@ app.post("/api/mails/:id/send", async (c) => {
     const when = new Date(scheduled_at);
     if (Number.isNaN(when.getTime())) {
       return c.json({ error: "Invalid scheduled_at — expected an ISO-8601 timestamp." }, 400);
+    }
+    const current = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
+    if (!current) return c.json({ error: "Not found" }, 404);
+    if (current.status !== "draft" && current.status !== "scheduled") {
+      return c.json({ error: `This issue is ${current.status}; it can't be scheduled again.` }, 409);
     }
     const s = await getSettings();
     const from = fromOverride?.includes("@") ? fromOverride : fromAddress(s);
@@ -1120,7 +1158,7 @@ app.post("/api/jobs/send-mail", async (c) => {
   });
   if (!ok) return c.json({ error: "unauthorized" }, 401);
 
-  let body: { mail_id?: number; from?: string; scheduled_for?: string };
+  let body: { mail_id?: number; from?: string; scheduled_for?: string; continue_send?: string };
   try {
     body = JSON.parse(raw);
   } catch {
@@ -1128,6 +1166,21 @@ app.post("/api/jobs/send-mail", async (c) => {
   }
   const id = Number(body.mail_id);
   if (!Number.isFinite(id)) return c.json({ error: "bad_request" }, 400);
+
+  // A continuation of a send already under way (see bookContinuation). It only
+  // proceeds if that exact send is still running; anything else is a stale job
+  // doing the right thing by stopping, so it answers 200.
+  if (body.continue_send) {
+    const row = await get<{ status: string; send_id: string | null }>(
+      "SELECT status, send_id FROM mails WHERE id = ?",
+      [id],
+    );
+    if (!row || row.status !== "sending" || row.send_id !== body.continue_send) {
+      return c.json({ ok: true, skipped: "not-sending" });
+    }
+    const result = await drain(c, id, body.continue_send);
+    return c.json({ ok: true, ...result });
+  }
 
   // Jobs enqueued before the payload carried scheduled_for are still in flight
   // across this deploy. null keeps their status guards and skips only the

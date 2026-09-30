@@ -2,6 +2,7 @@ import { Plus, Send, Clock, FileText, Users, ChevronRight, Mail } from "lucide-r
 import { useStore } from "../store";
 import { Button } from "@/components/ui/button";
 import type { Mail as MailType } from "../../shared/types";
+import { statusTone } from "../lib/status";
 
 // The overview (DESIGN.md → Interaction / Signature 6): a row of stat tiles,
 // tinted only where the stat is itself a status, then two cards of rows. It is
@@ -109,10 +110,7 @@ export function HomeView({
 }
 
 function MailRow({ mail, onOpen }: { mail: MailType; onOpen: () => void }) {
-  const badge =
-    mail.status === "sent" ? "bg-success-tint text-success"
-    : mail.status === "scheduled" ? "bg-info-tint text-info"
-    : "bg-muted text-muted-foreground";
+  const badge = statusTone(mail.status);
   return (
     <li className="[&+li]:border-t [&+li]:border-border">
       <button type="button" onClick={onOpen} className="flex h-12 w-full items-center gap-3 rounded-[0.5rem] px-3 text-left hover:bg-muted">
