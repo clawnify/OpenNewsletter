@@ -112,8 +112,10 @@ export async function addContact(
 
   if (existing) {
     // Never silently resurrect someone who opted out — that is precisely the
-    // re-import that generates spam complaints. They must opt in again.
-    if (existing.status === "unsubscribed") return existing;
+    // re-import that generates spam complaints. They must opt in again. Nor an
+    // address that hard-bounced: re-importing it only bounces again, and bounce
+    // rates are what mailbox providers judge a sender by.
+    if (existing.status === "unsubscribed" || existing.status === "bounced") return existing;
     await run(
       `UPDATE contacts SET first_name = ?, last_name = ?, status = ?,
               consent_source = ?, consent_at = ?, consent_evidence = ?,

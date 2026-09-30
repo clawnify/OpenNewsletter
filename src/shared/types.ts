@@ -121,6 +121,8 @@ export interface StatusInfo {
   github_connected: boolean;
   /** A CRM in the same workspace is reachable; enables "Import from CRM". */
   crm_connected?: boolean;
+  /** Delivery events (bounces, complaints, clicks) reach this app. */
+  tracking?: { enabled: boolean; source: "env" | "stored" | null; endpoint: string; events: string[] };
   audiences: ResendAudience[];
 }
 

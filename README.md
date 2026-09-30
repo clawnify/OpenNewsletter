@@ -36,6 +36,11 @@ account. The provider is just delivery, and it's swappable.
 - **Embeddable signup widget** — drop `<script src=".../widget.js">` on your
   own site; it starts the same opt-in flow.
 - **Sending** — send now, or send a test to yourself. Bring your own API key.
+- **Delivery tracking** — one click in Settings registers a Resend webhook with
+  your own key. Hard bounces and spam complaints then stop future sends to
+  that address on every list, and each sent issue shows delivered, clicked,
+  opened and bounced. Clicks are shown first: Apple Mail opens every message
+  on arrival, so opens run high.
 - **Email-safe rendering** — table-wrapped, inline-styled HTML with a
   per-subscriber unsubscribe footer, plus the `List-Unsubscribe` headers
   mailbox providers expect from bulk senders.
@@ -171,6 +176,7 @@ npx clawnify deploy
 | `RESEND_API_KEY` | for sending | Your own key — delivery only; contacts stay in D1 |
 | `OPENROUTER_API_KEY` | for AI | The Generate button |
 | `NEWSLETTER_MODEL` | no | Override the generation model |
+| `RESEND_WEBHOOK_SECRET` | no | Signing secret of a Resend webhook you created by hand. Only needed when your key can send but not manage webhooks; otherwise Settings → Delivery tracking → Turn on sets it up |
 
 On Clawnify these are injected automatically from your org's API keys /
 environment variables at deploy time — no secrets in the app.
@@ -189,6 +195,7 @@ src/
                        subscribe/confirm/unsubscribe, widget, generate, send)
     contacts.ts      — audiences + contacts + the consent lifecycle
     sending.ts       — the send engine: per-recipient deliveries, batches, resume
+    events.ts        — what bounces, complaints, opens and clicks change
     render.ts        — mail + tokens → email-safe inlined HTML
     ai.ts            — OpenRouter generation
     providers/       — EmailProvider interface (send-only) + adapters

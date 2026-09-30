@@ -9,6 +9,9 @@ import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
 import { sendVerdict } from "./schedule";
 import * as sending from "./sending";
+import { applyDeliveryEvent } from "./events";
+import { parseResendEvent, verifyResendWebhook, RESEND_EVENTS } from "./providers/resend-webhook";
+import { WebhookSetupError } from "./providers/types";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle } from "../shared/blocks";
@@ -24,6 +27,9 @@ type Env = {
     CREDENTIALS?: CredentialBinding;
     CLAWNIFY_ORG_ID?: string;
     RESEND_API_KEY?: string;
+    // Signing secret for a Resend webhook set up by hand. Wins over the one
+    // "Turn on delivery tracking" stores.
+    RESEND_WEBHOOK_SECRET?: string;
     OPENROUTER_API_KEY?: string;
     NEWSLETTER_MODEL?: string;
     GITHUB_TOKEN?: string;
@@ -66,6 +72,8 @@ async function ensureSeed() {
     `ALTER TABLE mails ADD COLUMN send_id TEXT`,
     `ALTER TABLE mails ADD COLUMN send_snapshot TEXT`,
     `ALTER TABLE mails ADD COLUMN send_error TEXT`,
+    `ALTER TABLE settings ADD COLUMN resend_webhook_id TEXT`,
+    `ALTER TABLE settings ADD COLUMN resend_webhook_secret TEXT`,
   ]) {
     try {
       await run(sql);
@@ -219,6 +227,7 @@ app.get("/api/status", async (c) => {
     ai_available: !!env.OPENROUTER_API_KEY,
     github_connected: !!env.GITHUB_TOKEN,
     crm_connected: crm.crmConfigured(c.env),
+    tracking: await trackingState(c),
     audiences,
     sending_domains,
   });
@@ -1199,6 +1208,114 @@ app.post("/api/jobs/send-mail", async (c) => {
   // timestamp compare they cannot answer — see sendVerdict.
   const r = await sendMailNow(c, id, body.from, body.scheduled_for ?? null);
   return c.json(r.body, r.status);
+});
+
+// ── delivery events (Resend webhook) ─────────────────────────────────
+//
+// Resend reports what happened to each message after it was accepted:
+// delivered, bounced, marked as spam, opened, clicked. Without this the app
+// never learns an address is dead or that someone complained, and keeps
+// mailing both, which is what gets a sending domain blocked. Every message
+// carries its delivery id as a tag, so an event maps straight to its row.
+
+async function webhookSecret(c: any): Promise<{ secret: string | null; source: "env" | "stored" | null }> {
+  const fromEnv = (c.env as { RESEND_WEBHOOK_SECRET?: string }).RESEND_WEBHOOK_SECRET;
+  if (fromEnv) return { secret: fromEnv, source: "env" };
+  const row = await get<{ resend_webhook_secret: string | null }>("SELECT resend_webhook_secret FROM settings WHERE id = 1");
+  return row?.resend_webhook_secret ? { secret: row.resend_webhook_secret, source: "stored" } : { secret: null, source: null };
+}
+
+function webhookEndpoint(c: any): string {
+  return `${new URL(c.req.url).origin}/api/webhooks/resend`;
+}
+
+async function trackingState(c: any) {
+  const { secret, source } = await webhookSecret(c);
+  return { enabled: !!secret, source, endpoint: webhookEndpoint(c), events: [...RESEND_EVENTS] };
+}
+
+app.post("/api/webhooks/resend", async (c) => {
+  // Verified against the raw bytes: the signature covers them exactly.
+  const raw = await c.req.text();
+  const { secret } = await webhookSecret(c);
+  if (!secret) return c.json({ error: "Delivery tracking is not set up on this app." }, 404);
+  const ok = await verifyResendWebhook(
+    raw,
+    { id: c.req.header("svix-id") ?? null, timestamp: c.req.header("svix-timestamp") ?? null, signature: c.req.header("svix-signature") ?? null },
+    secret,
+  );
+  if (!ok) return c.json({ error: "unauthorized" }, 401);
+
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return c.json({ error: "bad_request" }, 400);
+  }
+  const ev = parseResendEvent(body);
+  if (!ev) return c.json({ ok: true, ignored: true });
+  // 200 even when no delivery matches: those are this app's other mail
+  // (confirmations, test sends), and a non-2xx would only make Resend retry.
+  return c.json({ ok: true, outcome: await applyDeliveryEvent(ev) });
+});
+
+/**
+ * "Turn on delivery tracking": register this app's webhook on the operator's
+ * own Resend account with the key the app already sends with, and keep the
+ * signing secret. A sending-only key can't manage webhooks; the answer then
+ * carries what to set up by hand.
+ */
+app.post("/api/tracking", async (c) => {
+  const p = await provider(c);
+  if (!p) return c.json({ error: "Connect Resend first." }, 400);
+  const url = new URL(c.req.url);
+  if (url.protocol !== "https:" || url.hostname === "localhost" || url.hostname === "127.0.0.1") {
+    return c.json({ error: "Resend can only reach this app at its public https address. Open the app there and try again." }, 400);
+  }
+  const manual = { endpoint: webhookEndpoint(c), events: [...RESEND_EVENTS] };
+  if (!p.ensureWebhook) return c.json({ error: "Set the webhook up in your provider's dashboard.", manual }, 400);
+  try {
+    const w = await p.ensureWebhook(manual.endpoint);
+    await run("UPDATE settings SET resend_webhook_id = ?, resend_webhook_secret = ? WHERE id = 1", [w.id, w.secret]);
+    return c.json({ ok: true, tracking: await trackingState(c) });
+  } catch (e) {
+    if (e instanceof WebhookSetupError) return c.json({ error: e.message, manual }, 400);
+    throw e;
+  }
+});
+
+/** The manual path: the operator created the webhook in Resend and pastes its signing secret. */
+app.put("/api/tracking/secret", async (c) => {
+  const { secret } = await c.req.json<{ secret?: string }>().catch(() => ({}) as { secret?: string });
+  if (!secret?.trim().startsWith("whsec_")) return c.json({ error: "Paste the webhook's signing secret (it starts with whsec_)." }, 400);
+  await run("UPDATE settings SET resend_webhook_id = NULL, resend_webhook_secret = ? WHERE id = 1", [secret.trim()]);
+  return c.json({ ok: true, tracking: await trackingState(c) });
+});
+
+/**
+ * What happened to one issue, from its delivery rows. Opens are reported but
+ * not trusted: Apple Mail Privacy Protection opens every message on arrival,
+ * so clicks are the engagement number that means something.
+ */
+app.get("/api/mails/:id/stats", async (c) => {
+  const id = Number(c.req.param("id"));
+  const r = await get<Record<string, number | null>>(
+    `SELECT COUNT(*) AS recipients,
+            SUM(status = 'sent') AS sent,
+            SUM(status = 'failed') AS failed,
+            SUM(status = 'skipped') AS skipped,
+            SUM(status IN ('pending', 'sending')) AS open,
+            COUNT(delivered_at) AS delivered,
+            COUNT(opened_at) AS opened,
+            COUNT(clicked_at) AS clicked,
+            SUM(bounce_permanent = 1) AS hard_bounced,
+            SUM(bounced_at IS NOT NULL AND bounce_permanent = 0) AS soft_bounced,
+            COUNT(complained_at) AS complained
+       FROM deliveries WHERE mail_id = ?`,
+    [id],
+  );
+  const stats = Object.fromEntries(Object.entries(r ?? {}).map(([k, v]) => [k, Number(v ?? 0)]));
+  return c.json({ ...stats, tracking: (await trackingState(c)).enabled });
 });
 
 // ── unsubscribe (public, branded) ────────────────────────────────────

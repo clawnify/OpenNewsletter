@@ -16,7 +16,8 @@ export async function api<T>(method: string, path: string, body?: unknown): Prom
   }
   if (!r.ok) {
     const msg = (data as { error?: string }).error || text || `Request failed (${r.status})`;
-    throw new Error(`${msg} (${r.status})`);
+    // The parsed body rides along for callers that act on more than the message.
+    throw Object.assign(new Error(`${msg} (${r.status})`), { status: r.status, data });
   }
   return data as T;
 }

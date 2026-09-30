@@ -49,7 +49,11 @@ CREATE TABLE IF NOT EXISTS settings (
   from_name TEXT NOT NULL DEFAULT '',
   from_email TEXT NOT NULL DEFAULT '',
   default_audience_id TEXT,
-  footer_text TEXT NOT NULL DEFAULT ''
+  footer_text TEXT NOT NULL DEFAULT '',
+  -- The Resend webhook "Turn on delivery tracking" registered, and its signing
+  -- secret (verifies events; RESEND_WEBHOOK_SECRET in the env wins).
+  resend_webhook_id TEXT,
+  resend_webhook_secret TEXT
 );
 
 -- Audiences (lists). Previously Resend segments; now local, so the list is the

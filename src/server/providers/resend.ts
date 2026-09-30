@@ -19,7 +19,8 @@ import type {
   SendResult,
 } from "./types";
 
-import { DELIVERY_TAG } from "./resend-webhook";
+import { DELIVERY_TAG, RESEND_EVENTS } from "./resend-webhook";
+import { WebhookSetupError } from "./types";
 
 const BASE = "https://api.resend.com";
 
@@ -118,6 +119,32 @@ export class ResendProvider implements EmailProvider {
     if (res.status === 401 || res.status === 403) return { kind: "fatal", message };
     if (res.status === 400 || res.status === 422) return { kind: "invalid", message };
     return { kind: "unknown", message };
+  }
+
+  /**
+   * Reuse the webhook already pointing here, if any (a reinstall, a second
+   * click), otherwise create one. Needs a full-access key: a sending-only key
+   * gets 401/403 and the operator sets the webhook up by hand instead.
+   */
+  async ensureWebhook(endpoint: string): Promise<{ id: string; secret: string }> {
+    try {
+      const list = await this.req<{ data?: { id: string; endpoint: string }[] }>("GET", "/webhooks");
+      const existing = (list.data || []).find((w) => w.endpoint === endpoint);
+      if (existing) {
+        const w = await this.req<{ id: string; signing_secret: string }>("GET", `/webhooks/${existing.id}`);
+        return { id: w.id, secret: w.signing_secret };
+      }
+      const created = await this.req<{ id: string; signing_secret: string }>("POST", "/webhooks", {
+        endpoint,
+        events: [...RESEND_EVENTS],
+      });
+      return { id: created.id, secret: created.signing_secret };
+    } catch (e: any) {
+      if (/→ (401|403):/.test(e?.message || "")) {
+        throw new WebhookSetupError("This Resend key can send but can't manage webhooks.");
+      }
+      throw e;
+    }
   }
 
   private headers(idempotencyKey?: string): Record<string, string> {

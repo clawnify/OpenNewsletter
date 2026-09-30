@@ -72,4 +72,14 @@ export interface EmailProvider {
   sendEmail(input: SendEmailInput): Promise<SendResult>;
   /** Send up to BATCH_SIZE messages in one call. Never throws; see BatchOutcome. */
   sendBatch(input: SendBatchInput): Promise<BatchOutcome>;
+  /**
+   * Register (or find) this app's delivery-event webhook on the provider
+   * account and return its signing secret. Optional: a provider without an
+   * API for it is set up by hand. Throws WebhookSetupError when the key isn't
+   * allowed to manage webhooks.
+   */
+  ensureWebhook?(endpoint: string): Promise<{ id: string; secret: string }>;
 }
+
+/** The key can send but not manage webhooks (e.g. a sending-only key). */
+export class WebhookSetupError extends Error {}

@@ -160,6 +160,19 @@ body {
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  /* Status roles (platform apps DESIGN.md): text, tint fill, solid. The
+     components already used these class names; without the tokens every
+     status badge rendered unstyled. */
+  --color-destructive-tint: var(--destructive-tint);
+  --color-success: var(--success);
+  --color-success-tint: var(--success-tint);
+  --color-success-solid: var(--success-solid);
+  --color-info: var(--info);
+  --color-info-tint: var(--info-tint);
+  --color-info-solid: var(--info-solid);
+  --color-warning: var(--warning);
+  --color-warning-tint: var(--warning-tint);
+  --color-warning-solid: var(--warning-solid);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
@@ -208,6 +221,16 @@ body {
   --accent: oklch(0.975 0.002 85);
   --accent-foreground: oklch(0.22 0.002 85);
   --destructive: oklch(0.44 0.125 25);
+  --destructive-tint: #F9EDEC;
+  --success: #2B5F3C;
+  --success-tint: #DBF9E2;
+  --success-solid: #319656;
+  --info: #173EC4;
+  --info-tint: #ECF0F9;
+  --info-solid: #4977ED;
+  --warning: #664E27;
+  --warning-tint: #F9EFDF;
+  --warning-solid: #A3772B;
   --border: oklch(0.915 0.007 85);
   --input: oklch(1 0 0);
   --ring: oklch(0.6 0.204 15.7056);
@@ -251,6 +274,16 @@ body {
   --accent: oklch(0.25 0.003 85);
   --accent-foreground: oklch(0.95 0.002 85);
   --destructive: oklch(0.82 0.055 25);
+  --destructive-tint: #3B1C1A;
+  --success: #86DA9E;
+  --success-tint: #1A2B1F;
+  --success-solid: #3C9C5D;
+  --info: #B5C4E5;
+  --info-tint: #12234F;
+  --info-solid: #5580E8;
+  --warning: #E5BD7E;
+  --warning-tint: #2D2518;
+  --warning-solid: #A87E35;
   --border: oklch(0.3 0.003 85);
   --input: oklch(0.2 0.002 85);
   --ring: oklch(0.62 0.198 15.7056);
