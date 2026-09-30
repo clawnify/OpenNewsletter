@@ -74,6 +74,9 @@ async function ensureSeed() {
     `ALTER TABLE mails ADD COLUMN send_error TEXT`,
     `ALTER TABLE settings ADD COLUMN resend_webhook_id TEXT`,
     `ALTER TABLE settings ADD COLUMN resend_webhook_secret TEXT`,
+    `ALTER TABLE contacts ADD COLUMN confirm_sent_at TEXT`,
+    `ALTER TABLE contacts ADD COLUMN confirm_attempts INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE contacts ADD COLUMN confirm_error TEXT`,
   ]) {
     try {
       await run(sql);
@@ -84,6 +87,11 @@ async function ensureSeed() {
   // Idempotent, and outside the try: a mistake here must surface, not be read
   // as "already exists".
   for (const sql of sending.DELIVERIES_DDL) await run(sql);
+  for (const sql of [
+    `CREATE TABLE IF NOT EXISTS signup_attempts (ip_hash TEXT NOT NULL, at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS idx_signup_attempts ON signup_attempts(ip_hash, at)`,
+    `CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at)`,
+  ]) await run(sql);
   seeded = true;
 }
 
@@ -789,12 +797,21 @@ const SUBSCRIBE_CORS = {
 app.options("/api/subscribe", (c) => c.body(null, 204, SUBSCRIBE_CORS));
 
 app.post("/api/subscribe", async (c) => {
-  const b = await c.req
-    .json<{ email?: string; first_name?: string; audience_id?: string }>()
-    .catch(() => ({}) as { email?: string; first_name?: string; audience_id?: string });
+  type Body = { email?: string; first_name?: string; audience_id?: string; company?: string };
+  const b = await c.req.json<Body>().catch(() => ({}) as Body);
+
+  // Honeypot: the widget renders `company` hidden from people. A form filler
+  // that fills every field gets the same answer as everyone, and nothing else.
+  if (b.company) return c.json({ ok: true }, 200, SUBSCRIBE_CORS);
+
   const email = b.email?.trim();
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return c.json({ error: "A valid email is required" }, 400, SUBSCRIBE_CORS);
+  }
+
+  const ip = c.req.header("CF-Connecting-IP");
+  if (ip && !(await contacts.allowSignup(ip))) {
+    return c.json({ error: "Too many signups from this network. Try again in an hour." }, 429, SUBSCRIBE_CORS);
   }
 
   const audienceId = b.audience_id || (await contacts.defaultAudience()).id;
@@ -802,28 +819,108 @@ app.post("/api/subscribe", async (c) => {
 
   // Same response either way: whether an address is already subscribed is not
   // something an unauthenticated caller should be able to probe.
-  if ("alreadySubscribed" in result) return c.json({ ok: true }, 200, SUBSCRIBE_CORS);
+  if ("alreadySubscribed" in result || !result.send) return c.json({ ok: true }, 200, SUBSCRIBE_CORS);
 
+  await sendConfirmations(c, [{ id: result.contact.id, email, token: result.token, attempts: result.contact.confirm_attempts ?? 0 }]);
+  return c.json({ ok: true }, 200, SUBSCRIBE_CORS);
+});
+
+/**
+ * Send confirmation emails and record the outcome on each contact, so a signup
+ * whose email never went out shows up in the Audience view instead of waiting
+ * forever. Batched through the provider (100 a call); anything the batch can't
+ * settle is sent singly. A duplicate confirmation is harmless, so this keeps
+ * the idempotency simple: one key per contact per attempt.
+ */
+async function sendConfirmations(
+  c: any,
+  due: { id: string; email: string; token: string; attempts: number }[],
+): Promise<{ sent: number; failed: number; error?: string }> {
   const s = await getSettings();
+  const from = fromAddress(s);
   const p = await provider(c);
-  if (p && s.from_email) {
-    const url = `${new URL(c.req.url).origin}/api/confirm?token=${result.token}`;
-    const name = s.publication_name || "our newsletter";
-    try {
-      await p.sendEmail({
-        from: s.from_name ? `${s.from_name} <${s.from_email}>` : s.from_email,
-        to: email,
-        subject: `Confirm your subscription to ${name}`,
-        html:
-          `<p>Tap the link below to confirm your subscription to ${escapeHtml(name)}.</p>` +
-          `<p><a href="${url}">Confirm subscription</a></p>` +
-          `<p style="color:#666;font-size:12px">If you didn't request this, ignore this email — nothing will be sent to you.</p>`,
-      });
-    } catch {
-      // The pending contact stands; the operator can re-trigger the email.
+  const why = !p ? "No sending backend is configured." : !from ? "Set a from address in Settings." : null;
+  if (why) {
+    for (const d of due) await contacts.recordConfirmation(d.id, { error: why });
+    return { sent: 0, failed: due.length, error: why };
+  }
+
+  const origin = new URL(c.req.url).origin;
+  const name = s.publication_name || "our newsletter";
+  const subject = `Confirm your subscription to ${name}`;
+  const message = (d: (typeof due)[number]) => {
+    const url = `${origin}/api/confirm?token=${d.token}`;
+    // Doubles as "this wasn't me": it removes the pending signup.
+    const unsubscribeUrl = `${origin}/api/unsubscribe?c=${d.id}`;
+    return {
+      to: d.email,
+      unsubscribeUrl,
+      html:
+        `<p>Tap the button below to confirm your subscription to ${escapeHtml(name)}.</p>` +
+        `<p><a href="${url}" style="display:inline-block;padding:10px 18px;background:#111;color:#fff;border-radius:8px;text-decoration:none">Confirm subscription</a></p>` +
+        `<p style="color:#666;font-size:12px">If you didn't sign up, ignore this email and nothing will be sent to you. The link works for 7 days.</p>`,
+    };
+  };
+
+  let sent = 0;
+  let failed = 0;
+  for (let i = 0; i < due.length; i += sending.BATCH_SIZE) {
+    const chunk = due.slice(i, i + sending.BATCH_SIZE);
+    // Keyed on exactly who is in the batch and which attempt it is for each.
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(chunk.map((d) => `${d.id}.${d.attempts}`).join(",")),
+    );
+    const key = `confirm/${[...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+    const outcome = await p!.sendBatch({ from: from!, subject, messages: chunk.map(message), idempotencyKey: key });
+    if (outcome.kind === "rate_limited") {
+      await new Promise((r) => setTimeout(r, Math.min(outcome.retryAfterMs, 10_000)));
+    }
+    if (outcome.kind === "sent") {
+      for (const d of chunk) await contacts.recordConfirmation(d.id, {});
+      sent += chunk.length;
+      continue;
+    }
+    if (outcome.kind === "fatal") {
+      for (const d of due.slice(i)) await contacts.recordConfirmation(d.id, { error: outcome.message });
+      return { sent, failed: failed + due.length - i, error: outcome.message };
+    }
+    // Anything else (a bad address, throttling, no clear answer): one by one.
+    for (const d of chunk) {
+      const m = message(d);
+      try {
+        await p!.sendEmail({
+          from: from!,
+          to: m.to,
+          subject,
+          html: m.html,
+          headers: { "List-Unsubscribe": `<${m.unsubscribeUrl}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" },
+          idempotencyKey: `confirm/${d.id}/${d.attempts}`,
+        });
+        await contacts.recordConfirmation(d.id, {});
+        sent++;
+      } catch (e: any) {
+        await contacts.recordConfirmation(d.id, { error: e?.message || "send failed" });
+        failed++;
+      }
     }
   }
-  return c.json({ ok: true }, 200, SUBSCRIBE_CORS);
+  return { sent, failed };
+}
+
+/** Largest number of confirmation emails one click sends; the rest go on the next. */
+const CONFIRMATIONS_PER_REQUEST = 500;
+
+/**
+ * The operator's "Send confirmation emails": everyone in the audience still
+ * waiting who never got one, or is owed a reminder (at most two, a day apart).
+ */
+app.post("/api/audiences/:id/confirmations", async (c) => {
+  const due = await contacts.confirmationsDue(c.req.param("id"), CONFIRMATIONS_PER_REQUEST);
+  if (due.length === 0) return c.json({ ok: true, sent: 0, failed: 0 });
+  const r = await sendConfirmations(c, due);
+  if (r.error && r.sent === 0) return c.json({ error: r.error, ...r }, 502);
+  return c.json({ ok: true, ...r });
 });
 
 // ── embeddable subscribe widget ──────────────────────────────────────
@@ -852,19 +949,24 @@ app.get("/widget.js", async (c) => {
     btn.style.cssText='padding:.55rem 1rem;border:0;border-radius:.5rem;background:#111;color:#fff;font:inherit;cursor:pointer';
     var msg=document.createElement('div');
     msg.style.cssText='flex-basis:100%;color:#555;font-size:13px';
+    // Honeypot: off-screen and skipped by keyboard and screen readers, so only
+    // a bot that fills every field fills it.
+    var trap=document.createElement('input');
+    trap.name='company';trap.tabIndex=-1;trap.autocomplete='off';trap.setAttribute('aria-hidden','true');
+    trap.style.cssText='position:absolute;left:-9999px;width:1px;height:1px;opacity:0';
     var form=document.createElement('form');
-    form.appendChild(input);form.appendChild(btn);form.appendChild(msg);
+    form.appendChild(trap);form.appendChild(input);form.appendChild(btn);form.appendChild(msg);
     form.style.cssText=wrap.style.cssText;
     form.addEventListener('submit',function(e){
       e.preventDefault();
       btn.disabled=true;msg.textContent='';
       fetch(ORIGIN+'/api/subscribe',{
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({email:input.value})
+        body:JSON.stringify({email:input.value,company:trap.value})
       }).then(function(r){
         // The endpoint answers identically whether or not the address is
         // already subscribed, so this message must not claim either way.
-        msg.textContent=r.ok?'Check your inbox to confirm your subscription to '+LABEL+'.':'Something went wrong — try again.';
+        msg.textContent=r.ok?'Check your inbox to confirm your subscription to '+LABEL+'.':r.status===429?'Too many signups from this network. Try again later.':'Something went wrong — try again.';
         if(r.ok){input.value='';}
       }).catch(function(){msg.textContent='Something went wrong — try again.';})
         .then(function(){btn.disabled=false;});
@@ -892,19 +994,37 @@ app.get("/widget.js", async (c) => {
   });
 });
 
+// Confirming takes a click, not a page load. Mail security scanners (Outlook
+// Safe Links and others) open every link in an email; if loading the link
+// confirmed, they would subscribe people who never clicked, which is exactly
+// what double opt-in exists to prevent. GET shows who the link is for and a
+// button; only the POST it submits records consent.
+
 app.get("/api/confirm", async (c) => {
   const token = c.req.query("token") || "";
-  const contact = token ? await contacts.confirmSignup(token, "double opt-in link") : null;
+  const peek = token ? await contacts.peekConfirmation(token) : null;
+  const s = await getSettings();
+  const name = escapeHtml(s.publication_name || "our newsletter");
+  if (!peek || "expired" in peek) {
+    return c.html(page(`<h1>Link expired</h1><p>This confirmation link is no longer valid. Sign up again and we'll send a fresh one.</p>`), 400);
+  }
+  return c.html(
+    page(
+      `<h1>Confirm your subscription</h1><p>Send ${name} to ${escapeHtml(peek.contact.email)}?</p>` +
+        `<form method="post" action="/api/confirm?token=${encodeURIComponent(token)}">` +
+        `<button type="submit" style="font:inherit;padding:.6rem 1.1rem;border:0;border-radius:.5rem;background:#111;color:#fff;cursor:pointer">Confirm subscription</button></form>`,
+    ),
+  );
+});
+
+app.post("/api/confirm", async (c) => {
+  const token = c.req.query("token") || "";
+  const contact = token ? await contacts.confirmSignup(token, `double opt-in: confirmed by click at ${new Date().toISOString()}`) : null;
   const s = await getSettings();
   const body = contact
     ? `<h1>You're subscribed</h1><p>${escapeHtml(contact.email)} will receive ${escapeHtml(s.publication_name || "our newsletter")}.</p>`
-    : `<h1>Link expired</h1><p>This confirmation link is no longer valid. Try subscribing again.</p>`;
-  return c.html(
-    `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-      `<title>Subscription</title>` +
-      `<div style="font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:32rem;margin:20vh auto;padding:0 1.5rem">${body}</div>`,
-    contact ? 200 : 400,
-  );
+    : `<h1>Link expired</h1><p>This confirmation link is no longer valid. Sign up again and we'll send a fresh one.</p>`;
+  return c.html(page(body), contact ? 200 : 400);
 });
 
 // ── send ─────────────────────────────────────────────────────────────

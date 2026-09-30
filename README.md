@@ -135,10 +135,23 @@ form:
 ```
 
 Either way it's **double opt-in**: the contact is created `pending` and only
-becomes a subscriber once they click the confirmation link. Sends go to
-confirmed subscribers only.
+becomes a subscriber once they confirm. Sends go to confirmed subscribers only.
 
-Adding someone by hand from the Audience view also lands them `pending`. If
+- **Confirming takes a click.** The link opens a page with a Confirm button;
+  loading the link alone changes nothing, so mail security scanners that open
+  every link can't subscribe anyone.
+- **Links expire** 7 days after their email. Signing up again inside 10
+  minutes reuses the email already sent, so a form can't be used to flood
+  someone's inbox.
+- **Bots:** the widget carries a hidden honeypot field, and one network can
+  start 10 signups an hour (the IP is stored hashed, for that hour only).
+- **Nobody waits unseen.** The Audience view shows who never got a
+  confirmation email (added by hand, or the email failed) and who hasn't
+  confirmed a day later, with one button that emails them: the first
+  confirmation, or a reminder, at most three emails per person.
+
+Adding someone by hand from the Audience view also lands them `pending`,
+until they confirm from the email that button sends. If
 you're migrating a list that already has recorded consent, pass
 `consent_evidence` to `POST /api/audiences/:id/contacts` to record how it was
 obtained and mark them subscribed.
