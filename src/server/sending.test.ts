@@ -45,7 +45,7 @@ class FakeProvider implements EmailProvider {
   clock = () => 0;
   gate: (input: SendBatchInput, call: number) => BatchOutcome | null = () => null;
   script: (input: SendBatchInput, call: number) => BatchOutcome | "deliver-then-unknown" = () => ({ kind: "sent", ids: [] });
-  private seen = new Map<string, { at: number; out: BatchOutcome }>();
+  private seen = new Map<string, { at: number; out: BatchOutcome; payload: string }>();
 
   get batchCalls() { return this.calls.filter((c) => c.messages.length > 1 || !c.idempotencyKey.includes("/dlv_")); }
   async listDomains() { return []; }
@@ -56,16 +56,19 @@ class FakeProvider implements EmailProvider {
     const refused = this.gate(input, call);
     if (refused) return refused;
     const prior = this.seen.get(input.idempotencyKey);
-    if (prior && this.clock() - prior.at < 24 * 3600_000) return prior.out;
+    const payload = JSON.stringify([input.from, input.subject, input.messages]);
+    if (prior && this.clock() - prior.at < 24 * 3600_000) {
+      return prior.payload === payload ? prior.out : { kind: "unknown", message: "409 invalid_idempotent_request" };
+    }
     const planned = this.script(input, call);
     const ok: BatchOutcome = { kind: "sent", ids: input.messages.map((m: { to: string }) => `id-${m.to}`) };
     if (planned === "deliver-then-unknown") {
-      this.seen.set(input.idempotencyKey, { at: this.clock(), out: ok });
+      this.seen.set(input.idempotencyKey, { at: this.clock(), out: ok, payload });
       this.delivered.push(...input.messages.map((m: { to: string }) => m.to));
       return { kind: "unknown", message: "timeout" };
     }
     if (planned.kind === "sent") {
-      this.seen.set(input.idempotencyKey, { at: this.clock(), out: ok });
+      this.seen.set(input.idempotencyKey, { at: this.clock(), out: ok, payload });
       this.delivered.push(...input.messages.map((m: { to: string }) => m.to));
       return ok;
     }
@@ -320,5 +323,101 @@ describe("send engine", () => {
     expect(await progress(1)).toMatchObject({ status: "sent", sent: 400 });
     expect(p.delivered).toHaveLength(400);
     expect(dupes(p.delivered)).toEqual([]);
+  });
+
+  // A risky key must never be traded for new keys.
+  it("records risky rows as maybe-delivered when a resume changes the snapshot, instead of resending them", async () => {
+    await seed(150);
+    await beginSend(1, AUD, snapshot());
+    let t = 0;
+    p.clock = () => t;
+    p.script = (_i, call) => (call === 1 ? "deliver-then-unknown" : { kind: "sent", ids: [] });
+    p.gate = (_i, call) => (call === 2 ? { kind: "fatal", message: "Resend 429: monthly quota" } : null);
+    await drainSend(1, p, { now: () => t });
+    expect(await status()).toBe("failed");
+
+    p.gate = () => null;
+    await beginSend(1, AUD, { ...snapshot(), from: "b@b.co" }); // the operator changed the sender
+    t += STALE_CLAIM_MS + 1;
+    const r = await drainSend(1, p, { now: () => t });
+    expect(dupes(p.delivered)).toEqual([]);
+    expect(r).toMatchObject({ status: "sent", sent: 50, failed: 100, open: 0 });
+  });
+
+  it("does not split a risky batch into single sends when its retry is rejected", async () => {
+    await seed(3);
+    await beginSend(1, AUD, snapshot());
+    let t = 0;
+    p.clock = () => t;
+    p.script = (_i, call) => (call === 1 ? "deliver-then-unknown" : { kind: "sent", ids: [] });
+    await drainSend(1, p, { now: () => t });
+    t += STALE_CLAIM_MS + 1;
+    p.gate = () => ({ kind: "invalid", message: "Resend 422: something changed" });
+    const r = await drainSend(1, p, { now: () => t });
+    expect(p.calls.filter(single)).toHaveLength(0);
+    expect(r).toMatchObject({ status: "failed", failed: 3 });
+    expect(p.delivered).toHaveLength(3);
+  });
+
+  // Several bad addresses are not an account problem.
+  it("fails bad addresses one by one instead of stopping the send, even with nothing else in the batch", async () => {
+    await seed(0, [{ email: "bad1@", status: "subscribed" }, { email: "bad2@", status: "subscribed" }]);
+    await beginSend(1, AUD, snapshot());
+    p.script = () => ({ kind: "invalid", message: "Invalid `to` field. The email address needs to follow the `email@example.com` format." });
+    const r = await drainSend(1, p);
+    expect(r).toMatchObject({ status: "failed", failed: 2, open: 0 });
+    expect(r.error).toBe("No recipient could be sent this issue.");
+  });
+
+  it("keeps treating identical rejections as an address problem once the send has had a success", async () => {
+    await seed(100, [{ email: "bad1@", status: "subscribed" }, { email: "bad2@", status: "subscribed" }]);
+    await beginSend(1, AUD, snapshot());
+    p.script = (i) =>
+      i.messages.some((m: { to: string }) => m.to.startsWith("bad")) ? { kind: "invalid", message: "Resend 422: rejected" } : { kind: "sent", ids: [] };
+    const r = await drainSend(1, p);
+    expect(r).toMatchObject({ status: "sent", sent: 100, failed: 2, open: 0 });
+  });
+
+  // A claim whose worker died before calling the provider sent nothing.
+  it("resends a stale claim that never reached the provider, even a day later", async () => {
+    await seed(4);
+    await beginSend(1, AUD, snapshot());
+    await run(`UPDATE deliveries SET status = 'sending', claimed_at = ?, send_key = 'k0', key_at = ?, in_flight = 0`, [
+      new Date(0).toISOString(),
+      new Date(0).toISOString(),
+    ]);
+    const r = await drainSend(1, p, { now: () => KEY_TTL_MS + STALE_CLAIM_MS + 1 });
+    expect(r).toMatchObject({ status: "sent", sent: 4 });
+  });
+
+  it("treats a stale claim whose request was in flight as risky", async () => {
+    await seed(4);
+    await beginSend(1, AUD, snapshot());
+    await run(`UPDATE deliveries SET status = 'sending', claimed_at = ?, send_key = 'k0', key_at = ?, in_flight = 1`, [
+      new Date(0).toISOString(),
+      new Date(0).toISOString(),
+    ]);
+    const r = await drainSend(1, p, { now: () => KEY_TTL_MS + STALE_CLAIM_MS + 1 });
+    expect(p.calls).toHaveLength(0);
+    expect(r).toMatchObject({ status: "failed", failed: 4 });
+  });
+
+  // A refusal tested nothing, so it doesn't use up a risky key's retries.
+  it("doesn't let repeated rate limits exhaust a risky key's retries", async () => {
+    await seed(2);
+    await beginSend(1, AUD, snapshot());
+    let t = 0;
+    p.clock = () => t;
+    p.script = (_i, call) => (call === 1 ? "deliver-then-unknown" : { kind: "sent", ids: [] });
+    await drainSend(1, p, { now: () => t, deadline: t + 1000 });
+    p.gate = () => ({ kind: "rate_limited", retryAfterMs: 60_000 });
+    for (let i = 0; i < MAX_RETRIES + 2; i++) {
+      t += STALE_CLAIM_MS + 1;
+      await drainSend(1, p, { now: () => t, deadline: t + 1000 });
+    }
+    p.gate = () => null;
+    const r = await drainSend(1, p, { now: () => t });
+    expect(r).toMatchObject({ status: "sent", sent: 2 });
+    expect(p.delivered).toHaveLength(2);
   });
 });

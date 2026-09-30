@@ -19,12 +19,16 @@
  *
  *  - **A key that may have delivered is never given up.** Each attempt is sent
  *    under an idempotency key stored on its rows. Once any attempt under a key
- *    has an unknown outcome (a timeout, a 5xx, a worker that died mid-request)
+ *    has an unknown outcome (a timeout, a 5xx, a worker that died while its
+ *    request was in flight: rows are marked `in_flight` just before the call)
  *    the key is marked risky and every later attempt for those rows reuses it,
  *    so the provider deduplicates instead of mailing them twice. A refusal on
  *    a later attempt proves only that *that* attempt sent nothing, so it does
  *    not clear the mark. A key that was only ever refused is dropped with the
- *    claim, so a retry can't be answered with a cached refusal.
+ *    claim, so a retry can't be answered with a cached refusal. Risky rows are
+ *    never given new keys (not split into single sends, not resent with a
+ *    changed snapshot): when that is the only way forward, they are recorded
+ *    "may have been delivered" instead.
  *
  *  - **Deduplication has an expiry.** The provider remembers a key for 24
  *    hours. A risky key older than KEY_TTL_MS is not retried: its rows are
@@ -73,6 +77,7 @@ export const DELIVERIES_DDL = [
     send_key TEXT,
     key_at TEXT,
     key_risky INTEGER NOT NULL DEFAULT 0,
+    in_flight INTEGER NOT NULL DEFAULT 0,
     single INTEGER NOT NULL DEFAULT 0,
     retries INTEGER NOT NULL DEFAULT 0,
     provider_message_id TEXT,
@@ -168,10 +173,21 @@ export async function beginSend(mailId: number, audienceId: string, snapshot: Se
   if ((row.status !== "sending" && row.status !== "failed") || !row.send_id) return { ok: false, reason: "not-found" };
 
   if (row.status === "failed") {
+    const next = JSON.stringify(snapshot);
+    const prev = await get<{ send_snapshot: string | null }>(`SELECT send_snapshot FROM mails WHERE id = ?`, [mailId]);
+    if (prev?.send_snapshot !== next) {
+      // A risky key only deduplicates the exact payload it first carried. With
+      // a new snapshot those rows can't be retried safely.
+      await run(
+        `UPDATE deliveries SET status = 'failed', error = ?, claim_token = NULL, in_flight = 0
+          WHERE mail_id = ? AND key_risky = 1 AND status IN ('pending', 'sending')`,
+        [MAYBE_DELIVERED, mailId],
+      );
+    }
     await run(
       `UPDATE mails SET status = 'sending', send_snapshot = ?, send_error = NULL, updated_at = datetime('now')
         WHERE id = ? AND status = 'failed'`,
-      [JSON.stringify(snapshot), mailId],
+      [next, mailId],
     );
   }
   // A worker that died between the claim and writing recipients leaves a send
@@ -243,6 +259,7 @@ interface ClaimedRow {
 }
 
 interface Claim {
+  mailId: number;
   token: string;
   rows: ClaimedRow[];
 }
@@ -262,13 +279,15 @@ async function claimNext(mailId: number, sendId: string, nowMs: number): Promise
   if (!next) return null;
 
   const t = token();
-  // One statement takes the batch. A stale claim's outcome is unknown (its
-  // worker died mid-request), so its key becomes risky. A risky key being
-  // tried again counts a retry. Rows never attempted get a fresh key.
+  // One statement takes the batch. A stale row whose request was in flight
+  // when its worker died has an unknown outcome, so its key becomes risky; a
+  // stale row that never reached the provider stays as it was. A risky key
+  // being tried again counts a retry. Rows never attempted get a fresh key.
   const taken = await query<{ id: string }>(
     `UPDATE deliveries
-        SET key_risky = CASE WHEN status = 'sending' THEN 1 ELSE key_risky END,
-            retries = retries + CASE WHEN status = 'sending' OR key_risky = 1 THEN 1 ELSE 0 END,
+        SET key_risky = CASE WHEN status = 'sending' AND in_flight = 1 THEN 1 ELSE key_risky END,
+            retries = retries + CASE WHEN (status = 'sending' AND in_flight = 1) OR key_risky = 1 THEN 1 ELSE 0 END,
+            in_flight = 0,
             status = 'sending', claim_token = ?, claimed_at = ?,
             key_at = CASE WHEN send_key IS NULL THEN ? ELSE key_at END,
             send_key = COALESCE(send_key, ?)
@@ -277,7 +296,7 @@ async function claimNext(mailId: number, sendId: string, nowMs: number): Promise
       RETURNING id`,
     [t, iso(nowMs), iso(nowMs), `opennewsletter/${sendId}/${next.batch}/${t.slice(0, 8)}`, mailId, next.batch, stale],
   );
-  if (taken.length === 0) return { token: t, rows: [] };
+  if (taken.length === 0) return { mailId, token: t, rows: [] };
 
   // Rows whose risky key can't be retried safely any more: too many retries,
   // or older than the provider's memory of it.
@@ -300,7 +319,7 @@ async function claimNext(mailId: number, sendId: string, nowMs: number): Promise
       WHERE claim_token = ? AND status = 'sending' ORDER BY id`,
     [t],
   );
-  return { token: t, rows };
+  return { mailId, token: t, rows };
 }
 
 type StepResult = { stop?: undefined } | { stop: "fatal"; message: string } | { stop: "yield" };
@@ -313,16 +332,27 @@ async function sendClaim(claim: Claim, snap: SendSnapshot, provider: EmailProvid
 
   if (grouped.length > 0) {
     const messages = grouped.map((r) => renderFor(snap, r));
+    await markInFlight(claim.token, grouped.map((r) => r.id));
     const outcome = await sendWithWaits(provider, snap, messages, grouped[0].send_key, clock);
     switch (outcome.kind) {
       case "sent":
         await markSent(claim.token, grouped.map((r, i) => [r.id, outcome.ids[i] ?? null]), clock.now());
         break;
       case "invalid": {
+        if (grouped[0].key_risky === 1) {
+          // An earlier attempt under this key may have landed. Singles would
+          // need new keys, which the provider can't match to it.
+          await run(
+            `UPDATE deliveries SET status = 'failed', error = ?, claim_token = NULL, in_flight = 0
+              WHERE claim_token = ? AND single = 0`,
+            [`${MAYBE_DELIVERED} Retrying it was rejected: ${outcome.message}`, claim.token],
+          );
+          break;
+        }
         // Rejected as a whole for one message, so nothing went out under this
         // key: split into single sends, each under its own key.
         await run(
-          `UPDATE deliveries SET single = 1, key_risky = 0, retries = 0, key_at = ?, send_key = send_key || '/' || id
+          `UPDATE deliveries SET single = 1, in_flight = 0, key_at = ?, send_key = send_key || '/' || id
             WHERE claim_token = ? AND single = 0`,
           [iso(clock.now()), claim.token],
         );
@@ -331,29 +361,31 @@ async function sendClaim(claim: Claim, snap: SendSnapshot, provider: EmailProvid
             WHERE claim_token = ? AND status = 'sending' AND single = 1 ORDER BY id`,
           [claim.token],
         );
-        return sendSingles(claim.token, split, snap, provider, clock, { accountCheck: true });
+        return sendSingles(claim.token, split, snap, provider, clock, { accountCheck: true, mailId: claim.mailId });
       }
       case "rate_limited":
         await release(claim.token);
         return { stop: "yield" };
       case "fatal":
-        await release(claim.token);
-        return { stop: "fatal", message: outcome.message };
+        return (await release(claim.token)) ? { stop: "fatal", message: outcome.message } : { stop: "yield" };
       case "in_progress":
       case "unknown":
         await markUnknown(claim.token, grouped.map((r) => r.id), outcome.kind === "unknown" ? outcome.message : "In progress elsewhere");
         break;
     }
   }
-  if (singles.length > 0) return sendSingles(claim.token, singles, snap, provider, clock, { accountCheck: false });
+  if (singles.length > 0) return sendSingles(claim.token, singles, snap, provider, clock, { accountCheck: false, mailId: claim.mailId });
   return {};
 }
 
 /**
  * Send rows one at a time, each through the same outcome handling as a batch.
  * `accountCheck`: right after a batch rejection, if *every* message is
- * rejected with the same reason the problem is the account or the sender, not
- * an address, so stop the send rather than fail the whole list.
+ * rejected with the same reason, nothing in this send has ever been accepted,
+ * and the reason isn't about the recipient, the problem is the account or the
+ * sender: stop the send rather than fail the whole list. (Resend's message
+ * for a bad `to` doesn't name the address, so "all the same" alone would also
+ * match a batch of several bad addresses.)
  */
 async function sendSingles(
   claimToken: string,
@@ -361,11 +393,12 @@ async function sendSingles(
   snap: SendSnapshot,
   provider: EmailProvider,
   clock: Clock,
-  opts: { accountCheck: boolean },
+  opts: { accountCheck: boolean; mailId: number },
 ): Promise<StepResult> {
   const rejected: { id: string; message: string }[] = [];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
+    await markInFlight(claimToken, [r.id]);
     const outcome = await sendWithWaits(provider, snap, [renderFor(snap, r)], r.send_key, clock);
     switch (outcome.kind) {
       case "sent":
@@ -378,8 +411,7 @@ async function sendSingles(
         await release(claimToken);
         return { stop: "yield" };
       case "fatal":
-        await release(claimToken);
-        return { stop: "fatal", message: outcome.message };
+        return (await release(claimToken)) ? { stop: "fatal", message: outcome.message } : { stop: "yield" };
       case "in_progress":
       case "unknown":
         await markUnknown(claimToken, [r.id], outcome.kind === "unknown" ? outcome.message : "In progress elsewhere");
@@ -391,13 +423,15 @@ async function sendSingles(
     opts.accountCheck &&
     rows.length > 1 &&
     rejected.length === rows.length &&
-    rejected.every((x) => x.message === rejected[0].message)
+    rejected.every((x) => x.message === rejected[0].message) &&
+    !/`to`/.test(rejected[0].message) &&
+    !(await get(`SELECT 1 AS x FROM deliveries WHERE mail_id = ? AND status = 'sent' LIMIT 1`, [opts.mailId]))
   ) {
-    await release(claimToken);
-    return { stop: "fatal", message: rejected[0].message };
+    if (await release(claimToken)) return { stop: "fatal", message: rejected[0].message };
+    return { stop: "yield" };
   }
   for (const x of rejected) {
-    await run(`UPDATE deliveries SET status = 'failed', error = ?, claim_token = NULL WHERE id = ? AND claim_token = ?`, [
+    await run(`UPDATE deliveries SET status = 'failed', error = ?, claim_token = NULL, in_flight = 0 WHERE id = ? AND claim_token = ?`, [
       x.message,
       x.id,
       claimToken,
@@ -440,7 +474,7 @@ async function markSent(claimToken: string, pairs: [string, string | null][], no
   if (pairs.length === 0) return;
   const payload = JSON.stringify(pairs);
   await run(
-    `UPDATE deliveries SET status = 'sent', sent_at = ?, error = NULL, claim_token = NULL,
+    `UPDATE deliveries SET status = 'sent', sent_at = ?, error = NULL, claim_token = NULL, in_flight = 0,
             provider_message_id = (SELECT json_extract(j.value, '$[1]') FROM json_each(?) j
                                     WHERE json_extract(j.value, '$[0]') = deliveries.id)
       WHERE claim_token = ? AND id IN (SELECT json_extract(value, '$[0]') FROM json_each(?))`,
@@ -454,27 +488,41 @@ async function markSent(claimToken: string, pairs: [string, string | null][], no
  */
 async function markUnknown(claimToken: string, ids: string[], message: string): Promise<void> {
   await run(
-    `UPDATE deliveries SET key_risky = 1, error = ?
+    `UPDATE deliveries SET key_risky = 1, in_flight = 0, error = ?
       WHERE claim_token = ? AND id IN (SELECT value FROM json_each(?))`,
     [message, claimToken, JSON.stringify(ids)],
   );
+}
+
+/** Just before a provider call: if this worker dies now, the outcome is unknown. */
+async function markInFlight(claimToken: string, ids: string[]): Promise<void> {
+  await run(`UPDATE deliveries SET in_flight = 1 WHERE claim_token = ? AND id IN (SELECT value FROM json_each(?))`, [
+    claimToken,
+    JSON.stringify(ids),
+  ]);
 }
 
 /**
  * This attempt sent nothing: hand the rows back to waiting. A key that was
  * ever risky stays on its rows (an earlier attempt under it may have landed);
  * any other key is dropped, so the next attempt can't meet a cached refusal.
+ * The retry this claim counted is given back: a refusal tested nothing.
+ * Returns false when the claim was no longer ours (another worker took it
+ * over), in which case this worker must not stop the send.
  */
-async function release(claimToken: string): Promise<void> {
-  await run(
+async function release(claimToken: string): Promise<boolean> {
+  const rows = await query<{ id: string }>(
     `UPDATE deliveries
-        SET status = 'pending', claim_token = NULL, claimed_at = NULL,
+        SET status = 'pending', claim_token = NULL, claimed_at = NULL, in_flight = 0,
+            retries = MAX(0, retries - key_risky),
             send_key = CASE WHEN key_risky = 1 THEN send_key ELSE NULL END,
             key_at = CASE WHEN key_risky = 1 THEN key_at ELSE NULL END,
             single = CASE WHEN key_risky = 1 THEN single ELSE 0 END
-      WHERE claim_token = ? AND status = 'sending'`,
+      WHERE claim_token = ? AND status = 'sending'
+      RETURNING id`,
     [claimToken],
   );
+  return rows.length > 0;
 }
 
 async function finishIfDone(mailId: number, nowMs: number): Promise<SendProgress> {

@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
   send_key TEXT,
   key_at TEXT,
   key_risky INTEGER NOT NULL DEFAULT 0,
+  -- 1 while a provider call for this row is under way; a stale claim with it set had an unknown outcome.
+  in_flight INTEGER NOT NULL DEFAULT 0,
   -- 1 once the row is sent on its own, after its batch was rejected for one bad message.
   single INTEGER NOT NULL DEFAULT 0,
   retries INTEGER NOT NULL DEFAULT 0,
