@@ -19,6 +19,8 @@ import type {
   SendResult,
 } from "./types";
 
+import { DELIVERY_TAG } from "./resend-webhook";
+
 const BASE = "https://api.resend.com";
 
 /** Gmail/Yahoo/Microsoft require these of bulk senders; nothing upstream adds them on this path. */
@@ -89,6 +91,8 @@ export class ResendProvider implements EmailProvider {
             subject: input.subject,
             html: m.html,
             headers: unsubscribeHeaders(m.unsubscribeUrl),
+            // Echoed back on every webhook event for this message.
+            ...(m.deliveryId ? { tags: [{ name: DELIVERY_TAG, value: m.deliveryId }] } : {}),
           })),
         ),
       });

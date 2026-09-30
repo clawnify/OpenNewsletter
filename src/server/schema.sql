@@ -98,10 +98,8 @@ CREATE TABLE IF NOT EXISTS contacts (
 
 -- One row per recipient of a send: who it went to, whether it arrived at the
 -- provider, and the provider's message id (which bounce and complaint events
--- refer to). Written once when the send starts, in fixed batches of 100: an
--- attempt with an unknown outcome is retried under the same idempotency key,
--- so a batch's members never change after its first claim. See
--- src/server/sending.ts.
+-- refer to). Written once when the send starts, in fixed batches of 100. See
+-- src/server/sending.ts for the claim and idempotency-key rules.
 CREATE TABLE IF NOT EXISTS deliveries (
   id TEXT PRIMARY KEY,
   mail_id INTEGER NOT NULL,
@@ -110,13 +108,28 @@ CREATE TABLE IF NOT EXISTS deliveries (
   batch INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),
-  attempts INTEGER NOT NULL DEFAULT 0,
+  -- Who holds the row right now, and since when (a stale claim is retried).
+  claim_token TEXT,
   claimed_at TEXT,
-  -- The idempotency key this batch's current attempt is sent under.
+  -- The idempotency key this row is sent under, when it was minted, and
+  -- whether an attempt under it may have delivered (then it is never dropped).
   send_key TEXT,
+  key_at TEXT,
+  key_risky INTEGER NOT NULL DEFAULT 0,
+  -- 1 once the row is sent on its own, after its batch was rejected for one bad message.
+  single INTEGER NOT NULL DEFAULT 0,
+  retries INTEGER NOT NULL DEFAULT 0,
   provider_message_id TEXT,
   error TEXT,
   sent_at TEXT,
+  -- Delivery events from the provider's webhook (src/server/events.ts).
+  delivered_at TEXT,
+  opened_at TEXT,
+  clicked_at TEXT,
+  bounced_at TEXT,
+  bounce_permanent INTEGER NOT NULL DEFAULT 0,
+  bounce_reason TEXT,
+  complained_at TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 

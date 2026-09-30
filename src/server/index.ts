@@ -391,20 +391,22 @@ app.put("/api/mails/:id", async (c) => {
     status: b.status ?? existing.status,
     scheduled_at: b.scheduled_at !== undefined ? b.scheduled_at : existing.scheduled_at,
   };
-  // Once a send has started, only the send engine moves the status: an editor
-  // autosave that carries the old status must not pull a running send back to
-  // draft. Content edits are still saved; the send delivers its own snapshot.
-  if (existing.status === "sending" || existing.status === "sent") {
-    fields.status = existing.status;
-    fields.scheduled_at = existing.scheduled_at;
-  }
+
 
   // The email subject (and list title) is derived from the blocks, since the
   // title is now just a display-heading block.
   if (b.blocks !== undefined) fields.title = deriveTitle(b.blocks);
 
   await run(
-    `UPDATE mails SET eyebrow=?, title=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_mobile=?, template_slug=?, audience_id=?, status=?, scheduled_at=?, updated_at=datetime('now') WHERE id=?`,
+    // Once a send has started, only the send engine moves the status: a client
+    // carrying an old status must not pull a running send back to draft.
+    // Decided inside the UPDATE, not from the row read above, so a send that
+    // starts between the two can't be overwritten. Content edits still save;
+    // the send delivers its own snapshot.
+    `UPDATE mails SET eyebrow=?, title=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_mobile=?, template_slug=?, audience_id=?,
+       status = CASE WHEN status IN ('sending', 'sent', 'failed') THEN status ELSE ? END,
+       scheduled_at = CASE WHEN status IN ('sending', 'sent', 'failed') THEN scheduled_at ELSE ? END,
+       updated_at=datetime('now') WHERE id=?`,
     [
       fields.eyebrow, fields.title, fields.subtitle, fields.byline_name, fields.byline_date,
       fields.feature_image, fields.blocks, fields.design, fields.design_mobile, fields.template_slug, fields.audience_id,
@@ -960,8 +962,10 @@ async function enqueueSend(c: any, mailId: number, runAt: string, from: string):
 /** Wall-clock budget for one drain when the queue can pick up the rest. */
 const DRAIN_BUDGET_MS = 25_000;
 
+/** The queue only delivers to the app's own *.apps.clawnify.com hostname. */
 function hasQueue(c: any): boolean {
-  return !!(c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN;
+  if (!(c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN) return false;
+  return new URL(c.req.url).hostname.endsWith(".apps.clawnify.com");
 }
 
 /**
@@ -970,8 +974,8 @@ function hasQueue(c: any): boolean {
  * if this drain finishes, the job arrives, finds nothing to do and answers 200.
  * Keyed per minute, so several drains in the same minute book one job.
  */
-async function bookContinuation(c: any, mailId: number, sendId: string): Promise<void> {
-  if (!hasQueue(c)) return;
+async function bookContinuation(c: any, mailId: number, sendId: string): Promise<boolean> {
+  if (!hasQueue(c)) return false;
   const origin = new URL(c.req.url).origin;
   try {
     await enqueueJob(c.env, {
@@ -980,18 +984,23 @@ async function bookContinuation(c: any, mailId: number, sendId: string): Promise
       runAt: new Date(Date.now() + 60_000).toISOString(),
       idempotencyKey: `send-mail-${mailId}/${sendId}/${Math.floor(Date.now() / 60_000)}`,
     });
+    return true;
   } catch (e) {
-    // The drain below still runs; only the safety net is missing.
     console.error("[send] could not book continuation", e);
+    return false;
   }
 }
 
-/** Run the send for up to the budget (or to the end, with no queue to continue it). */
+/**
+ * Run the send. With a continuation booked it stops at the budget and the job
+ * carries on; without one (no queue, custom domain, enqueue failed) it runs to
+ * the end, since nothing else would.
+ */
 async function drain(c: any, mailId: number, sendId: string) {
   const p = await provider(c);
   if (!p) return null;
-  await bookContinuation(c, mailId, sendId);
-  return sending.drainSend(mailId, p, { deadline: hasQueue(c) ? Date.now() + DRAIN_BUDGET_MS : undefined });
+  const booked = await bookContinuation(c, mailId, sendId);
+  return sending.drainSend(mailId, p, { deadline: booked ? Date.now() + DRAIN_BUDGET_MS : undefined });
 }
 
 function sendResponse(result: sending.SendProgress, mail: Mail) {
@@ -1179,6 +1188,9 @@ app.post("/api/jobs/send-mail", async (c) => {
       return c.json({ ok: true, skipped: "not-sending" });
     }
     const result = await drain(c, id, body.continue_send);
+    // Non-2xx so the queue retries with backoff: the send is still running
+    // and nothing else will pick it up.
+    if (!result) return c.json({ error: "No sending backend could be resolved." }, 503);
     return c.json({ ok: true, ...result });
   }
 

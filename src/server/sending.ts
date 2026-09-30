@@ -14,23 +14,31 @@
  *
  *  - **Who gets the issue is decided once.** `beginSend` snapshots the issue
  *    (content, design, settings, sender) and writes a row per confirmed
- *    subscriber, numbered into fixed batches. Later edits to the issue, the
- *    settings or the list don't change what an in-flight send delivers.
- *  - **An attempt whose outcome is unknown is retried under the same
- *    idempotency key**, so a retry after a timeout is deduplicated by the
- *    provider instead of mailing 100 people twice. The key is stored on the
- *    batch's rows when it is claimed and kept until the batch resolves; this
- *    is also why a batch's membership never changes after its first claim.
- *    When the provider definitely sent nothing (refused, throttled) the key is
- *    dropped with the claim, so the next attempt can't be answered with a
- *    cached refusal.
- *  - **Every claim is one statement.** The storage layer runs statements one
- *    at a time with no transactions, so ownership of a batch is decided by an
- *    UPDATE's change count, never by a read followed by a write.
- *  - **"Unknown" is not "failed".** A timeout or 5xx may have delivered. Those
- *    rows stay claimed and are retried under the same key once the claim goes
- *    stale; only after MAX_ATTEMPTS are they recorded failed, with a message
- *    that says they may have arrived.
+ *    subscriber, numbered into fixed batches, in one statement. Later edits to
+ *    the issue, the settings or the list don't change what a send delivers.
+ *
+ *  - **A key that may have delivered is never given up.** Each attempt is sent
+ *    under an idempotency key stored on its rows. Once any attempt under a key
+ *    has an unknown outcome (a timeout, a 5xx, a worker that died mid-request)
+ *    the key is marked risky and every later attempt for those rows reuses it,
+ *    so the provider deduplicates instead of mailing them twice. A refusal on
+ *    a later attempt proves only that *that* attempt sent nothing, so it does
+ *    not clear the mark. A key that was only ever refused is dropped with the
+ *    claim, so a retry can't be answered with a cached refusal.
+ *
+ *  - **Deduplication has an expiry.** The provider remembers a key for 24
+ *    hours. A risky key older than KEY_TTL_MS is not retried: its rows are
+ *    recorded failed with a message that they may have been delivered.
+ *    Retrying would risk a duplicate the provider can no longer catch.
+ *
+ *  - **Ownership is read back, never counted.** The storage layer runs
+ *    statements one at a time with no transactions, and one of its bindings
+ *    reports no change counts at all. So a claim writes a fresh token and
+ *    `RETURNING`s the rows it took; every later write for that attempt is
+ *    guarded by the token.
+ *
+ *  - **"Unknown" is not "failed".** Unknown rows stay claimed and are retried
+ *    under the same key once the claim goes stale, at most MAX_RETRIES times.
  */
 import { query, get, run } from "./db";
 import { renderEmailHtml } from "./render";
@@ -41,10 +49,49 @@ import type { Mail, Settings } from "../shared/types";
 export const BATCH_SIZE = 100;
 /** A claim this old with no outcome recorded means the worker holding it died. */
 export const STALE_CLAIM_MS = 10 * 60_000;
-/** Claims per batch before an unanswered row is recorded failed. */
-export const MAX_ATTEMPTS = 3;
-/** Longest single wait on a 429 before giving the batch back and yielding. */
+/** Retries of a risky key before its rows are recorded failed. */
+export const MAX_RETRIES = 3;
+/** Resend keeps idempotency keys for 24h; stop trusting one well before that. */
+export const KEY_TTL_MS = 23 * 60 * 60_000;
+/** Longest single wait on a 429 before giving the rows back and yielding. */
 const MAX_RATE_WAIT_MS = 10_000;
+
+const MAYBE_DELIVERED = "The provider never confirmed this message. It may have been delivered.";
+
+/** Mirrors schema.sql, for installs whose database predates the table. */
+export const DELIVERIES_DDL = [
+  `CREATE TABLE IF NOT EXISTS deliveries (
+    id TEXT PRIMARY KEY,
+    mail_id INTEGER NOT NULL,
+    contact_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    batch INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),
+    claim_token TEXT,
+    claimed_at TEXT,
+    send_key TEXT,
+    key_at TEXT,
+    key_risky INTEGER NOT NULL DEFAULT 0,
+    single INTEGER NOT NULL DEFAULT 0,
+    retries INTEGER NOT NULL DEFAULT 0,
+    provider_message_id TEXT,
+    error TEXT,
+    sent_at TEXT,
+    delivered_at TEXT,
+    opened_at TEXT,
+    clicked_at TEXT,
+    bounced_at TEXT,
+    bounce_permanent INTEGER NOT NULL DEFAULT 0,
+    bounce_reason TEXT,
+    complained_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_recipient ON deliveries(mail_id, contact_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_deliveries_batch ON deliveries(mail_id, status, batch)`,
+  `CREATE INDEX IF NOT EXISTS idx_deliveries_provider ON deliveries(provider_message_id)
+     WHERE provider_message_id IS NOT NULL`,
+];
 
 /** Everything a send needs, frozen at the moment it starts. */
 export interface SendSnapshot {
@@ -71,59 +118,43 @@ export interface SendProgress {
 }
 
 export interface DrainOptions {
-  /** Epoch ms after which to stop starting batches. Absent = run to completion. */
+  /** Epoch ms after which to stop starting work. Absent = run to completion. */
   deadline?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
 
-/** Mirrors schema.sql, for installs whose database predates the table. */
-export const DELIVERIES_DDL = [
-  `CREATE TABLE IF NOT EXISTS deliveries (
-    id TEXT PRIMARY KEY,
-    mail_id INTEGER NOT NULL,
-    contact_id TEXT NOT NULL,
-    email TEXT NOT NULL,
-    batch INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending'
-      CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),
-    attempts INTEGER NOT NULL DEFAULT 0,
-    claimed_at TEXT,
-    send_key TEXT,
-    provider_message_id TEXT,
-    error TEXT,
-    sent_at TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_recipient ON deliveries(mail_id, contact_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_deliveries_batch ON deliveries(mail_id, status, batch)`,
-  `CREATE INDEX IF NOT EXISTS idx_deliveries_provider ON deliveries(provider_message_id)
-     WHERE provider_message_id IS NOT NULL`,
-];
+interface Clock {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  deadline?: number;
+}
 
 const iso = (ms: number) => new Date(ms).toISOString();
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const token = () => crypto.randomUUID().replace(/-/g, "");
 
 /**
  * Start a send, or pick up the one already running.
  *
- * - draft / scheduled: claimed atomically, snapshotted, recipients written.
- * - sending: resumed as-is (the snapshot is kept so in-flight batches send
- *   exactly what their first attempt sent).
+ * - draft / scheduled: claimed, snapshotted, recipients written.
+ * - sending: resumed as-is (the snapshot is kept so a retried key sends the
+ *   same payload it sent the first time).
  * - failed: resumed with a fresh snapshot, since a failed send stopped on
- *   something the operator was meant to fix (the key, the sender). Rows that
- *   were delivered stay delivered; only unresolved rows go out.
+ *   something the operator was meant to fix (the key, the sender). Delivered
+ *   rows stay delivered; only unresolved rows go out.
  * - sent: refused.
  */
 export async function beginSend(mailId: number, audienceId: string, snapshot: SendSnapshot): Promise<BeginResult> {
   const sendId = crypto.randomUUID();
-  const claimed = await run(
+  const claimed = await query<{ id: number }>(
     `UPDATE mails SET status = 'sending', send_id = ?, send_snapshot = ?, send_error = NULL,
             updated_at = datetime('now')
-      WHERE id = ? AND status IN ('draft', 'scheduled')`,
+      WHERE id = ? AND status IN ('draft', 'scheduled')
+      RETURNING id`,
     [sendId, JSON.stringify(snapshot), mailId],
   );
-  if (claimed.changes > 0) {
+  if (claimed.length > 0) {
     await writeRecipients(mailId, audienceId);
     return { ok: true, sendId, resumed: false };
   }
@@ -134,44 +165,46 @@ export async function beginSend(mailId: number, audienceId: string, snapshot: Se
   );
   if (!row) return { ok: false, reason: "not-found" };
   if (row.status === "sent") return { ok: false, reason: "already-sent" };
-  if (row.status === "failed" && row.send_id) {
+  if ((row.status !== "sending" && row.status !== "failed") || !row.send_id) return { ok: false, reason: "not-found" };
+
+  if (row.status === "failed") {
     await run(
       `UPDATE mails SET status = 'sending', send_snapshot = ?, send_error = NULL, updated_at = datetime('now')
         WHERE id = ? AND status = 'failed'`,
       [JSON.stringify(snapshot), mailId],
     );
   }
-  if ((row.status === "sending" || row.status === "failed") && row.send_id) {
-    // A worker that died between the claim above and writing recipients leaves
-    // a send with no rows; write them now. INSERT OR IGNORE makes a race harmless.
-    await writeRecipients(mailId, audienceId);
-    return { ok: true, sendId: row.send_id, resumed: true };
-  }
-  return { ok: false, reason: "not-found" };
+  // A worker that died between the claim and writing recipients leaves a send
+  // with no rows; writeRecipients is a no-op when they exist.
+  await writeRecipients(mailId, audienceId);
+  return { ok: true, sendId: row.send_id, resumed: true };
 }
 
-/** One row per confirmed subscriber, numbered into fixed batches. Once per send. */
+/**
+ * One row per confirmed subscriber, numbered into fixed batches. A single
+ * statement guarded by NOT EXISTS, so two concurrent starts can't both write
+ * (a count-then-insert could, and a late subscriber could then land in a batch
+ * that was already claimed).
+ */
 async function writeRecipients(mailId: number, audienceId: string): Promise<void> {
-  const existing = await get<{ n: number }>(`SELECT COUNT(*) AS n FROM deliveries WHERE mail_id = ?`, [mailId]);
-  if ((existing?.n ?? 0) > 0) return;
   await run(
     `INSERT OR IGNORE INTO deliveries (id, mail_id, contact_id, email, batch)
      SELECT 'dlv_' || lower(hex(randomblob(16))), ?, id, email,
             CAST((ROW_NUMBER() OVER (ORDER BY created_at, id) - 1) / ? AS INTEGER)
        FROM contacts
-      WHERE audience_id = ? AND status = 'subscribed'`,
-    [mailId, BATCH_SIZE, audienceId],
+      WHERE audience_id = ? AND status = 'subscribed'
+        AND NOT EXISTS (SELECT 1 FROM deliveries WHERE mail_id = ?)`,
+    [mailId, BATCH_SIZE, audienceId, mailId],
   );
 }
 
 /**
- * Work through the send's batches until they are all resolved, the deadline
- * passes, or the provider refuses the send outright. Safe to run concurrently
- * with itself: batches are claimed, not read.
+ * Work through the send until every row is resolved, the deadline passes, or
+ * the provider refuses the send outright. Safe to run concurrently with
+ * itself: rows are claimed, not read.
  */
 export async function drainSend(mailId: number, provider: EmailProvider, opts: DrainOptions = {}): Promise<SendProgress> {
-  const now = opts.now ?? Date.now;
-  const sleep = opts.sleep ?? defaultSleep;
+  const clock: Clock = { now: opts.now ?? Date.now, sleep: opts.sleep ?? defaultSleep, deadline: opts.deadline };
 
   const mail = await get<{ status: string; send_id: string | null; send_snapshot: string | null }>(
     `SELECT status, send_id, send_snapshot FROM mails WHERE id = ?`,
@@ -179,15 +212,14 @@ export async function drainSend(mailId: number, provider: EmailProvider, opts: D
   );
   if (!mail || mail.status !== "sending" || !mail.send_id || !mail.send_snapshot) return progress(mailId);
   const snap = JSON.parse(mail.send_snapshot) as SendSnapshot;
-  const sendId = mail.send_id;
 
   for (;;) {
-    if (opts.deadline !== undefined && now() >= opts.deadline) break;
-    const batch = await claimNextBatch(mailId, sendId, now());
-    if (batch === "none") break;
-    if (batch === "lost") continue;
+    if (clock.deadline !== undefined && clock.now() >= clock.deadline) break;
+    const claim = await claimNext(mailId, mail.send_id, clock.now());
+    if (!claim) break;
+    if (claim.rows.length === 0) continue;
 
-    const result = await sendBatch(mailId, batch, snap, provider, { now, sleep, deadline: opts.deadline });
+    const result = await sendClaim(claim, snap, provider, clock);
     if (result.stop === "fatal") {
       await run(
         `UPDATE mails SET status = 'failed', send_error = ?, updated_at = datetime('now')
@@ -198,201 +230,257 @@ export async function drainSend(mailId: number, provider: EmailProvider, opts: D
     }
     if (result.stop === "yield") break;
   }
-  return finishIfDone(mailId, now());
+  return finishIfDone(mailId, clock.now());
 }
 
-type Claim = number | "none" | "lost";
+interface ClaimedRow {
+  id: string;
+  contact_id: string;
+  email: string;
+  send_key: string;
+  key_risky: number;
+  single: number;
+}
 
-/** The next batch to work on, claimed. Orphaned claims first, so a stuck batch can't starve. */
-async function claimNextBatch(mailId: number, sendId: string, nowMs: number): Promise<Claim> {
+interface Claim {
+  token: string;
+  rows: ClaimedRow[];
+}
+
+/**
+ * Take the next batch: orphaned claims first (so a stuck batch can't starve),
+ * then waiting rows. Returns null when nothing is left to take.
+ */
+async function claimNext(mailId: number, sendId: string, nowMs: number): Promise<Claim | null> {
   const stale = iso(nowMs - STALE_CLAIM_MS);
-  const next = await get<{ batch: number; status: string }>(
-    `SELECT batch, status FROM deliveries
+  const next = await get<{ batch: number }>(
+    `SELECT batch FROM deliveries
       WHERE mail_id = ? AND (status = 'pending' OR (status = 'sending' AND claimed_at < ?))
       ORDER BY status = 'pending', batch LIMIT 1`,
     [mailId, stale],
   );
-  if (!next) return "none";
+  if (!next) return null;
 
-  if (next.status === "sending") {
-    const took = await run(
-      `UPDATE deliveries SET claimed_at = ?, attempts = attempts + 1
-        WHERE mail_id = ? AND batch = ? AND status = 'sending' AND claimed_at < ?`,
-      [iso(nowMs), mailId, next.batch, stale],
-    );
-    if (took.changes === 0) return "lost";
-    await run(
-      `UPDATE deliveries SET status = 'failed',
-              error = 'No answer from the provider after ${MAX_ATTEMPTS} attempts. It may have been delivered.'
-        WHERE mail_id = ? AND batch = ? AND status = 'sending' AND attempts > ?`,
-      [mailId, next.batch, MAX_ATTEMPTS],
-    );
-    return next.batch;
-  }
-
-  const took = await run(
-    `UPDATE deliveries SET status = 'sending', claimed_at = ?, attempts = attempts + 1, send_key = ?
-      WHERE mail_id = ? AND batch = ? AND status = 'pending'`,
-    [iso(nowMs), `opennewsletter/${sendId}/${next.batch}/${crypto.randomUUID().slice(0, 8)}`, mailId, next.batch],
+  const t = token();
+  // One statement takes the batch. A stale claim's outcome is unknown (its
+  // worker died mid-request), so its key becomes risky. A risky key being
+  // tried again counts a retry. Rows never attempted get a fresh key.
+  const taken = await query<{ id: string }>(
+    `UPDATE deliveries
+        SET key_risky = CASE WHEN status = 'sending' THEN 1 ELSE key_risky END,
+            retries = retries + CASE WHEN status = 'sending' OR key_risky = 1 THEN 1 ELSE 0 END,
+            status = 'sending', claim_token = ?, claimed_at = ?,
+            key_at = CASE WHEN send_key IS NULL THEN ? ELSE key_at END,
+            send_key = COALESCE(send_key, ?)
+      WHERE mail_id = ? AND batch = ?
+        AND (status = 'pending' OR (status = 'sending' AND claimed_at < ?))
+      RETURNING id`,
+    [t, iso(nowMs), iso(nowMs), `opennewsletter/${sendId}/${next.batch}/${t.slice(0, 8)}`, mailId, next.batch, stale],
   );
-  if (took.changes === 0) return "lost";
-  // First claim only: drop anyone who left since the send began. Never on a
-  // re-claim, where the batch must stay exactly what its first attempt sent.
+  if (taken.length === 0) return { token: t, rows: [] };
+
+  // Rows whose risky key can't be retried safely any more: too many retries,
+  // or older than the provider's memory of it.
   await run(
-    `UPDATE deliveries SET status = 'skipped', error = 'Unsubscribed before this issue reached them.'
-      WHERE mail_id = ? AND batch = ? AND status = 'sending'
-        AND contact_id NOT IN (SELECT id FROM contacts WHERE status = 'subscribed')`,
-    [mailId, next.batch],
+    `UPDATE deliveries SET status = 'failed', error = ?, claim_token = NULL
+      WHERE claim_token = ? AND key_risky = 1 AND (retries > ? OR key_at < ?)`,
+    [MAYBE_DELIVERED, t, MAX_RETRIES, iso(nowMs - KEY_TTL_MS)],
   );
-  return next.batch;
+  // Drop anyone who left since the send began, but only rows never attempted:
+  // a retried key must carry exactly the recipients it carried first.
+  await run(
+    `UPDATE deliveries SET status = 'skipped', error = 'Unsubscribed before this issue reached them.', claim_token = NULL
+      WHERE claim_token = ? AND key_risky = 0 AND retries = 0
+        AND contact_id NOT IN (SELECT id FROM contacts WHERE status = 'subscribed')`,
+    [t],
+  );
+
+  const rows = await query<ClaimedRow>(
+    `SELECT id, contact_id, email, send_key, key_risky, single FROM deliveries
+      WHERE claim_token = ? AND status = 'sending' ORDER BY id`,
+    [t],
+  );
+  return { token: t, rows };
 }
 
-type BatchResult = { stop?: undefined } | { stop: "fatal"; message: string } | { stop: "yield" };
+type StepResult = { stop?: undefined } | { stop: "fatal"; message: string } | { stop: "yield" };
 
-async function sendBatch(
-  mailId: number,
-  batch: number,
-  snap: SendSnapshot,
-  provider: EmailProvider,
-  t: { now: () => number; sleep: (ms: number) => Promise<void>; deadline?: number },
-): Promise<BatchResult> {
-  const rows = await query<{ id: string; contact_id: string; email: string; send_key: string }>(
-    `SELECT id, contact_id, email, send_key FROM deliveries
-      WHERE mail_id = ? AND batch = ? AND status = 'sending' ORDER BY id`,
-    [mailId, batch],
-  );
-  if (rows.length === 0) return {};
+async function sendClaim(claim: Claim, snap: SendSnapshot, provider: EmailProvider, clock: Clock): Promise<StepResult> {
+  // Rows already split into single sends (after a batch was rejected for one
+  // bad message) keep going one by one under their own keys.
+  const singles = claim.rows.filter((r) => r.single === 1);
+  const grouped = claim.rows.filter((r) => r.single !== 1);
 
-  const messages = rows.map((r) => renderFor(snap, r));
-  const idempotencyKey = rows[0].send_key;
-  const input = { from: snap.from, subject: snap.mail.title, messages, idempotencyKey };
-
-  let outcome: BatchOutcome = await provider.sendBatch(input);
-  while (outcome.kind === "rate_limited") {
-    const wait = Math.min(outcome.retryAfterMs, MAX_RATE_WAIT_MS);
-    if (t.deadline !== undefined && t.now() + wait >= t.deadline) {
-      await releaseBatch(mailId, batch);
-      return { stop: "yield" };
+  if (grouped.length > 0) {
+    const messages = grouped.map((r) => renderFor(snap, r));
+    const outcome = await sendWithWaits(provider, snap, messages, grouped[0].send_key, clock);
+    switch (outcome.kind) {
+      case "sent":
+        await markSent(claim.token, grouped.map((r, i) => [r.id, outcome.ids[i] ?? null]), clock.now());
+        break;
+      case "invalid": {
+        // Rejected as a whole for one message, so nothing went out under this
+        // key: split into single sends, each under its own key.
+        await run(
+          `UPDATE deliveries SET single = 1, key_risky = 0, retries = 0, key_at = ?, send_key = send_key || '/' || id
+            WHERE claim_token = ? AND single = 0`,
+          [iso(clock.now()), claim.token],
+        );
+        const split = await query<ClaimedRow>(
+          `SELECT id, contact_id, email, send_key, key_risky, single FROM deliveries
+            WHERE claim_token = ? AND status = 'sending' AND single = 1 ORDER BY id`,
+          [claim.token],
+        );
+        return sendSingles(claim.token, split, snap, provider, clock, { accountCheck: true });
+      }
+      case "rate_limited":
+        await release(claim.token);
+        return { stop: "yield" };
+      case "fatal":
+        await release(claim.token);
+        return { stop: "fatal", message: outcome.message };
+      case "in_progress":
+      case "unknown":
+        await markUnknown(claim.token, grouped.map((r) => r.id), outcome.kind === "unknown" ? outcome.message : "In progress elsewhere");
+        break;
     }
-    await t.sleep(wait);
-    outcome = await provider.sendBatch(input);
   }
-
-  switch (outcome.kind) {
-    case "sent": {
-      const ids = outcome.ids;
-      await markSent(mailId, rows.map((r, i) => [r.id, ids[i] ?? null]), t.now());
-      return {};
-    }
-    case "invalid":
-      return sendOneByOne(mailId, rows, messages, snap, idempotencyKey, provider, t.now);
-    case "fatal":
-      await releaseBatch(mailId, batch);
-      return { stop: "fatal", message: outcome.message };
-    case "in_progress":
-      // Another worker holds this key right now; its outcome will land on these rows.
-      return {};
-    case "unknown":
-      // Leave the rows claimed. Once the claim is stale they are retried under
-      // the same key, which the provider deduplicates if this attempt landed.
-      await run(`UPDATE deliveries SET error = ? WHERE mail_id = ? AND batch = ? AND status = 'sending'`, [
-        outcome.message,
-        mailId,
-        batch,
-      ]);
-      return {};
-  }
+  if (singles.length > 0) return sendSingles(claim.token, singles, snap, provider, clock, { accountCheck: false });
+  return {};
 }
 
 /**
- * The provider rejected the batch as a whole because of one message. Send the
- * messages singly so one bad address costs one row, not a hundred. When every
- * message fails the same way the problem isn't an address, so the send stops
- * and the rows go back to waiting.
+ * Send rows one at a time, each through the same outcome handling as a batch.
+ * `accountCheck`: right after a batch rejection, if *every* message is
+ * rejected with the same reason the problem is the account or the sender, not
+ * an address, so stop the send rather than fail the whole list.
  */
-async function sendOneByOne(
-  mailId: number,
-  rows: { id: string }[],
-  messages: BatchMessage[],
+async function sendSingles(
+  claimToken: string,
+  rows: ClaimedRow[],
   snap: SendSnapshot,
-  batchKey: string,
   provider: EmailProvider,
-  now: () => number,
-): Promise<BatchResult> {
-  const results: ({ id: string } | { error: string })[] = [];
+  clock: Clock,
+  opts: { accountCheck: boolean },
+): Promise<StepResult> {
+  const rejected: { id: string; message: string }[] = [];
   for (let i = 0; i < rows.length; i++) {
-    const m = messages[i];
-    try {
-      const r = await provider.sendEmail({
-        from: snap.from,
-        to: m.to,
-        subject: snap.mail.title,
-        html: m.html,
-        headers: { "List-Unsubscribe": `<${m.unsubscribeUrl}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" },
-        idempotencyKey: `${batchKey}/${rows[i].id}`,
-      });
-      results.push({ id: r.id });
-    } catch (e: any) {
-      results.push({ error: e?.message || "send failed" });
+    const r = rows[i];
+    const outcome = await sendWithWaits(provider, snap, [renderFor(snap, r)], r.send_key, clock);
+    switch (outcome.kind) {
+      case "sent":
+        await markSent(claimToken, [[r.id, outcome.ids[0] ?? null]], clock.now());
+        break;
+      case "invalid":
+        rejected.push({ id: r.id, message: outcome.message });
+        break;
+      case "rate_limited":
+        await release(claimToken);
+        return { stop: "yield" };
+      case "fatal":
+        await release(claimToken);
+        return { stop: "fatal", message: outcome.message };
+      case "in_progress":
+      case "unknown":
+        await markUnknown(claimToken, [r.id], outcome.kind === "unknown" ? outcome.message : "In progress elsewhere");
+        break;
     }
   }
 
-  const errors = results.filter((r): r is { error: string } => "error" in r).map((r) => r.error);
-  if (rows.length > 1 && errors.length === rows.length && errors.every((e) => e === errors[0])) {
-    await run(`UPDATE deliveries SET status = 'pending', claimed_at = NULL, send_key = NULL, error = NULL WHERE id IN (${rows.map(() => "?").join(",")})`, rows.map((r) => r.id));
-    return { stop: "fatal", message: errors[0] };
+  if (
+    opts.accountCheck &&
+    rows.length > 1 &&
+    rejected.length === rows.length &&
+    rejected.every((x) => x.message === rejected[0].message)
+  ) {
+    await release(claimToken);
+    return { stop: "fatal", message: rejected[0].message };
   }
-
-  await markSent(
-    mailId,
-    rows.flatMap((r, i) => ("id" in results[i] ? [[r.id, (results[i] as { id: string }).id] as [string, string | null]] : [])),
-    now(),
-  );
-  for (let i = 0; i < rows.length; i++) {
-    const res = results[i];
-    if ("error" in res) {
-      await run(`UPDATE deliveries SET status = 'failed', error = ? WHERE id = ?`, [res.error, rows[i].id]);
-    }
+  for (const x of rejected) {
+    await run(`UPDATE deliveries SET status = 'failed', error = ?, claim_token = NULL WHERE id = ? AND claim_token = ?`, [
+      x.message,
+      x.id,
+      claimToken,
+    ]);
   }
   return {};
 }
 
-function renderFor(snap: SendSnapshot, r: { contact_id: string; email: string }): BatchMessage {
+/** One provider call, waiting out 429s while the deadline allows. Same key throughout. */
+async function sendWithWaits(
+  provider: EmailProvider,
+  snap: SendSnapshot,
+  messages: BatchMessage[],
+  idempotencyKey: string,
+  clock: Clock,
+): Promise<BatchOutcome> {
+  const input = { from: snap.from, subject: snap.mail.title, messages, idempotencyKey };
+  let outcome = await provider.sendBatch(input);
+  while (outcome.kind === "rate_limited") {
+    const wait = Math.min(outcome.retryAfterMs, MAX_RATE_WAIT_MS);
+    if (clock.deadline !== undefined && clock.now() + wait >= clock.deadline) return outcome;
+    await clock.sleep(wait);
+    outcome = await provider.sendBatch(input);
+  }
+  return outcome;
+}
+
+function renderFor(snap: SendSnapshot, r: { id: string; contact_id: string; email: string }): BatchMessage {
   // The contact id is a UUID, so the link is unguessable and unsubscribes only this person.
   const unsubscribeUrl = `${snap.origin}/api/unsubscribe?c=${r.contact_id}`;
   const html = renderEmailHtml(snap.mail as Mail, snap.design, snap.settings, {
     unsubscribeUrl,
     mobile: snap.mail.design_mobile,
   });
-  return { to: r.email, html, unsubscribeUrl };
+  return { to: r.email, html, unsubscribeUrl, deliveryId: r.id };
 }
 
 /** One statement for the whole batch: per-row UPDATEs would spend a subrequest per recipient. */
-async function markSent(mailId: number, pairs: [string, string | null][], nowMs: number): Promise<void> {
+async function markSent(claimToken: string, pairs: [string, string | null][], nowMs: number): Promise<void> {
   if (pairs.length === 0) return;
   const payload = JSON.stringify(pairs);
   await run(
-    `UPDATE deliveries SET status = 'sent', sent_at = ?, error = NULL,
+    `UPDATE deliveries SET status = 'sent', sent_at = ?, error = NULL, claim_token = NULL,
             provider_message_id = (SELECT json_extract(j.value, '$[1]') FROM json_each(?) j
                                     WHERE json_extract(j.value, '$[0]') = deliveries.id)
-      WHERE mail_id = ? AND id IN (SELECT json_extract(value, '$[0]') FROM json_each(?))`,
-    [iso(nowMs), payload, mailId, payload],
+      WHERE claim_token = ? AND id IN (SELECT json_extract(value, '$[0]') FROM json_each(?))`,
+    [iso(nowMs), payload, claimToken, payload],
   );
 }
 
-/** Nothing was sent: hand the batch back so the next drain takes it fresh. */
-async function releaseBatch(mailId: number, batch: number): Promise<void> {
+/**
+ * No trustworthy answer. The rows stay claimed (so they go stale and are
+ * retried later) and their key becomes risky, so every retry reuses it.
+ */
+async function markUnknown(claimToken: string, ids: string[], message: string): Promise<void> {
   await run(
-    `UPDATE deliveries SET status = 'pending', claimed_at = NULL, send_key = NULL, attempts = attempts - 1
-      WHERE mail_id = ? AND batch = ? AND status = 'sending'`,
-    [mailId, batch],
+    `UPDATE deliveries SET key_risky = 1, error = ?
+      WHERE claim_token = ? AND id IN (SELECT value FROM json_each(?))`,
+    [message, claimToken, JSON.stringify(ids)],
+  );
+}
+
+/**
+ * This attempt sent nothing: hand the rows back to waiting. A key that was
+ * ever risky stays on its rows (an earlier attempt under it may have landed);
+ * any other key is dropped, so the next attempt can't meet a cached refusal.
+ */
+async function release(claimToken: string): Promise<void> {
+  await run(
+    `UPDATE deliveries
+        SET status = 'pending', claim_token = NULL, claimed_at = NULL,
+            send_key = CASE WHEN key_risky = 1 THEN send_key ELSE NULL END,
+            key_at = CASE WHEN key_risky = 1 THEN key_at ELSE NULL END,
+            single = CASE WHEN key_risky = 1 THEN single ELSE 0 END
+      WHERE claim_token = ? AND status = 'sending'`,
+    [claimToken],
   );
 }
 
 async function finishIfDone(mailId: number, nowMs: number): Promise<SendProgress> {
   const p = await progress(mailId);
   if (p.status !== "sending" || p.open > 0) return p;
-  // Only the first worker to see the send finished gets changes = 1; the rest are no-ops.
+  // Guarded on status, so only the first worker to see the send finished writes.
   await run(
     `UPDATE mails SET status = ?, sent_at = ?, scheduled_at = NULL, send_error = ?, updated_at = datetime('now')
       WHERE id = ? AND status = 'sending'`,

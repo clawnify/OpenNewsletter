@@ -28,6 +28,8 @@ export interface BatchMessage {
   html: string;
   /** Already embedded in `html`; passed separately for the List-Unsubscribe header. */
   unsubscribeUrl: string;
+  /** Tagged on the message so delivery events map back to this row. */
+  deliveryId?: string;
 }
 
 export interface SendBatchInput {
