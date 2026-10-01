@@ -36,6 +36,12 @@ account. The provider is just delivery, and it's swappable.
 - **Embeddable signup widget** — drop `<script src=".../widget.js">` on your
   own site; it starts the same opt-in flow.
 - **Sending** — send now, or send a test to yourself. Bring your own API key.
+- **Personalization** — write `Hi {{first_name|there}},` in any text. Each
+  reader gets their own name, and the word after the bar goes to readers
+  without one. `{{last_name}}` and `{{email}}` work the same way. Names are
+  always inserted as plain text, so a signup can't slip a link into your issue.
+- **Preview text** — set the line inboxes show after the subject, instead of
+  letting them borrow the first words of the body.
 - **Delivery tracking** — one click in Settings registers a Resend webhook with
   your own key. Hard bounces and spam complaints then stop future sends to
   that address on every list, and each sent issue shows delivered, clicked,

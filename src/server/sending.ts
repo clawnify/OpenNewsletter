@@ -46,6 +46,7 @@
  */
 import { query, get, run } from "./db";
 import { renderEmailHtml } from "./render";
+import { fillSubject, type MergeValues } from "../shared/merge";
 import type { BatchMessage, BatchOutcome, EmailProvider } from "./providers";
 import type { DesignTokens } from "../shared/design";
 import type { Mail, Settings } from "../shared/types";
@@ -69,6 +70,8 @@ export const DELIVERIES_DDL = [
     mail_id INTEGER NOT NULL,
     contact_id TEXT NOT NULL,
     email TEXT NOT NULL,
+    first_name TEXT,
+    last_name TEXT,
     batch INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
       CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),
@@ -106,6 +109,13 @@ export interface SendSnapshot {
   from: string;
   /** The app's own origin, for unsubscribe links. */
   origin: string;
+  /**
+   * Which renderer the send was begun with. Absent means 1, from before merge
+   * tags. A retried key must carry the exact payload it first carried, so a
+   * send renders with its own version even after the app is upgraded. Bump it
+   * whenever the same mail would render to different HTML.
+   */
+  renderer?: 2;
 }
 
 export type BeginResult =
@@ -184,6 +194,14 @@ export async function beginSend(mailId: number, audienceId: string, snapshot: Se
         [MAYBE_DELIVERED, mailId],
       );
     }
+    // Rows written before names were copied have none. Rows never attempted
+    // carry no payload yet, so they can take the names now.
+    await run(
+      `UPDATE deliveries SET first_name = (SELECT first_name FROM contacts WHERE id = deliveries.contact_id),
+                             last_name = (SELECT last_name FROM contacts WHERE id = deliveries.contact_id)
+        WHERE mail_id = ? AND first_name IS NULL AND key_risky = 0 AND status IN ('pending', 'failed')`,
+      [mailId],
+    );
     await run(
       `UPDATE mails SET status = 'sending', send_snapshot = ?, send_error = NULL, updated_at = datetime('now')
         WHERE id = ? AND status = 'failed'`,
@@ -204,8 +222,8 @@ export async function beginSend(mailId: number, audienceId: string, snapshot: Se
  */
 async function writeRecipients(mailId: number, audienceId: string): Promise<void> {
   await run(
-    `INSERT OR IGNORE INTO deliveries (id, mail_id, contact_id, email, batch)
-     SELECT 'dlv_' || lower(hex(randomblob(16))), ?, id, email,
+    `INSERT OR IGNORE INTO deliveries (id, mail_id, contact_id, email, first_name, last_name, batch)
+     SELECT 'dlv_' || lower(hex(randomblob(16))), ?, id, email, first_name, last_name,
             CAST((ROW_NUMBER() OVER (ORDER BY created_at, id) - 1) / ? AS INTEGER)
        FROM contacts
       WHERE audience_id = ? AND status = 'subscribed'
@@ -253,6 +271,8 @@ interface ClaimedRow {
   id: string;
   contact_id: string;
   email: string;
+  first_name: string | null;
+  last_name: string | null;
   send_key: string;
   key_risky: number;
   single: number;
@@ -315,7 +335,7 @@ async function claimNext(mailId: number, sendId: string, nowMs: number): Promise
   );
 
   const rows = await query<ClaimedRow>(
-    `SELECT id, contact_id, email, send_key, key_risky, single FROM deliveries
+    `SELECT id, contact_id, email, first_name, last_name, send_key, key_risky, single FROM deliveries
       WHERE claim_token = ? AND status = 'sending' ORDER BY id`,
     [t],
   );
@@ -357,7 +377,7 @@ async function sendClaim(claim: Claim, snap: SendSnapshot, provider: EmailProvid
           [iso(clock.now()), claim.token],
         );
         const split = await query<ClaimedRow>(
-          `SELECT id, contact_id, email, send_key, key_risky, single FROM deliveries
+          `SELECT id, contact_id, email, first_name, last_name, send_key, key_risky, single FROM deliveries
             WHERE claim_token = ? AND status = 'sending' AND single = 1 ORDER BY id`,
           [claim.token],
         );
@@ -459,14 +479,23 @@ async function sendWithWaits(
   return outcome;
 }
 
-function renderFor(snap: SendSnapshot, r: { id: string; contact_id: string; email: string }): BatchMessage {
+function renderFor(snap: SendSnapshot, r: ClaimedRow): BatchMessage {
   // The contact id is a UUID, so the link is unguessable and unsubscribes only this person.
   const unsubscribeUrl = `${snap.origin}/api/unsubscribe?c=${r.contact_id}`;
+  // From the row, not the contact: a name edited mid-send must not change a
+  // payload that may be retried under the same key.
+  const v2 = snap.renderer === 2;
+  const merge: MergeValues | undefined = v2
+    ? { first_name: r.first_name ?? "", last_name: r.last_name ?? "", email: r.email }
+    : undefined;
   const html = renderEmailHtml(snap.mail as Mail, snap.design, snap.settings, {
     unsubscribeUrl,
     mobile: snap.mail.design_mobile,
+    merge,
+    legacyColumns: !v2,
   });
-  return { to: r.email, html, unsubscribeUrl, deliveryId: r.id };
+  const subject = fillSubject(snap.mail.title, merge);
+  return { to: r.email, html, unsubscribeUrl, deliveryId: r.id, ...(subject !== snap.mail.title ? { subject } : {}) };
 }
 
 /** One statement for the whole batch: per-row UPDATEs would spend a subrequest per recipient. */
