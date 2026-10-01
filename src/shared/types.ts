@@ -48,6 +48,8 @@ export interface Mail {
   /** Publication eyebrow, e.g. "THE EDITORIAL REVIEW • VOLUME XXIII". */
   eyebrow: string;
   title: string;
+  /** Inbox preview line shown after the subject. Hidden in the body. */
+  preheader: string;
   /** Deck / standfirst (Ghost: custom_excerpt). */
   subtitle: string;
   byline_name: string;
