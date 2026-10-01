@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import app from "./index";
 import { DEFAULT_DESIGN } from "../shared/design";
+import { BUILTIN_TEMPLATES } from "../shared/templates";
 
 declare const process: { getBuiltinModule(id: string): any };
 const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
@@ -22,6 +23,11 @@ beforeEach(() => {
       },
     },
   };
+  // The app seeds built-in templates once per process, and each test here has a fresh database.
+  for (const t of BUILTIN_TEMPLATES) {
+    db.prepare(`INSERT OR IGNORE INTO templates (slug, name, description, design, skeleton, builtin) VALUES (?, ?, ?, ?, ?, 1)`)
+      .run(t.slug, t.name, t.description, JSON.stringify(t.design), JSON.stringify(t.skeleton));
+  }
 });
 
 type Reply = { status: number; json(): Promise<any> };
@@ -64,5 +70,44 @@ describe("mails", () => {
     const saved = await (await call("PUT", `/api/mails/${id}`, { preheader: "Three fixes this week" })).json();
     expect(saved.preheader).toBe("Three fixes this week");
     expect((await (await call("GET", `/api/mails/${id}`)).json()).preheader).toBe("Three fixes this week");
+  });
+});
+
+describe("templates make the mail they show", () => {
+  const h1s = (mail: { blocks: { type: string; level?: number }[] }) => mail.blocks.filter((b) => b.type === "heading" && b.level === 1).length;
+
+  it("a template saved from a mail creates that mail again, with one title", async () => {
+    const original = await (await call("POST", "/api/mails", { template_slug: "classic-editorial" })).json();
+    expect(h1s(original)).toBe(1);
+    const saved = await (await call("POST", "/api/templates", { name: "Mine", slug: "mine", from_mail_id: original.id })).json();
+    const copy = await (await call("POST", "/api/mails", { template_slug: saved.slug })).json();
+    expect(h1s(copy)).toBe(1);
+    expect(copy.blocks.map((b: { type: string }) => b.type)).toEqual(original.blocks.map((b: { type: string }) => b.type));
+  });
+
+  it("a template saved from a mail with no title doesn't gain the masthead it never showed", async () => {
+    const original = await (await call("POST", "/api/mails", { template_slug: "classic-editorial" })).json();
+    const body = [{ id: "x", type: "text", md: "Just a note." }];
+    await call("PUT", `/api/mails/${original.id}`, { blocks: body });
+    const saved = await (await call("POST", "/api/templates", { name: "Note", slug: "note", from_mail_id: original.id })).json();
+    const copy = await (await call("POST", "/api/mails", { template_slug: saved.slug })).json();
+    expect(copy.blocks.map((b: { type: string; md?: string }) => [b.type, b.md])).toEqual([["text", "Just a note."]]);
+  });
+});
+
+describe("GET /api/templates/:slug/preview", () => {
+  it("renders the mail the template creates, with a sample reader and no scripts allowed", async () => {
+    const res = await app.request("/api/templates/classic-editorial/preview", {}, env);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-security-policy")).toContain("script-src 'none'");
+    const html = await res.text();
+    expect(html).toContain("<!DOCTYPE html>");
+    const mail = await (await call("POST", "/api/mails", { template_slug: "classic-editorial" })).json();
+    const title = mail.blocks.find((b: { type: string; level?: number }) => b.type === "heading" && b.level === 1).text;
+    expect(html).toContain(title);
+  });
+
+  it("is a 404 for an unknown template", async () => {
+    expect((await app.request("/api/templates/nope/preview", {}, env)).status).toBe(404);
   });
 });
