@@ -16,10 +16,15 @@ CREATE TABLE IF NOT EXISTS mails (
   template_slug TEXT,
   -- Resend segment (audience) id this mail targets.
   audience_id TEXT,
-  status TEXT NOT NULL DEFAULT 'draft',  -- draft | scheduled | sent
+  status TEXT NOT NULL DEFAULT 'draft',  -- draft | scheduled | sending | sent | failed
   broadcast_id TEXT,
   scheduled_at TEXT,
   sent_at TEXT,
+  -- Set when a send starts (see src/server/sending.ts). The snapshot is what
+  -- the send delivers, so edits made while it runs can't change it.
+  send_id TEXT,
+  send_snapshot TEXT,
+  send_error TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -44,7 +49,11 @@ CREATE TABLE IF NOT EXISTS settings (
   from_name TEXT NOT NULL DEFAULT '',
   from_email TEXT NOT NULL DEFAULT '',
   default_audience_id TEXT,
-  footer_text TEXT NOT NULL DEFAULT ''
+  footer_text TEXT NOT NULL DEFAULT '',
+  -- The Resend webhook "Turn on delivery tracking" registered, and its signing
+  -- secret (verifies events; RESEND_WEBHOOK_SECRET in the env wins).
+  resend_webhook_id TEXT,
+  resend_webhook_secret TEXT
 );
 
 -- Audiences (lists). Previously Resend segments; now local, so the list is the
@@ -90,6 +99,50 @@ CREATE TABLE IF NOT EXISTS contacts (
   crm_contact_id TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- One row per recipient of a send: who it went to, whether it arrived at the
+-- provider, and the provider's message id (which bounce and complaint events
+-- refer to). Written once when the send starts, in fixed batches of 100. See
+-- src/server/sending.ts for the claim and idempotency-key rules.
+CREATE TABLE IF NOT EXISTS deliveries (
+  id TEXT PRIMARY KEY,
+  mail_id INTEGER NOT NULL,
+  contact_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  batch INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),
+  -- Who holds the row right now, and since when (a stale claim is retried).
+  claim_token TEXT,
+  claimed_at TEXT,
+  -- The idempotency key this row is sent under, when it was minted, and
+  -- whether an attempt under it may have delivered (then it is never dropped).
+  send_key TEXT,
+  key_at TEXT,
+  key_risky INTEGER NOT NULL DEFAULT 0,
+  -- 1 while a provider call for this row is under way; a stale claim with it set had an unknown outcome.
+  in_flight INTEGER NOT NULL DEFAULT 0,
+  -- 1 once the row is sent on its own, after its batch was rejected for one bad message.
+  single INTEGER NOT NULL DEFAULT 0,
+  retries INTEGER NOT NULL DEFAULT 0,
+  provider_message_id TEXT,
+  error TEXT,
+  sent_at TEXT,
+  -- Delivery events from the provider's webhook (src/server/events.ts).
+  delivered_at TEXT,
+  opened_at TEXT,
+  clicked_at TEXT,
+  bounced_at TEXT,
+  bounce_permanent INTEGER NOT NULL DEFAULT 0,
+  bounce_reason TEXT,
+  complained_at TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_recipient ON deliveries(mail_id, contact_id);
+CREATE INDEX IF NOT EXISTS idx_deliveries_batch ON deliveries(mail_id, status, batch);
+CREATE INDEX IF NOT EXISTS idx_deliveries_provider ON deliveries(provider_message_id)
+  WHERE provider_message_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_mails_status ON mails(status);
 CREATE INDEX IF NOT EXISTS idx_mails_updated ON mails(updated_at);

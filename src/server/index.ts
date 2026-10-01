@@ -8,6 +8,10 @@ import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
 import { sendVerdict } from "./schedule";
+import * as sending from "./sending";
+import { applyDeliveryEvent } from "./events";
+import { parseResendEvent, verifyResendWebhook, RESEND_EVENTS } from "./providers/resend-webhook";
+import { WebhookSetupError } from "./providers/types";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle } from "../shared/blocks";
@@ -23,6 +27,9 @@ type Env = {
     CREDENTIALS?: CredentialBinding;
     CLAWNIFY_ORG_ID?: string;
     RESEND_API_KEY?: string;
+    // Signing secret for a Resend webhook set up by hand. Wins over the one
+    // "Turn on delivery tracking" stores.
+    RESEND_WEBHOOK_SECRET?: string;
     OPENROUTER_API_KEY?: string;
     NEWSLETTER_MODEL?: string;
     GITHUB_TOKEN?: string;
@@ -62,6 +69,11 @@ async function ensureSeed() {
     `ALTER TABLE settings ADD COLUMN logo TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN senders TEXT NOT NULL DEFAULT '[]'`,
     `ALTER TABLE contacts ADD COLUMN crm_contact_id TEXT`,
+    `ALTER TABLE mails ADD COLUMN send_id TEXT`,
+    `ALTER TABLE mails ADD COLUMN send_snapshot TEXT`,
+    `ALTER TABLE mails ADD COLUMN send_error TEXT`,
+    `ALTER TABLE settings ADD COLUMN resend_webhook_id TEXT`,
+    `ALTER TABLE settings ADD COLUMN resend_webhook_secret TEXT`,
   ]) {
     try {
       await run(sql);
@@ -69,6 +81,9 @@ async function ensureSeed() {
       /* column already exists */
     }
   }
+  // Idempotent, and outside the try: a mistake here must surface, not be read
+  // as "already exists".
+  for (const sql of sending.DELIVERIES_DDL) await run(sql);
   seeded = true;
 }
 
@@ -212,6 +227,7 @@ app.get("/api/status", async (c) => {
     ai_available: !!env.OPENROUTER_API_KEY,
     github_connected: !!env.GITHUB_TOKEN,
     crm_connected: crm.crmConfigured(c.env),
+    tracking: await trackingState(c),
     audiences,
     sending_domains,
   });
@@ -385,12 +401,21 @@ app.put("/api/mails/:id", async (c) => {
     scheduled_at: b.scheduled_at !== undefined ? b.scheduled_at : existing.scheduled_at,
   };
 
+
   // The email subject (and list title) is derived from the blocks, since the
   // title is now just a display-heading block.
   if (b.blocks !== undefined) fields.title = deriveTitle(b.blocks);
 
   await run(
-    `UPDATE mails SET eyebrow=?, title=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_mobile=?, template_slug=?, audience_id=?, status=?, scheduled_at=?, updated_at=datetime('now') WHERE id=?`,
+    // Once a send has started, only the send engine moves the status: a client
+    // carrying an old status must not pull a running send back to draft.
+    // Decided inside the UPDATE, not from the row read above, so a send that
+    // starts between the two can't be overwritten. Content edits still save;
+    // the send delivers its own snapshot.
+    `UPDATE mails SET eyebrow=?, title=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_mobile=?, template_slug=?, audience_id=?,
+       status = CASE WHEN status IN ('sending', 'sent', 'failed') THEN status ELSE ? END,
+       scheduled_at = CASE WHEN status IN ('sending', 'sent', 'failed') THEN scheduled_at ELSE ? END,
+       updated_at=datetime('now') WHERE id=?`,
     [
       fields.eyebrow, fields.title, fields.subtitle, fields.byline_name, fields.byline_date,
       fields.feature_image, fields.blocks, fields.design, fields.design_mobile, fields.template_slug, fields.audience_id,
@@ -402,7 +427,11 @@ app.put("/api/mails/:id", async (c) => {
 });
 
 app.delete("/api/mails/:id", async (c) => {
-  await run("DELETE FROM mails WHERE id = ?", [Number(c.req.param("id"))]);
+  const id = Number(c.req.param("id"));
+  const row = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
+  if (row?.status === "sending") return c.json({ error: "This issue is still sending." }, 409);
+  await run("DELETE FROM deliveries WHERE mail_id = ?", [id]);
+  await run("DELETE FROM mails WHERE id = ?", [id]);
   return c.json({ ok: true });
 });
 
@@ -939,10 +968,62 @@ async function enqueueSend(c: any, mailId: number, runAt: string, from: string):
   });
 }
 
+/** Wall-clock budget for one drain when the queue can pick up the rest. */
+const DRAIN_BUDGET_MS = 25_000;
+
+/** The queue only delivers to the app's own *.apps.clawnify.com hostname. */
+function hasQueue(c: any): boolean {
+  if (!(c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN) return false;
+  return new URL(c.req.url).hostname.endsWith(".apps.clawnify.com");
+}
+
+/**
+ * Book the next drain before starting this one. If this worker dies or the
+ * operator closes the tab mid-send, the job picks the send up a minute later;
+ * if this drain finishes, the job arrives, finds nothing to do and answers 200.
+ * Keyed per minute, so several drains in the same minute book one job.
+ */
+async function bookContinuation(c: any, mailId: number, sendId: string): Promise<boolean> {
+  if (!hasQueue(c)) return false;
+  const origin = new URL(c.req.url).origin;
+  try {
+    await enqueueJob(c.env, {
+      targetUrl: `${origin}/api/jobs/send-mail`,
+      payload: { mail_id: mailId, continue_send: sendId },
+      runAt: new Date(Date.now() + 60_000).toISOString(),
+      idempotencyKey: `send-mail-${mailId}/${sendId}/${Math.floor(Date.now() / 60_000)}`,
+    });
+    return true;
+  } catch (e) {
+    console.error("[send] could not book continuation", e);
+    return false;
+  }
+}
+
+/**
+ * Run the send. With a continuation booked it stops at the budget and the job
+ * carries on; without one (no queue, custom domain, enqueue failed) it runs to
+ * the end, since nothing else would.
+ */
+async function drain(c: any, mailId: number, sendId: string) {
+  const p = await provider(c);
+  if (!p) return null;
+  const booked = await bookContinuation(c, mailId, sendId);
+  return sending.drainSend(mailId, p, { deadline: booked ? Date.now() + DRAIN_BUDGET_MS : undefined });
+}
+
+function sendResponse(result: sending.SendProgress, mail: Mail) {
+  if (result.status === "failed") {
+    return { status: 502 as const, body: { ...result, error: result.error || "Send failed", mail } };
+  }
+  return { status: 200 as const, body: { ok: true, ...result, mail } };
+}
+
 /**
  * The actual send. Shared by the operator-triggered route and the queue
- * callback so a scheduled issue goes out through exactly the same path —
- * including the domain precheck and suppression reconciliation.
+ * callback so a scheduled issue goes out through exactly the same path,
+ * including the domain precheck. Sending an issue that is already sending, or
+ * that stopped as failed, resumes it rather than starting over.
  */
 async function sendMailNow(
   c: any,
@@ -953,7 +1034,7 @@ async function sendMailNow(
   // means an operator pressed send just now, which needs no such check — they
   // are looking at the issue and their intent is the request itself.
   scheduledFor?: string | null,
-): Promise<{ status: 200 | 400 | 404 | 502; body: Record<string, unknown> }> {
+): Promise<{ status: 200 | 400 | 404 | 409 | 502; body: Record<string, unknown> }> {
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   if (!row) return { status: 404, body: { error: "Not found" } };
   const mail = parseMail(row);
@@ -971,6 +1052,8 @@ async function sendMailNow(
       return { status: 200, body: { ok: true, skipped: verdict.reason, sent: 0 } };
     }
   }
+
+  if (row.status === "sent") return { status: 409, body: { error: "This issue has already been sent." } };
 
   const p = await provider(c);
   if (!p) return { status: 400, body: { error: "No sending backend is configured." } };
@@ -1013,61 +1096,29 @@ async function sendMailNow(
     // a failed precheck; the backend itself still refuses unverified domains.
   }
 
-  const recipients = await contacts.subscribedRecipients(mail.audience_id);
-  if (recipients.length === 0) {
+  const resuming = row.status === "sending" || row.status === "failed";
+  if (!resuming && (await contacts.subscribedRecipients(mail.audience_id)).length === 0) {
     return { status: 400, body: { error: "No confirmed subscribers on this audience yet." } };
   }
 
-  const design = await resolveDesign(mail);
-  const origin = new URL(c.req.url).origin;
-
-  // Rendered per recipient: the footer's unsubscribe link identifies this
-  // subscriber, so one shared body would let any recipient unsubscribe the
-  // whole list. The contact id is a UUID, so the link is unguessable.
-  const bulk = recipients.map((r) => {
-    const unsubscribeUrl = `${origin}/api/unsubscribe?c=${r.id}`;
-    return {
-      email: r.email,
-      unsubscribeUrl,
-      html: renderEmailHtml(mail, design, s, { unsubscribeUrl }),
-    };
+  const { conversation: _conversation, ...frozen } = mail as Mail & { conversation?: unknown };
+  const begun = await sending.beginSend(id, mail.audience_id, {
+    mail: frozen,
+    design: await resolveDesign(mail),
+    settings: s,
+    from,
+    origin: new URL(c.req.url).origin,
   });
-
-  try {
-    const result = await p.sendBulk({
-      from,
-      subject: mail.title,
-      recipients: bulk,
-      // The audience id is the stable list key the suppression ledger is
-      // scoped by. It must never change for a given list.
-      listKey: mail.audience_id,
-    });
-
-    // The backend refuses anyone who unsubscribed through the one-click header,
-    // which the app may not have seen yet — fold those back so the subscriber
-    // list stops claiming they're still on it.
-    if (result.suppressed.length) {
-      await contacts.applySuppressions(mail.audience_id, result.suppressed);
-    }
-
-    await run(
-      `UPDATE mails SET status=?, scheduled_at=NULL, sent_at=?, updated_at=datetime('now') WHERE id=?`,
-      ["sent", new Date().toISOString(), id],
-    );
-    const updated = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
-    return {
-      status: 200,
-      body: {
-        ok: true,
-        sent: result.sent.length,
-        suppressed: result.suppressed.length,
-        failed: result.failed,
-        mail: parseMail(updated),
-      },
-    };
-  } catch (e: any) {
-    return { status: 502, body: { error: e?.message || "Send failed" } };
+  if (!begun.ok) {
+    return begun.reason === "already-sent"
+      ? { status: 409, body: { error: "This issue has already been sent." } }
+      : { status: 404, body: { error: "Not found" } };
   }
+
+  const result = await drain(c, id, begun.sendId);
+  if (!result) return { status: 400, body: { error: "No sending backend is configured." } };
+  const updated = parseMail(await get<any>("SELECT * FROM mails WHERE id = ?", [id]));
+  return sendResponse(result, updated);
 }
 
 app.post("/api/mails/:id/send", async (c) => {
@@ -1080,6 +1131,11 @@ app.post("/api/mails/:id/send", async (c) => {
     const when = new Date(scheduled_at);
     if (Number.isNaN(when.getTime())) {
       return c.json({ error: "Invalid scheduled_at — expected an ISO-8601 timestamp." }, 400);
+    }
+    const current = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
+    if (!current) return c.json({ error: "Not found" }, 404);
+    if (current.status !== "draft" && current.status !== "scheduled") {
+      return c.json({ error: `This issue is ${current.status}; it can't be scheduled again.` }, 409);
     }
     const s = await getSettings();
     const from = fromOverride?.includes("@") ? fromOverride : fromAddress(s);
@@ -1120,7 +1176,7 @@ app.post("/api/jobs/send-mail", async (c) => {
   });
   if (!ok) return c.json({ error: "unauthorized" }, 401);
 
-  let body: { mail_id?: number; from?: string; scheduled_for?: string };
+  let body: { mail_id?: number; from?: string; scheduled_for?: string; continue_send?: string };
   try {
     body = JSON.parse(raw);
   } catch {
@@ -1129,11 +1185,137 @@ app.post("/api/jobs/send-mail", async (c) => {
   const id = Number(body.mail_id);
   if (!Number.isFinite(id)) return c.json({ error: "bad_request" }, 400);
 
+  // A continuation of a send already under way (see bookContinuation). It only
+  // proceeds if that exact send is still running; anything else is a stale job
+  // doing the right thing by stopping, so it answers 200.
+  if (body.continue_send) {
+    const row = await get<{ status: string; send_id: string | null }>(
+      "SELECT status, send_id FROM mails WHERE id = ?",
+      [id],
+    );
+    if (!row || row.status !== "sending" || row.send_id !== body.continue_send) {
+      return c.json({ ok: true, skipped: "not-sending" });
+    }
+    const result = await drain(c, id, body.continue_send);
+    // Non-2xx so the queue retries with backoff: the send is still running
+    // and nothing else will pick it up.
+    if (!result) return c.json({ error: "No sending backend could be resolved." }, 503);
+    return c.json({ ok: true, ...result });
+  }
+
   // Jobs enqueued before the payload carried scheduled_for are still in flight
   // across this deploy. null keeps their status guards and skips only the
   // timestamp compare they cannot answer — see sendVerdict.
   const r = await sendMailNow(c, id, body.from, body.scheduled_for ?? null);
   return c.json(r.body, r.status);
+});
+
+// ── delivery events (Resend webhook) ─────────────────────────────────
+//
+// Resend reports what happened to each message after it was accepted:
+// delivered, bounced, marked as spam, opened, clicked. Without this the app
+// never learns an address is dead or that someone complained, and keeps
+// mailing both, which is what gets a sending domain blocked. Every message
+// carries its delivery id as a tag, so an event maps straight to its row.
+
+async function webhookSecret(c: any): Promise<{ secret: string | null; source: "env" | "stored" | null }> {
+  const fromEnv = (c.env as { RESEND_WEBHOOK_SECRET?: string }).RESEND_WEBHOOK_SECRET;
+  if (fromEnv) return { secret: fromEnv, source: "env" };
+  const row = await get<{ resend_webhook_secret: string | null }>("SELECT resend_webhook_secret FROM settings WHERE id = 1");
+  return row?.resend_webhook_secret ? { secret: row.resend_webhook_secret, source: "stored" } : { secret: null, source: null };
+}
+
+function webhookEndpoint(c: any): string {
+  return `${new URL(c.req.url).origin}/api/webhooks/resend`;
+}
+
+async function trackingState(c: any) {
+  const { secret, source } = await webhookSecret(c);
+  return { enabled: !!secret, source, endpoint: webhookEndpoint(c), events: [...RESEND_EVENTS] };
+}
+
+app.post("/api/webhooks/resend", async (c) => {
+  // Verified against the raw bytes: the signature covers them exactly.
+  const raw = await c.req.text();
+  const { secret } = await webhookSecret(c);
+  if (!secret) return c.json({ error: "Delivery tracking is not set up on this app." }, 404);
+  const ok = await verifyResendWebhook(
+    raw,
+    { id: c.req.header("svix-id") ?? null, timestamp: c.req.header("svix-timestamp") ?? null, signature: c.req.header("svix-signature") ?? null },
+    secret,
+  );
+  if (!ok) return c.json({ error: "unauthorized" }, 401);
+
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return c.json({ error: "bad_request" }, 400);
+  }
+  const ev = parseResendEvent(body);
+  if (!ev) return c.json({ ok: true, ignored: true });
+  // 200 even when no delivery matches: those are this app's other mail
+  // (confirmations, test sends), and a non-2xx would only make Resend retry.
+  return c.json({ ok: true, outcome: await applyDeliveryEvent(ev) });
+});
+
+/**
+ * "Turn on delivery tracking": register this app's webhook on the operator's
+ * own Resend account with the key the app already sends with, and keep the
+ * signing secret. A sending-only key can't manage webhooks; the answer then
+ * carries what to set up by hand.
+ */
+app.post("/api/tracking", async (c) => {
+  const p = await provider(c);
+  if (!p) return c.json({ error: "Connect Resend first." }, 400);
+  const url = new URL(c.req.url);
+  if (url.protocol !== "https:" || url.hostname === "localhost" || url.hostname === "127.0.0.1") {
+    return c.json({ error: "Resend can only reach this app at its public https address. Open the app there and try again." }, 400);
+  }
+  const manual = { endpoint: webhookEndpoint(c), events: [...RESEND_EVENTS] };
+  if (!p.ensureWebhook) return c.json({ error: "Set the webhook up in your provider's dashboard.", manual }, 400);
+  try {
+    const w = await p.ensureWebhook(manual.endpoint);
+    await run("UPDATE settings SET resend_webhook_id = ?, resend_webhook_secret = ? WHERE id = 1", [w.id, w.secret]);
+    return c.json({ ok: true, tracking: await trackingState(c) });
+  } catch (e) {
+    if (e instanceof WebhookSetupError) return c.json({ error: e.message, manual }, 400);
+    throw e;
+  }
+});
+
+/** The manual path: the operator created the webhook in Resend and pastes its signing secret. */
+app.put("/api/tracking/secret", async (c) => {
+  const { secret } = await c.req.json<{ secret?: string }>().catch(() => ({}) as { secret?: string });
+  if (!secret?.trim().startsWith("whsec_")) return c.json({ error: "Paste the webhook's signing secret (it starts with whsec_)." }, 400);
+  await run("UPDATE settings SET resend_webhook_id = NULL, resend_webhook_secret = ? WHERE id = 1", [secret.trim()]);
+  return c.json({ ok: true, tracking: await trackingState(c) });
+});
+
+/**
+ * What happened to one issue, from its delivery rows. Opens are reported but
+ * not trusted: Apple Mail Privacy Protection opens every message on arrival,
+ * so clicks are the engagement number that means something.
+ */
+app.get("/api/mails/:id/stats", async (c) => {
+  const id = Number(c.req.param("id"));
+  const r = await get<Record<string, number | null>>(
+    `SELECT COUNT(*) AS recipients,
+            SUM(status = 'sent') AS sent,
+            SUM(status = 'failed') AS failed,
+            SUM(status = 'skipped') AS skipped,
+            SUM(status IN ('pending', 'sending')) AS open,
+            COUNT(delivered_at) AS delivered,
+            COUNT(opened_at) AS opened,
+            COUNT(clicked_at) AS clicked,
+            SUM(bounce_permanent = 1) AS hard_bounced,
+            SUM(bounced_at IS NOT NULL AND bounce_permanent = 0) AS soft_bounced,
+            COUNT(complained_at) AS complained
+       FROM deliveries WHERE mail_id = ?`,
+    [id],
+  );
+  const stats = Object.fromEntries(Object.entries(r ?? {}).map(([k, v]) => [k, Number(v ?? 0)]));
+  return c.json({ ...stats, tracking: (await trackingState(c)).enabled });
 });
 
 // ── unsubscribe (public, branded) ────────────────────────────────────

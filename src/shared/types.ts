@@ -63,7 +63,9 @@ export interface Mail {
   template_slug: string | null;
   /** Resend audience this mail sends to. */
   audience_id: string | null;
-  status: "draft" | "scheduled" | "sent";
+  status: "draft" | "scheduled" | "sending" | "sent" | "failed";
+  /** Why the last send stopped, when it did (status "failed"). Resending resumes it. */
+  send_error?: string | null;
   /** Resend broadcast id once created. */
   broadcast_id: string | null;
   scheduled_at: string | null;
@@ -119,6 +121,8 @@ export interface StatusInfo {
   github_connected: boolean;
   /** A CRM in the same workspace is reachable; enables "Import from CRM". */
   crm_connected?: boolean;
+  /** Delivery events (bounces, complaints, clicks) reach this app. */
+  tracking?: { enabled: boolean; source: "env" | "stored" | null; endpoint: string; events: string[] };
   audiences: ResendAudience[];
 }
 

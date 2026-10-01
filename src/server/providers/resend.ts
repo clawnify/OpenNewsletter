@@ -1,8 +1,8 @@
 /**
  * Resend adapter for the EmailProvider interface.
  *
- * Transactional sends only (`POST /emails`), one message per recipient —
- * *not* Broadcasts. Broadcasts require the subscriber list to live in a Resend
+ * Per-recipient messages (`POST /emails/batch`, 100 at a time), *not*
+ * Broadcasts. Broadcasts require the subscriber list to live in a Resend
  * account, which is exactly what moving contacts into D1 undid. The trade is
  * that Resend's hosted unsubscribe page comes with Broadcasts, so on this path
  * the app owns unsubscribe entirely: its own footer link, its own List-
@@ -12,31 +12,32 @@
  * a better fit for a Worker.
  */
 import type {
+  BatchOutcome,
   EmailProvider,
-  SendBulkInput,
-  SendBulkResult,
+  SendBatchInput,
   SendEmailInput,
   SendResult,
 } from "./types";
 
+import { DELIVERY_TAG, RESEND_EVENTS } from "./resend-webhook";
+import { WebhookSetupError } from "./types";
+
 const BASE = "https://api.resend.com";
 
-// Resend's default rate ceiling is modest; keep concurrency conservative so a
-// large send degrades into slowness rather than a wall of 429s.
-const CONCURRENCY = 4;
+/** Gmail/Yahoo/Microsoft require these of bulk senders; nothing upstream adds them on this path. */
+function unsubscribeHeaders(url: string): Record<string, string> {
+  return { "List-Unsubscribe": `<${url}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" };
+}
 
 export class ResendProvider implements EmailProvider {
   readonly name = "resend";
 
   constructor(private apiKey: string) {}
 
-  private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async req<T>(method: string, path: string, body?: unknown, idempotencyKey?: string): Promise<T> {
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
+      headers: this.headers(idempotencyKey),
       body: body ? JSON.stringify(body) : undefined,
     });
     const text = await res.text();
@@ -64,48 +65,93 @@ export class ResendProvider implements EmailProvider {
   }
 
   async sendEmail(input: SendEmailInput): Promise<SendResult> {
-    const r = await this.req<{ id: string }>("POST", "/emails", {
-      from: input.from,
-      to: [input.to],
-      subject: input.subject,
-      html: input.html,
-    });
+    const r = await this.req<{ id: string }>(
+      "POST",
+      "/emails",
+      { from: input.from, to: [input.to], subject: input.subject, html: input.html, headers: input.headers },
+      input.idempotencyKey,
+    );
     return { id: r.id };
   }
 
-  async sendBulk(input: SendBulkInput): Promise<SendBulkResult> {
-    const out: SendBulkResult = { sent: [], suppressed: [], failed: [] };
-
-    let next = 0;
-    const worker = async () => {
-      for (;;) {
-        const i = next++;
-        if (i >= input.recipients.length) return;
-        const r = input.recipients[i];
-        try {
-          await this.req("POST", "/emails", {
+  /**
+   * POST /emails/batch: up to 100 messages, all-or-nothing validation, and an
+   * Idempotency-Key that makes a retry of the same batch a no-op for 24 hours.
+   * Error names from https://resend.com/docs/api-reference/errors.
+   */
+  async sendBatch(input: SendBatchInput): Promise<BatchOutcome> {
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/emails/batch`, {
+        method: "POST",
+        headers: this.headers(input.idempotencyKey),
+        body: JSON.stringify(
+          input.messages.map((m) => ({
             from: input.from,
-            to: [r.email],
+            to: [m.to],
             subject: input.subject,
-            html: r.html,
-            // Gmail/Yahoo/Microsoft require these of bulk senders. On this path
-            // nothing upstream adds them, so the app's own unsubscribe URL —
-            // already embedded in the footer — is reused as the one-click
-            // target. It accepts POST for exactly this reason.
-            headers: {
-              "List-Unsubscribe": `<${r.unsubscribeUrl}>`,
-              "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
-            },
-          });
-          out.sent.push(r.email);
-        } catch (e: any) {
-          out.failed.push({ email: r.email, error: e?.message || "send failed" });
-        }
+            html: m.html,
+            headers: unsubscribeHeaders(m.unsubscribeUrl),
+            // Echoed back on every webhook event for this message.
+            ...(m.deliveryId ? { tags: [{ name: DELIVERY_TAG, value: m.deliveryId }] } : {}),
+          })),
+        ),
+      });
+    } catch (e: any) {
+      return { kind: "unknown", message: e?.message || "network error" };
+    }
+    const json = (await res.json().catch(() => undefined)) as
+      | { data?: { id: string }[]; name?: string; message?: string }
+      | undefined;
+    const message = `Resend ${res.status}: ${json?.message || res.statusText}`;
+
+    if (res.ok) return { kind: "sent", ids: (json?.data || []).map((d) => d.id) };
+    if (res.status === 429) {
+      // Quota errors share the status with throttling, but waiting a second fixes only throttling.
+      if (json?.name !== "rate_limit_exceeded") return { kind: "fatal", message };
+      const secs = Number(res.headers.get("retry-after") || res.headers.get("ratelimit-reset") || "1");
+      return { kind: "rate_limited", retryAfterMs: Math.max(1, Number.isFinite(secs) ? secs : 1) * 1000 };
+    }
+    if (res.status === 409) {
+      return json?.name === "concurrent_idempotent_requests" ? { kind: "in_progress" } : { kind: "unknown", message };
+    }
+    // 401/403: the key or the sending domain, the same for every message.
+    if (res.status === 401 || res.status === 403) return { kind: "fatal", message };
+    if (res.status === 400 || res.status === 422) return { kind: "invalid", message };
+    return { kind: "unknown", message };
+  }
+
+  /**
+   * Reuse the webhook already pointing here, if any (a reinstall, a second
+   * click), otherwise create one. Needs a full-access key: a sending-only key
+   * gets 401/403 and the operator sets the webhook up by hand instead.
+   */
+  async ensureWebhook(endpoint: string): Promise<{ id: string; secret: string }> {
+    try {
+      const list = await this.req<{ data?: { id: string; endpoint: string }[] }>("GET", "/webhooks");
+      const existing = (list.data || []).find((w) => w.endpoint === endpoint);
+      if (existing) {
+        const w = await this.req<{ id: string; signing_secret: string }>("GET", `/webhooks/${existing.id}`);
+        return { id: w.id, secret: w.signing_secret };
       }
+      const created = await this.req<{ id: string; signing_secret: string }>("POST", "/webhooks", {
+        endpoint,
+        events: [...RESEND_EVENTS],
+      });
+      return { id: created.id, secret: created.signing_secret };
+    } catch (e: any) {
+      if (/→ (401|403):/.test(e?.message || "")) {
+        throw new WebhookSetupError("This Resend key can send but can't manage webhooks.");
+      }
+      throw e;
+    }
+  }
+
+  private headers(idempotencyKey?: string): Record<string, string> {
+    return {
+      Authorization: `Bearer ${this.apiKey}`,
+      "Content-Type": "application/json",
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     };
-    await Promise.all(
-      Array.from({ length: Math.min(CONCURRENCY, input.recipients.length) }, worker),
-    );
-    return out;
   }
 }

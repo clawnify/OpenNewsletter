@@ -72,6 +72,8 @@ export function SettingsView() {
         />
       </section>
 
+      <TrackingSection />
+
       <section className="mt-6 space-y-4 rounded-md bg-card p-5 shadow-edge">
         <h2 className="text-sm font-semibold">Sender</h2>
         {field("Publication name", "publication_name", "The Editorial Review")}
@@ -178,5 +180,77 @@ function Status({ ok, label, detail }: { ok: boolean; label: string; detail: str
       <span className="font-medium">{label}</span>
       <span className="text-muted-foreground">— {detail}</span>
     </div>
+  );
+}
+
+/**
+ * Delivery tracking: Resend tells the app when a message bounces or is marked
+ * as spam. "Turn on" registers the webhook with the key the app already sends
+ * with; a sending-only key can't, so the fallback shows what to set up by hand.
+ */
+function TrackingSection() {
+  const { status, refreshStatus, setError } = useStore();
+  const [busy, setBusy] = useState(false);
+  const [manual, setManual] = useState<{ endpoint: string; events: string[]; reason: string } | null>(null);
+  const [secret, setSecret] = useState("");
+  const tracking = status?.tracking;
+
+  const turnOn = async () => {
+    setBusy(true);
+    try {
+      await api("POST", "/api/tracking");
+      await refreshStatus();
+    } catch (e) {
+      // Only a key that can't manage webhooks gets the by-hand steps; anything
+      // else (no public address yet, Resend down) is an error to read, not a
+      // setup to follow.
+      const data = (e as Error & { data?: { error?: string; manual?: { endpoint: string; events: string[] } } }).data;
+      if (data?.manual) setManual({ ...data.manual, reason: data.error ?? "" });
+      else setError(data?.error ?? (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveSecret = async () => {
+    try {
+      await api("PUT", "/api/tracking/secret", { secret });
+      setManual(null);
+      setSecret("");
+      await refreshStatus();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  return (
+    <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
+      <div className="flex items-center gap-3">
+        <h2 className="text-sm font-semibold">Delivery tracking</h2>
+        {tracking?.enabled ? (
+          <span className="flex items-center gap-1 text-xs text-success"><CheckCircle2 size={14} /> On</span>
+        ) : status?.resend_connected ? (
+          <Button size="sm" variant="outline" className="ml-auto" disabled={busy} onClick={turnOn}>
+            {busy ? "Turning on…" : "Turn on"}
+          </Button>
+        ) : null}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {tracking?.enabled
+          ? "Addresses that hard-bounce or mark an issue as spam stop getting your newsletter, on every list. Each sent issue shows deliveries, clicks and bounces."
+          : "Resend can tell this app when a message bounces or is marked as spam, so dead and unhappy addresses stop being mailed. It also fills in deliveries and clicks for each issue."}
+      </p>
+      {manual ? (
+        <div className="space-y-2 rounded-sm bg-muted p-3 text-xs">
+          <p>{manual.reason} Add the webhook in Resend (Webhooks → Add endpoint), then paste its signing secret here.</p>
+          <p><span className="text-muted-foreground">Endpoint </span><code className="break-all">{manual.endpoint}</code></p>
+          <p><span className="text-muted-foreground">Events </span><code>{manual.events.join(", ")}</code></p>
+          <div className="flex gap-2">
+            <Input value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="whsec_…" aria-label="Signing secret" />
+            <Button size="sm" disabled={!secret.trim()} onClick={saveSecret}>Save</Button>
+          </div>
+        </div>
+      ) : null}
+    </section>
   );
 }

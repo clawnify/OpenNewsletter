@@ -14,6 +14,8 @@ import { SendDialog } from "./send-dialog";
 import { Chat, type ChatContext, type ApplyTool } from "./chat";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { statusTone } from "../lib/status";
+import { DeliveryStats } from "./delivery-stats";
 
 export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void }) {
   const store = useStore();
@@ -249,7 +251,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
           <Badge variant="secondary">Mail</Badge>
           <span className="max-w-[260px] truncate font-medium">{mail.title || "Untitled"}</span>
           <span className="text-xs text-muted-foreground">{saved ? "Saved" : "Saving…"}</span>
-          {sent ? <Badge className="bg-success-tint capitalize text-success">{mail.status}</Badge> : null}
+          {mail.status === "scheduled" ? <Badge className={`capitalize ${statusTone(mail.status)}`}>{mail.status}</Badge> : sent ? <DeliveryStats mail={mail} /> : null}
         </div>
         <div className="ml-auto flex items-center gap-2">
           <div className="flex items-center">

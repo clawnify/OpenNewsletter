@@ -4,6 +4,7 @@ import { useStore } from "../store";
 import type { Mail } from "../../shared/types";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { statusTone } from "../lib/status";
 
 export function MailsView({ openMail }: { openMail: (id: number) => void }) {
   const { mails, templates, createMail, deleteMail, setError } = useStore();
@@ -77,12 +78,7 @@ export function MailsView({ openMail }: { openMail: (id: number) => void }) {
 }
 
 function MailRow({ mail, onOpen, onDelete }: { mail: Mail; onOpen: () => void; onDelete: () => void }) {
-  const badge =
-    mail.status === "sent"
-      ? "bg-success-tint text-success"
-      : mail.status === "scheduled"
-        ? "bg-info-tint text-info"
-        : "bg-muted text-muted-foreground";
+  const badge = statusTone(mail.status);
   return (
     <li className="flex items-center gap-3 px-4 py-3 hover:bg-muted">
       <button className="min-w-0 flex-1 text-left" onClick={onOpen}>

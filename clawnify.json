@@ -48,6 +48,12 @@
         "methods": [
           "POST"
         ]
+      },
+      {
+        "path": "/api/webhooks/resend",
+        "methods": [
+          "POST"
+        ]
       }
     ]
   },
@@ -59,6 +65,7 @@
     ],
     "optional": [
       "RESEND_API_KEY",
+      "RESEND_WEBHOOK_SECRET",
       "NEWSLETTER_MODEL",
       "CRM_APP_ID"
     ]
