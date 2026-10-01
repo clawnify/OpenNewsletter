@@ -111,3 +111,57 @@ describe("html blocks", () => {
     expect(html).toMatch(/<td>open<\/td><\/tr><\/table><\/td><\/tr><tr><td[^>]*><div class="nl-text"[^>]*><p[^>]*>after/);
   });
 });
+
+// Every block type with no styling set. A send retries under idempotency keys
+// and must render exactly as it first did, so if this snapshot changes for an
+// existing block, bump the send snapshot's `renderer` (src/server/sending.ts).
+describe("existing blocks render unchanged", () => {
+  it("matches the snapshot", () => {
+    const all = [
+      { id: "a", type: "heading", level: 1, text: "Title" }, { id: "b", type: "heading", level: 2, text: "H2", align: "center" },
+      { id: "c", type: "text", md: "Body **b** [l](https://x.y)", color: "secondary", scale: 0.82, uppercase: true },
+      { id: "d", type: "image", src: "https://x.y/i.png", alt: "alt", caption: "cap", href: "https://x.y" },
+      { id: "f", type: "button", text: "Go", href: "https://x.y", align: "center" },
+      { id: "g", type: "list", ordered: true, items: ["one", "two"] }, { id: "h", type: "quote", text: "q", cite: "c" },
+      { id: "i", type: "divider" }, { id: "j", type: "spacer", size: 24 },
+      { id: "k", type: "columns", items: [{ image: "https://x.y/a.png", heading: "A", text: "a" }, { image: "", heading: "B", text: "b" }] },
+      { id: "l", type: "html", html: "<table><tr><td>x {{first_name}}</td></tr></table>" },
+    ] as Block[];
+    expect(renderEmailHtml(mail(all, "pre"), DEFAULT_DESIGN, settings, { merge: values("Ada") })).toMatchSnapshot();
+  });
+});
+
+describe("block styling", () => {
+  const dark = { ...DEFAULT_DESIGN, colors: { ...DEFAULT_DESIGN.colors, foreground: "#111111" } };
+
+  it("puts a block in a coloured section and keeps its text readable there", () => {
+    const html = renderBlock({ id: "t", type: "text", md: "Hi", box: { background: "#111827" } } as Block, dark);
+    expect(html).toMatch(/^<table[^>]*><tr><td bgcolor="#111827" style="background:#111827;padding:24px;/);
+    expect(html).toContain("color:#FFFFFF");
+  });
+
+  it("keeps padding 0 on a coloured section, and renders bare with no colour and no padding", () => {
+    expect(renderBlock({ id: "t", type: "divider", box: { background: "primary", padding: 0 } } as Block, dark)).toContain(`padding:0px;`);
+    const bare = renderBlock({ id: "t", type: "divider" } as Block, dark);
+    expect(renderBlock({ id: "t", type: "divider", box: { padding: 0 } } as Block, dark)).toBe(bare);
+  });
+
+  it("ignores a background that is neither a design colour nor a hex value", () => {
+    expect(renderBlock({ id: "t", type: "divider", box: { background: "red;x:expression(1)" } } as Block, dark)).not.toContain("expression");
+  });
+
+  it("sizes and aligns an image, with a pixel width for Outlook", () => {
+    const html = renderBlock({ id: "i", type: "image", src: "https://x.y/i.png", alt: "", caption: "", href: "", width: 50, align: "left" } as Block, DEFAULT_DESIGN);
+    expect(html).toContain(`width="${DEFAULT_DESIGN.layout.contentWidth / 2}" style="width:50%;`);
+    expect(html).toContain("text-align:left");
+  });
+
+  it("draws outline and full-width buttons", () => {
+    const outline = renderBlock({ id: "b", type: "button", text: "Go", href: "https://x.y", align: "left", variant: "outline" } as Block, DEFAULT_DESIGN);
+    expect(outline).toContain(`border:2px solid ${DEFAULT_DESIGN.colors.primary}`);
+    expect(outline).not.toContain("bgcolor");
+    const full = renderBlock({ id: "b", type: "button", text: "Go", href: "https://x.y", align: "left", fullWidth: true } as Block, DEFAULT_DESIGN);
+    expect(full).toContain(`width="100%"`);
+    expect(full).toContain("display:block");
+  });
+});

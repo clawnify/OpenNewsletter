@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   ChevronUp, ChevronDown, ChevronsUpDown, Trash2, Sparkles, Plus, Check,
-  Image as ImageIcon, Type, Heading, List as ListIcon, Quote, Minus, MousePointerClick, Columns as ColumnsIcon, Upload, Code,
+  Image as ImageIcon, Type, Heading, List as ListIcon, Quote, Minus, MousePointerClick, Columns as ColumnsIcon, Upload, Code, Paintbrush,
 } from "lucide-react";
-import { renderBlock, renderHtmlBlock } from "../../shared/email-blocks";
+import { BOX_COLORS, blockBox, renderBlock, renderHtmlBlock } from "../../shared/email-blocks";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
 import { markdownToHtml } from "../../shared/markdown";
 import { designVars, fontStack, type DesignTokens } from "../../shared/design";
@@ -75,7 +75,7 @@ export function Preview({ mail, design, settings, edit }: { mail: Mail; design: 
 
         {(mail.blocks || []).map((b, i) => (
           <BlockWrap key={b.id} edit={edit} block={b} index={i} count={mail.blocks.length} design={design}>
-            <BlockView block={b} design={design} edit={edit} />
+            <Boxed block={b} design={design}>{(d) => <BlockView block={b} design={d} edit={edit} />}</Boxed>
           </BlockWrap>
         ))}
         {edit && !edit.selectMode ? <AddBar onAdd={(t) => edit.onAdd(mail.blocks.length, t)} /> : null}
@@ -123,6 +123,7 @@ function BlockWrap({ edit, block, index, count, design, children }: { edit?: Edi
     >
       <div className={`absolute -top-3 right-2 z-10 flex items-center gap-0.5 rounded-lg border bg-background p-0.5 shadow-sm ${selected ? "" : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100"}`}>
         {stylable ? <PresetMenu block={block} onPick={(p) => edit.onReplace(block.id, applyPreset(block, p))} /> : null}
+        <StyleMenu block={block} design={design} onChange={(p) => edit.onBlock(block.id, p)} />
         <Tool icon={Sparkles} title="Rewrite with AI" onClick={() => edit.onBlockAI(block)} />
         <Tool icon={Code} title={block.type === "html" ? "Edit HTML" : "Edit as HTML (stops following the design settings)"} onClick={openHtml} />
         <Tool icon={ChevronUp} title="Move up" disabled={index === 0} onClick={() => edit.onMove(index, -1)} />
@@ -219,6 +220,106 @@ function HtmlEditor({ html, design, onSave, onClose }: { html: string; design: D
   );
 }
 
+/** The block's coloured section on the canvas, matching the email (shared blockBox). */
+function Boxed({ block, design, children }: { block: Block; design: DesignTokens; children: (d: DesignTokens) => React.ReactNode }) {
+  const box = blockBox(block, design);
+  if (!box) return <>{children(design)}</>;
+  return <div style={{ background: box.background || undefined, padding: box.padding, borderRadius: box.radius }}>{children(box.design)}</div>;
+}
+
+const PADDINGS = [0, 16, 24, 32, 48];
+const BOX_LABELS: Record<(typeof BOX_COLORS)[number], string> = { page: "Page", primary: "Accent", secondary: "Muted", foreground: "Dark", border: "Light" };
+
+/** Section colour and padding for any block, plus the controls only images and buttons have. */
+function StyleMenu({ block, design, onChange }: { block: Block; design: DesignTokens; onChange: (patch: Record<string, unknown>) => void }) {
+  const box = block.box ?? {};
+  const setBox = (next: typeof box) => {
+    const clean = { ...next };
+    if (!clean.background) delete clean.background;
+    if (clean.padding === undefined) delete clean.padding;
+    // Padding 0 is kept on a coloured section (it would otherwise default to 24); alone it means no box.
+    onChange({ box: clean.background || clean.padding ? clean : undefined });
+  };
+  const chip = (active: boolean) => `h-7 rounded px-2 text-xs ${active ? "bg-primary text-primary-foreground" : "bg-muted hover:bg-muted/70"}`;
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button title="Style" onClick={(e) => e.stopPropagation()} className="grid h-6 w-6 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground">
+          <Paintbrush size={13} />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-72 space-y-3 p-3" align="end" onClick={(e) => e.stopPropagation()}>
+        <div>
+          <div className="mb-1.5 text-xs font-medium text-muted-foreground">Background</div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button className={chip(!box.background)} onClick={() => setBox({ ...box, background: undefined })}>None</button>
+            {BOX_COLORS.map((c) => (
+              <button
+                key={c}
+                title={BOX_LABELS[c]}
+                aria-label={BOX_LABELS[c]}
+                onClick={() => setBox({ ...box, background: c })}
+                className={`h-7 w-7 rounded-full shadow-edge ${box.background === c ? "ring-2 ring-primary ring-offset-1" : ""}`}
+                style={{ background: design.colors[c] }}
+              />
+            ))}
+            <label className="relative h-7 w-7 cursor-pointer overflow-hidden rounded-full shadow-edge" title="Custom colour">
+              <span className="absolute inset-0" style={{ background: box.background?.startsWith("#") ? box.background : "conic-gradient(red, yellow, lime, aqua, blue, magenta, red)" }} />
+              <input type="color" className="absolute inset-0 opacity-0" aria-label="Custom colour" value={box.background?.startsWith("#") ? box.background : "#F4F4F5"} onChange={(e) => setBox({ ...box, background: e.target.value.toUpperCase() })} />
+            </label>
+          </div>
+        </div>
+        <div>
+          <div className="mb-1.5 text-xs font-medium text-muted-foreground">Padding</div>
+          <div className="flex gap-1">
+            {PADDINGS.map((p) => (
+              <button key={p} className={chip((box.padding ?? (box.background ? 24 : 0)) === p)} onClick={() => setBox({ ...box, padding: p })}>{p}</button>
+            ))}
+          </div>
+        </div>
+        {block.type === "image" ? (
+          <>
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-muted-foreground">Width</div>
+              <div className="flex gap-1">
+                {[25, 50, 75, 100].map((w) => (
+                  <button key={w} className={chip((block.width ?? 100) === w)} onClick={() => onChange({ width: w === 100 && !block.align ? undefined : w })}>{w}%</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-muted-foreground">Align</div>
+              <div className="flex gap-1">
+                {(["left", "center", "right"] as const).map((a) => (
+                  <button key={a} className={`${chip((block.align ?? "center") === a)} capitalize`} onClick={() => onChange({ align: a === "center" && !block.width ? undefined : a })}>{a}</button>
+                ))}
+              </div>
+            </div>
+          </>
+        ) : null}
+        {block.type === "button" ? (
+          <>
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-muted-foreground">Style</div>
+              <div className="flex gap-1">
+                <button className={chip(block.variant !== "outline")} onClick={() => onChange({ variant: undefined })}>Solid</button>
+                <button className={chip(block.variant === "outline")} onClick={() => onChange({ variant: "outline" })}>Outline</button>
+              </div>
+            </div>
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-muted-foreground">Width</div>
+              <div className="flex gap-1">
+                <button className={chip(!block.fullWidth)} onClick={() => onChange({ fullWidth: undefined })}>Fit text</button>
+                <button className={chip(!!block.fullWidth)} onClick={() => onChange({ fullWidth: true })}>Full width</button>
+              </div>
+            </div>
+          </>
+        ) : null}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function PresetMenu({ block, onPick }: { block: Block; onPick: (p: TextPreset) => void }) {
   const cur = currentPreset(block);
   const label = TEXT_PRESETS.find((p) => p.id === cur)?.label || "Style";
@@ -268,11 +369,23 @@ function BlockView({ block, design, edit }: { block: Block; design: DesignTokens
         <div style={textStyle(block, design)} dangerouslySetInnerHTML={{ __html: markdownToHtml(block.md) }} />
       );
     case "image":
-      return <ImageField edit={edit} src={block.src} onCommit={(src) => set({ src })} radius={design.layout.imageRadius} caption={block.caption} onCaption={(c) => set({ caption: c })} label="image" />;
+      return <ImageField edit={edit} src={block.src} onCommit={(src) => set({ src })} radius={design.layout.imageRadius} caption={block.caption} onCaption={(c) => set({ caption: c })} label="image" width={block.width} align={block.align} />;
     case "button":
       return (
         <div style={{ textAlign: block.align }}>
-          <span style={{ display: "inline-block", background: design.colors.primary, color: design.options.autoButtonText === false ? design.colors.onPrimary : readableTextOn(design.colors.primary), padding: "12px 22px", borderRadius: design.layout.buttonRadius, fontFamily: fontStack(design.typography.bodyFont), fontWeight: 600 }}>
+          <span
+            style={{
+              display: block.fullWidth ? "block" : "inline-block",
+              textAlign: "center",
+              background: block.variant === "outline" ? "transparent" : design.colors.primary,
+              border: block.variant === "outline" ? `2px solid ${design.colors.primary}` : undefined,
+              color: block.variant === "outline" ? design.colors.primary : design.options.autoButtonText === false ? design.colors.onPrimary : readableTextOn(design.colors.primary),
+              padding: block.variant === "outline" ? "10px 20px" : "12px 22px",
+              borderRadius: design.layout.buttonRadius,
+              fontFamily: fontStack(design.typography.bodyFont),
+              fontWeight: 600,
+            }}
+          >
             {editable ? <Editable tag="span" value={block.text} placeholder="Button" onCommit={(v) => set({ text: v })} /> : block.text}
           </span>
           {editable ? <input className="ml-2 w-48 rounded border bg-background px-2 py-1 align-middle text-xs text-muted-foreground" value={block.href} placeholder="https://link" onChange={(e) => set({ href: e.target.value })} /> : null}
@@ -339,14 +452,20 @@ function BlockList({ ordered, items, edit, design, onChange }: { ordered: boolea
   );
 }
 
-function ImageField({ edit, src, onCommit, radius, label, caption, onCaption }: { edit?: EditHandlers; src: string; onCommit: (src: string) => void; radius: number; label: string; caption?: string; onCaption?: (c: string) => void }) {
+function ImageField({ edit, src, onCommit, radius, label, caption, onCaption, width, align }: { edit?: EditHandlers; src: string; onCommit: (src: string) => void; radius: number; label: string; caption?: string; onCaption?: (c: string) => void; width?: number; align?: "left" | "center" | "right" }) {
   const [url, setUrl] = useState(src);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  // Same sizing as the email: a width or alignment turns the full-bleed image into a sized, aligned one.
+  const sized = width !== undefined || align !== undefined;
+  const imgStyle: CSSProperties = sized
+    ? { width: `${width ?? 100}%`, maxWidth: "100%", borderRadius: radius, display: "inline-block" }
+    : { width: "100%", borderRadius: radius, display: "block" };
+  const frame: CSSProperties = sized ? { textAlign: align ?? "center", lineHeight: 0 } : {};
 
   if (!edit || edit.selectMode) {
     if (!src) return null;
-    return <img src={src} alt="" style={{ width: "100%", borderRadius: radius, display: "block" }} />;
+    return <div style={frame}><img src={src} alt="" style={imgStyle} /></div>;
   }
 
   const upload = async (file: File) => {
@@ -370,8 +489,8 @@ function ImageField({ edit, src, onCommit, radius, label, caption, onCaption }: 
       <Popover>
         <PopoverTrigger asChild>
           {src ? (
-            <button className="block w-full" title={`Change ${label}`} onClick={() => setUrl(src)}>
-              <img src={src} alt="" style={{ width: "100%", borderRadius: radius, display: "block" }} />
+            <button className="block w-full" style={frame} title={`Change ${label}`} onClick={() => setUrl(src)}>
+              <img src={src} alt="" style={imgStyle} />
             </button>
           ) : (
             <button className="flex w-full items-center justify-center gap-2 border border-dashed py-8 text-sm text-muted-foreground hover:border-primary" style={{ borderRadius: radius }}>

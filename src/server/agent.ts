@@ -30,6 +30,8 @@ Starting fresh / restructuring:
 - Markdown for set_content / add_block: "# Title", "## Section", paragraphs separated by blank lines, "- item" lists, "> quote", "![alt](url)" images, "[label](url)" alone on a line for a button, "---" for a divider.
 - If the user attaches an image and wants it in the newsletter, call add_image with a short alt description — it uploads the attachment to storage and inserts an image block.
 
+Styling blocks: style_block gives any block a coloured section (a band, a callout, a dark hero) with padding; text inside switches to a readable colour on its own. It also sizes and aligns images and sets a button to outline or full width. Reach for it before HTML.
+
 HTML blocks (for designs the other blocks can't express: a hero with a background, a coloured band, a multi-column layout with buttons, a pasted snippet):
 - add_html_block adds one; edit_block on an html block replaces its whole HTML (the outline shows it in full).
 - Write email HTML: tables for layout, inline styles, absolute image URLs, at most 600px wide. No scripts, forms or external CSS; mail clients drop them. Merge tags work inside.
@@ -84,6 +86,19 @@ export const NEWSLETTER_TOOLS = {
     inputSchema: z.object({
       key: z.string(),
       value: z.union([z.string(), z.number(), z.boolean()]),
+    }),
+  }),
+  style_block: tool({
+    description:
+      "Style one block: a coloured section behind it with padding, an image's width and alignment, or a button's look. Pass only what changes.",
+    inputSchema: z.object({
+      block_id: z.string(),
+      background: z.string().optional().describe('A design colour (page, primary, secondary, foreground, border), a hex like "#F4F4F5", or "none" to remove the section.'),
+      padding: z.number().optional().describe("Inner padding in px (0-64)."),
+      image_width: z.number().optional().describe("Image width as a percent of the content (10-100)."),
+      image_align: z.enum(["left", "center", "right"]).optional(),
+      button_variant: z.enum(["solid", "outline"]).optional(),
+      button_full_width: z.boolean().optional(),
     }),
   }),
   add_html_block: tool({

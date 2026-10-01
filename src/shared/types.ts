@@ -7,6 +7,19 @@ import type { DesignTokens } from "./design";
 
 export interface BlockBase {
   id: string;
+  /** A coloured section around the block. Absent, the block renders bare, exactly as before boxes existed. */
+  box?: BlockBox;
+}
+
+/**
+ * `background` is a design colour name (BOX_COLORS) or a hex value. Text inside
+ * keeps its colours where they read on it and switches to near-black or
+ * near-white where they don't.
+ */
+export interface BlockBox {
+  background?: string;
+  /** Inner padding in px. */
+  padding?: number;
 }
 /** Which design-guideline color a text block uses (resolved from tokens). */
 export type TextColor = "default" | "primary" | "secondary";
@@ -25,8 +38,18 @@ export type Block =
       italic?: boolean;
       align?: "left" | "center";
     })
-  | (BlockBase & { type: "image"; src: string; alt: string; caption: string; href: string })
-  | (BlockBase & { type: "button"; text: string; href: string; align: "left" | "center" | "right" })
+  | (BlockBase & {
+      type: "image"; src: string; alt: string; caption: string; href: string;
+      /** Percent of the content width (absent = full width). */
+      width?: number;
+      align?: "left" | "center" | "right";
+    })
+  | (BlockBase & {
+      type: "button"; text: string; href: string; align: "left" | "center" | "right";
+      /** Absent = solid. */
+      variant?: "solid" | "outline";
+      fullWidth?: boolean;
+    })
   | (BlockBase & { type: "list"; ordered: boolean; items: string[] })
   | (BlockBase & { type: "quote"; text: string; cite: string })
   | (BlockBase & { type: "divider" })
