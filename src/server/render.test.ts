@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderEmailHtml } from "./render";
 import { DEFAULT_DESIGN } from "../shared/design";
+import { renderBlock } from "../shared/email-blocks";
 import type { Block, Mail, Settings } from "../shared/types";
 
 const settings: Settings = { publication_name: "Pub", logo: "", from_name: "", from_email: "a@b.co", senders: [], default_audience_id: null, footer_text: "" } as Settings;
@@ -81,5 +82,32 @@ describe("columns", () => {
     ] } as Block]), DEFAULT_DESIGN, settings);
     const pads = [...html.matchAll(/class="nl-col"[^>]*padding:([^;]+);/g)].map((m) => m[1]);
     expect(pads).toEqual(["0 0 0 0px", "0 0 0 16px", "0 0 0 16px"]);
+  });
+});
+
+describe("html blocks", () => {
+  it("send the same email as the block they were converted from", () => {
+    const blocks: Block[] = [
+      text("Some **bold** and a [link](https://example.com)."),
+      { id: "b", type: "button", text: "Go", href: "https://example.com", align: "center" },
+      { id: "c", type: "columns", items: [{ image: "https://example.com/a.png", heading: "A", text: "a" }, { image: "", heading: "B", text: "b" }] } as Block,
+    ];
+    const converted = blocks.map((b): Block => ({ id: b.id, type: "html", html: renderBlock(b, DEFAULT_DESIGN) }));
+    expect(renderEmailHtml(mail(converted), DEFAULT_DESIGN, settings)).toBe(renderEmailHtml(mail(blocks), DEFAULT_DESIGN, settings));
+  });
+
+  it("fill merge tags as escaped text, but never inside a URL attribute", () => {
+    const html = renderEmailHtml(
+      mail([{ id: "h", type: "html", html: `<td>Hi {{first_name|there}}</td><a href="{{first_name}}">x</a><img src='{{ email }}'>` } as Block]),
+      DEFAULT_DESIGN, settings, { merge: { first_name: `<b>"Ann"</b>`, last_name: "", email: "javascript:alert(1)" } },
+    );
+    expect(html).toContain("Hi &lt;b&gt;&quot;Ann&quot;&lt;/b&gt;");
+    expect(html).toContain(`href="{{first_name}}"`);
+    expect(html).toContain(`src='{{ email }}'`);
+  });
+
+  it("stay inside their own row when the snippet is broken", () => {
+    const html = renderEmailHtml(mail([{ id: "h", type: "html", html: "<table><tr><td>open" } as Block, text("after")]), DEFAULT_DESIGN, settings);
+    expect(html).toMatch(/<td>open<\/td><\/tr><\/table><\/td><\/tr><tr><td[^>]*><div class="nl-text"[^>]*><p[^>]*>after/);
   });
 });

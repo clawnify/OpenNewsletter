@@ -57,7 +57,7 @@ export function fillTags(src: string, values: MergeValues | undefined, render: (
   const marked = src.replace(TAG, (m, field: string, fallback: string | undefined, at: number) => {
     // A tag that opens a link or image target would let the reader choose the
     // whole URL, scheme included. It stays as written.
-    if (/\]\(\s*$/.test(src.slice(Math.max(0, at - 8), at))) return m;
+    if (/(?:\]\(|\b(?:href|src)\s*=\s*["']?)\s*$/i.test(src.slice(Math.max(0, at - 24), at))) return m;
     filled.push(escapeHtml(valueFor(values, field, fallback)));
     return `\u0001${filled.length - 1}\u0001`;
   });
@@ -92,6 +92,7 @@ export function fillBlocksText(blocks: Block[], values: MergeValues): Block[] {
       case "list": return { ...b, items: b.items.map(f) };
       case "quote": return { ...b, text: f(b.text), cite: f(b.cite) };
       case "columns": return { ...b, items: b.items.map((c) => ({ ...c, heading: f(c.heading), text: f(c.text) })) };
+      case "html": return { ...b, html: f(b.html) };
       default: return b;
     }
   });

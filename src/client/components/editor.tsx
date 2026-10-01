@@ -192,6 +192,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
             case "quote": return { ...b, text };
             case "list": return { ...b, items: text.split("\n").map((s) => s.replace(/^\s*[-*+]\s+|^\s*\d+\.\s+/, "").trim()).filter(Boolean) };
             case "image": return { ...b, alt: text };
+            case "html": return { ...b, html: text };
             default: return b; // divider / spacer / columns — nothing textual to set
           }
         });
@@ -212,6 +213,12 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
         if (!next) return `I can't set "${input.key}".`;
         commit(device === "mobile" ? { design_mobile: diffTokens(base, next) } : { design: next });
         return `Set ${input.key}.`;
+      }
+      case "add_html_block": {
+        const block: Block = { id: blockId(), type: "html", html: String(input.html || "") };
+        const curBlocks = cur.blocks || [];
+        commit({ blocks: input.position === "start" ? [block, ...curBlocks] : [...curBlocks, block] });
+        return "Added the HTML block.";
       }
       case "add_image": {
         // src is resolved by the chat (it uploads the attachment before calling).
@@ -395,6 +402,8 @@ function blockPreview(b: Block): string {
     case "divider": return "divider";
     case "spacer": return "spacer";
     case "columns": return `${b.items.length} columns`;
+    // In full (to a cap), so the assistant can rewrite it with edit_block.
+    case "html": return b.html.length > 4000 ? b.html.slice(0, 4000) + "\n…(truncated)" : b.html;
   }
 }
 
