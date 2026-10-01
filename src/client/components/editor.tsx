@@ -148,7 +148,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
     const cur = live.current.mail;
     if (!cur) return {};
     const outline =
-      (cur.blocks || []).map((b) => `[${b.id}] ${b.type}: ${blockPreview(b)}`).join("\n") || "(empty)";
+      (cur.blocks || []).map((b) => `[${b.id}] ${b.type}${b.box?.background ? ` (section ${b.box.background})` : ""}: ${blockPreview(b)}`).join("\n") || "(empty)";
     const focus = [...aiSelected];
     const focusNote = focus.length ? `\n\nThe user has these block ids in focus — scope edits to them: ${focus.join(", ")}` : "";
     const d = `primary ${design.colors.primary}, background ${design.colors.background}, heading font ${design.typography.headingFont}, button radius ${design.layout.buttonRadius}px`;
@@ -213,6 +213,31 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
         if (!next) return `I can't set "${input.key}".`;
         commit(device === "mobile" ? { design_mobile: diffTokens(base, next) } : { design: next });
         return `Set ${input.key}.`;
+      }
+      case "style_block": {
+        let found = false;
+        const blocks = (cur.blocks || []).map((b): Block => {
+          if (b.id !== input.block_id) return b;
+          found = true;
+          const next = { ...b } as Block & Record<string, unknown>;
+          if (input.background !== undefined || input.padding !== undefined) {
+            const bg = input.background === "none" ? undefined : input.background !== undefined ? String(input.background) : b.box?.background;
+            const pad = input.padding !== undefined ? Number(input.padding) : b.box?.padding;
+            next.box = bg || pad ? { ...(bg ? { background: bg } : {}), ...(pad !== undefined ? { padding: pad } : {}) } : undefined;
+          }
+          if (b.type === "image") {
+            if (input.image_width !== undefined) next.width = Number(input.image_width);
+            if (input.image_align !== undefined) next.align = input.image_align;
+          }
+          if (b.type === "button") {
+            if (input.button_variant !== undefined) next.variant = input.button_variant === "outline" ? "outline" : undefined;
+            if (input.button_full_width !== undefined) next.fullWidth = input.button_full_width ? true : undefined;
+          }
+          return next;
+        });
+        if (!found) return `No block ${input.block_id}.`;
+        commit({ blocks });
+        return "Styled the block.";
       }
       case "add_html_block": {
         const block: Block = { id: blockId(), type: "html", html: String(input.html || "") };
