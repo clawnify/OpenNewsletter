@@ -42,6 +42,13 @@ account. The provider is just delivery, and it's swappable.
   always inserted as plain text, so a signup can't slip a link into your issue.
 - **Preview text** — set the line inboxes show after the subject, instead of
   letting them borrow the first words of the body.
+- **HTML when blocks aren't enough** — add an HTML block for a design the
+  blocks can't express (a hero with a background, a coloured band, buttons in
+  columns), or choose **Edit as HTML** on any block to start from exactly the
+  email markup it sends today. You edit it with a live preview; the assistant
+  can write HTML blocks too. Merge tags work inside them. Scripts, forms and
+  embeds are removed, and a snippet left unclosed can't spill into the next
+  block.
 - **Delivery tracking** — one click in Settings registers a Resend webhook with
   your own key. Hard bounces and spam complaints then stop future sends to
   that address on every list, and each sent issue shows delivered, clicked,

@@ -31,7 +31,11 @@ export type Block =
   | (BlockBase & { type: "quote"; text: string; cite: string })
   | (BlockBase & { type: "divider" })
   | (BlockBase & { type: "spacer"; size: number })
-  | (BlockBase & { type: "columns"; items: ColumnCell[] });
+  | (BlockBase & { type: "columns"; items: ColumnCell[] })
+  // Author-written email HTML, for designs the other blocks can't express. It
+  // doesn't follow the design tokens; it renders as written, cleaned (see
+  // shared/email-html.ts), inside its own row.
+  | (BlockBase & { type: "html"; html: string });
 
 export type BlockType = Block["type"];
 

@@ -37,6 +37,12 @@ export function newBlock(type: Block["type"]): Block {
         type,
         items: [emptyCell(), emptyCell()],
       };
+    case "html":
+      return {
+        id: blockId(),
+        type,
+        html: `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">\n  <tr>\n    <td style="padding:24px;background:#F4F4F5;border-radius:8px;text-align:center;font-family:Arial,sans-serif;font-size:16px;color:#111111;">\n      Your HTML here. Use tables and inline styles: mail clients ignore most CSS.\n    </td>\n  </tr>\n</table>`,
+      };
   }
 }
 
