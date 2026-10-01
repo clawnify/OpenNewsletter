@@ -132,6 +132,10 @@ export interface ResendAudience {
   contact_count?: number;
   /** Confirmed subscribers, as reported by /api/status. */
   subscribed_count?: number;
+  /** Waiting to confirm; of those, never emailed; and owed a reminder. */
+  pending_count?: number;
+  pending_unsent?: number;
+  pending_due?: number;
 }
 
 /**
@@ -154,5 +158,9 @@ export interface ResendContact {
   consent_at?: string | null;
   /** Set when imported from the workspace CRM; the CRM keeps the person. */
   crm_contact_id?: string | null;
+  /** Last confirmation email (null: none went out), how many, and why the last one failed. */
+  confirm_sent_at?: string | null;
+  confirm_attempts?: number;
+  confirm_error?: string | null;
   created_at?: string;
 }

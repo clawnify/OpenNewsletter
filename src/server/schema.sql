@@ -97,8 +97,23 @@ CREATE TABLE IF NOT EXISTS contacts (
   -- person, this row keeps the consent, and the id lets unsubscribes report
   -- back to the CRM timeline.
   crm_contact_id TEXT,
+  -- Confirmation emails: when the last one went out (null = never, e.g. added
+  -- by hand or the send failed), how many in all, and why the last one failed.
+  -- The link expires 7 days after its email; reminders stop after 3 emails.
+  confirm_sent_at TEXT,
+  confirm_attempts INTEGER NOT NULL DEFAULT 0,
+  confirm_error TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Public signups per caller in the last hour, IP stored hashed. Pruned on every
+-- signup; only used for the rate limit on /api/subscribe.
+CREATE TABLE IF NOT EXISTS signup_attempts (
+  ip_hash TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signup_attempts ON signup_attempts(ip_hash, at);
+CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at);
 
 -- One row per recipient of a send: who it went to, whether it arrived at the
 -- provider, and the provider's message id (which bounce and complaint events

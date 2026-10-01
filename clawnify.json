@@ -27,7 +27,8 @@
       {
         "path": "/api/confirm",
         "methods": [
-          "GET"
+          "GET",
+          "POST"
         ]
       },
       {

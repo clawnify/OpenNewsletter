@@ -24,6 +24,12 @@ export interface Audience {
   name: string;
   description: string;
   subscribed_count?: number;
+  /** Waiting to confirm. */
+  pending_count?: number;
+  /** Waiting, and no confirmation email has ever gone out (added by hand, or the send failed). */
+  pending_unsent?: number;
+  /** Waiting, emailed over a day ago, and still owed a reminder. */
+  pending_due?: number;
   created_at: string;
 }
 
@@ -38,24 +44,45 @@ export interface Contact {
   consent_at: string | null;
   unsubscribed_at: string | null;
   crm_contact_id: string | null;
+  /** When the last confirmation email went out; null if none ever did. */
+  confirm_sent_at: string | null;
+  confirm_attempts: number;
+  /** Why the last confirmation email couldn't be sent. */
+  confirm_error: string | null;
   created_at: string;
 }
 
 const CONTACT_COLS =
-  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, created_at";
+  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, confirm_sent_at, confirm_attempts, confirm_error, created_at";
+
+/** A confirmation link stops working this long after its email was sent. */
+export const CONFIRM_TTL_MS = 7 * 24 * 3600_000;
+/** A repeat signup inside this window reuses the email already sent, instead of mailing the address again. */
+export const CONFIRM_COOLDOWN_MS = 10 * 60_000;
+/** A pending contact is owed a reminder this long after the last confirmation email… */
+export const REMIND_AFTER_MS = 24 * 3600_000;
+/** …up to this many confirmation emails in all (the first plus two reminders). */
+export const MAX_CONFIRM_EMAILS = 3;
 
 const now = () => new Date().toISOString();
 const normalize = (email: string) => email.trim().toLowerCase();
 
 // ── Audiences ───────────────────────────────────────────────────────────────
 
-export async function listAudiences(): Promise<Audience[]> {
+export async function listAudiences(nowMs: number = Date.now()): Promise<Audience[]> {
   return (await query(
     `SELECT a.id, a.name, a.description, a.created_at,
             (SELECT COUNT(*) FROM contacts c
-              WHERE c.audience_id = a.id AND c.status = 'subscribed') AS subscribed_count
+              WHERE c.audience_id = a.id AND c.status = 'subscribed') AS subscribed_count,
+            (SELECT COUNT(*) FROM contacts c
+              WHERE c.audience_id = a.id AND c.status = 'pending') AS pending_count,
+            (SELECT COUNT(*) FROM contacts c
+              WHERE c.audience_id = a.id AND c.status = 'pending' AND c.confirm_sent_at IS NULL) AS pending_unsent,
+            (SELECT COUNT(*) FROM contacts c
+              WHERE c.audience_id = a.id AND c.status = 'pending' AND c.confirm_sent_at < ?
+                AND c.confirm_attempts < ?) AS pending_due
        FROM audiences a ORDER BY a.created_at`,
-    [],
+    [new Date(nowMs - REMIND_AFTER_MS).toISOString(), MAX_CONFIRM_EMAILS],
   )) as unknown as Audience[];
 }
 
@@ -178,26 +205,37 @@ export async function subscribedRecipients(audienceId: string): Promise<Contact[
 // ── Consent transitions ─────────────────────────────────────────────────────
 
 /**
- * Begin a double opt-in. Returns the token to put in the confirmation email.
- * Re-submitting an existing pending signup issues a fresh token rather than
- * erroring, so a lost confirmation email is self-service to fix.
+ * Begin a double opt-in. Returns the token to put in the confirmation email,
+ * and whether to send one.
+ *
+ * A repeat signup reuses the token already issued, so every confirmation email
+ * this person has received keeps working. Inside CONFIRM_COOLDOWN_MS it sends
+ * nothing new: the form is public, and without that anyone could fill one
+ * inbox with confirmation emails by submitting the same address in a loop.
  */
 export async function startSignup(
   audienceId: string,
   input: { email: string; first_name?: string },
-): Promise<{ contact: Contact; token: string } | { alreadySubscribed: true }> {
+  nowMs: number = Date.now(),
+): Promise<{ contact: Contact; token: string; send: boolean } | { alreadySubscribed: true }> {
   const email = normalize(input.email);
   const existing = (await get(`SELECT * FROM contacts WHERE audience_id = ? AND email = ?`, [
     audienceId,
     email,
-  ])) as Contact | null;
+  ])) as (Contact & { confirm_token: string | null }) | null;
 
   if (existing?.status === "subscribed") return { alreadySubscribed: true };
 
-  const token = crypto.randomUUID().replace(/-/g, "");
   const contact =
     existing ??
-    (await addContact(audienceId, input, { source: "signup_form", status: "pending" }));
+    ({ ...(await addContact(audienceId, input, { source: "signup_form", status: "pending" })), confirm_token: null } as Contact & {
+      confirm_token: string | null;
+    });
+
+  const sentAt = contact.confirm_sent_at ? Date.parse(contact.confirm_sent_at) : null;
+  const live = !!contact.confirm_token && sentAt !== null && nowMs - sentAt < CONFIRM_TTL_MS;
+  const token = live ? contact.confirm_token! : crypto.randomUUID().replace(/-/g, "");
+  const send = !(live && sentAt !== null && nowMs - sentAt < CONFIRM_COOLDOWN_MS);
 
   await run(
     `UPDATE contacts SET confirm_token = ?, status = 'pending',
@@ -205,25 +243,101 @@ export async function startSignup(
        WHERE id = ?`,
     [token, input.first_name ?? contact.first_name, contact.id],
   );
-  return { contact, token };
+  return { contact, token, send };
+}
+
+/**
+ * Pending contacts owed a confirmation email: never sent one, or sent one over
+ * a day ago and still under MAX_CONFIRM_EMAILS. Each gets a live token (an
+ * expired one is replaced). Bounded, so one request can't fan out without end.
+ */
+export async function confirmationsDue(
+  audienceId: string,
+  limit: number,
+  nowMs: number = Date.now(),
+): Promise<{ id: string; email: string; token: string; attempts: number }[]> {
+  const rows = (await query(
+    `SELECT id, email, confirm_token, confirm_sent_at, confirm_attempts FROM contacts
+      WHERE audience_id = ? AND status = 'pending'
+        AND (confirm_sent_at IS NULL OR (confirm_sent_at < ? AND confirm_attempts < ?))
+      ORDER BY created_at LIMIT ?`,
+    [audienceId, new Date(nowMs - REMIND_AFTER_MS).toISOString(), MAX_CONFIRM_EMAILS, limit],
+  )) as unknown as { id: string; email: string; confirm_token: string | null; confirm_sent_at: string | null; confirm_attempts: number }[];
+
+  const out: { id: string; email: string; token: string; attempts: number }[] = [];
+  for (const r of rows) {
+    const sentAt = r.confirm_sent_at ? Date.parse(r.confirm_sent_at) : null;
+    let token = r.confirm_token;
+    if (!token || sentAt === null || nowMs - sentAt >= CONFIRM_TTL_MS) {
+      token = crypto.randomUUID().replace(/-/g, "");
+      await run(`UPDATE contacts SET confirm_token = ? WHERE id = ?`, [token, r.id]);
+    }
+    out.push({ id: r.id, email: r.email, token, attempts: Number(r.confirm_attempts) });
+  }
+  return out;
+}
+
+/** A confirmation email went out (or failed to): what the audience view reports. */
+export async function recordConfirmation(contactId: string, result: { error?: string }, nowMs: number = Date.now()): Promise<void> {
+  if (result.error) {
+    await run(`UPDATE contacts SET confirm_error = ? WHERE id = ?`, [result.error.slice(0, 500), contactId]);
+    return;
+  }
+  await run(
+    `UPDATE contacts SET confirm_sent_at = ?, confirm_attempts = confirm_attempts + 1, confirm_error = NULL WHERE id = ?`,
+    [new Date(nowMs).toISOString(), contactId],
+  );
+}
+
+/** Look a token up without using it: the confirmation page shows who it's for before anyone presses the button. */
+export async function peekConfirmation(
+  token: string,
+  nowMs: number = Date.now(),
+): Promise<{ contact: Contact } | { expired: true } | null> {
+  const contact = (await get(`SELECT ${CONTACT_COLS} FROM contacts WHERE confirm_token = ?`, [token])) as Contact | null;
+  if (!contact) return null;
+  const sentAt = contact.confirm_sent_at ? Date.parse(contact.confirm_sent_at) : null;
+  if (sentAt !== null && nowMs - sentAt >= CONFIRM_TTL_MS) return { expired: true };
+  return { contact };
 }
 
 /** Complete a double opt-in. The token is single-use — cleared on success. */
-export async function confirmSignup(token: string, evidence = ""): Promise<Contact | null> {
-  const contact = (await get(`SELECT * FROM contacts WHERE confirm_token = ?`, [
-    token,
-  ])) as Contact | null;
-  if (!contact) return null;
+export async function confirmSignup(token: string, evidence = "", nowMs: number = Date.now()): Promise<Contact | null> {
+  const peek = await peekConfirmation(token, nowMs);
+  if (!peek || "expired" in peek) return null;
+  const contact = peek.contact;
 
   await run(
     `UPDATE contacts SET status = 'subscribed', consent_at = ?, consent_evidence = ?,
-            confirm_token = NULL, unsubscribed_at = NULL
-       WHERE id = ?`,
-    [now(), evidence, contact.id],
+            confirm_token = NULL, unsubscribed_at = NULL, confirm_error = NULL
+       WHERE id = ? AND confirm_token = ?`,
+    [new Date(nowMs).toISOString(), evidence, contact.id, token],
   );
   return (await get(`SELECT ${CONTACT_COLS} FROM contacts WHERE id = ?`, [
     contact.id,
   ])) as Contact;
+}
+
+// ── Signup rate limit ───────────────────────────────────────────────────────
+
+/** Signups one address (IP) may start per hour. Generous for a shared office, tight for a script. */
+export const SIGNUPS_PER_IP_PER_HOUR = 10;
+
+/**
+ * Count a signup from this caller and say whether it's within the limit. The
+ * IP is stored hashed and kept for an hour, only for this count.
+ */
+export async function allowSignup(ip: string, nowMs: number = Date.now()): Promise<boolean> {
+  const hour = new Date(nowMs - 3600_000).toISOString();
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(ip));
+  const ipHash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  await run(`DELETE FROM signup_attempts WHERE at < ?`, [hour]);
+  const n = (await get(`SELECT COUNT(*) AS n FROM signup_attempts WHERE ip_hash = ? AND at >= ?`, [ipHash, hour])) as {
+    n: number;
+  } | null;
+  if (Number(n?.n ?? 0) >= SIGNUPS_PER_IP_PER_HOUR) return false;
+  await run(`INSERT INTO signup_attempts (ip_hash, at) VALUES (?, ?)`, [ipHash, new Date(nowMs).toISOString()]);
+  return true;
 }
 
 export async function markUnsubscribed(audienceId: string, email: string): Promise<void> {
