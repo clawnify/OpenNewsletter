@@ -39,6 +39,11 @@ describe("merge tags", () => {
     expect(html).toContain("<strong style=\"font-weight:700;\">[Claim](https://evil.example) &lt;img src=x onerror=1&gt; &quot;q&quot;</strong>");
   });
 
+  it("reads Klaviyo's and Liquid's default filter as the fallback", () => {
+    const html = renderEmailHtml(mail([text(`A {{ first_name|default:'friend' }}, B {{ first_name | default: "there" }}, C {{last_name|default:}}.`)]), DEFAULT_DESIGN, settings, { merge: values("") });
+    expect(html).toContain("A friend, B there, C .");
+  });
+
   it("leaves tags as written without values, and unknown tags always", () => {
     const blocks = [text("Hi {{first_name|there}} {{company}}")];
     expect(renderEmailHtml(mail(blocks), DEFAULT_DESIGN, settings)).toContain("Hi {{first_name|there}} {{company}}");

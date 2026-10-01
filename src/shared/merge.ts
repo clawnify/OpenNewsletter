@@ -32,8 +32,19 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
+/**
+ * The fallback after the bar. `{{first_name|there}}` is ours; Klaviyo and
+ * Liquid write `{{ first_name|default:'there' }}` and `{{ first_name | default: "there" }}`,
+ * and both arrive in pasted copy and from the assistant, so they mean the same.
+ */
+function fallbackText(raw: string | undefined): string {
+  const text = (raw ?? "").trim().replace(/^default\s*:\s*/, "");
+  const quoted = /^(['"])(.*)\1$/.exec(text);
+  return quoted ? quoted[2] : text;
+}
+
 function valueFor(values: MergeValues, field: string, fallback: string | undefined): string {
-  return (values[field as keyof MergeValues] || "").trim() || (fallback ?? "").trim();
+  return (values[field as keyof MergeValues] || "").trim() || fallbackText(fallback);
 }
 
 /**
