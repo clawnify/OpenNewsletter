@@ -4,6 +4,8 @@ import { enqueueJob, verifyDelivery } from "@clawnify/queue";
 import { initDB, query, get, run, addColumns } from "./db";
 import * as contacts from "./contacts";
 import * as crm from "./crm";
+import * as importer from "./importer";
+import { toCsv } from "../shared/csv";
 import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
@@ -786,7 +788,68 @@ app.post("/api/audiences", async (c) => {
 });
 
 app.get("/api/audiences/:id/contacts", async (c) => {
-  return c.json(await contacts.listContacts(c.req.param("id")));
+  const limit = Number(c.req.query("limit"));
+  // Without `limit`: the whole list as an array, as older callers expect.
+  if (!limit) return c.json(await contacts.listContacts(c.req.param("id")));
+  return c.json(
+    await contacts.pageContacts(c.req.param("id"), {
+      limit: Math.min(Math.max(1, Math.floor(limit)), 200),
+      search: c.req.query("search"),
+      status: c.req.query("status"),
+      cursor: c.req.query("cursor"),
+    }),
+  );
+});
+
+// ── CSV import and export ────────────────────────────────────────────
+// The browser parses and maps the file and posts it in chunks; see
+// importer.ts for the consent rules each chunk is held to.
+app.post("/api/audiences/:id/import", async (c) => {
+  const audienceId = c.req.param("id");
+  if (!(await contacts.listAudiences()).some((a) => a.id === audienceId)) return c.json({ error: "Audience not found" }, 404);
+  type Body = { rows?: unknown; evidence?: unknown; source?: unknown };
+  const b = await c.req.json<Body>().catch(() => ({}) as Body);
+  if (!Array.isArray(b.rows) || b.rows.length === 0) return c.json({ error: "No rows" }, 400);
+  if (b.rows.length > importer.IMPORT_CHUNK) return c.json({ error: `At most ${importer.IMPORT_CHUNK} rows per request` }, 413);
+  const evidence = typeof b.evidence === "string" ? b.evidence.trim().slice(0, 1000) : "";
+  const source = typeof b.source === "string" && b.source.trim() ? b.source.trim().slice(0, 200) : "CSV import";
+  const { rows, rejected } = importer.cleanRows(b.rows, evidence, source);
+  return c.json({ ...(await importer.importChunk(audienceId, rows)), rejected });
+});
+
+app.get("/api/audiences/:id/export", async (c) => {
+  const audienceId = c.req.param("id");
+  const audience = (await contacts.listAudiences()).find((a) => a.id === audienceId);
+  if (!audience) return c.json({ error: "Audience not found" }, 404);
+  const cols = importer.EXPORT_COLUMNS;
+  const enc = new TextEncoder();
+  // Streamed a page at a time, so a large list never sits in memory whole.
+  const body = new ReadableStream<Uint8Array>({
+    async start(ctrl) {
+      try {
+        ctrl.enqueue(enc.encode(toCsv([...cols], [])));
+        let after = "";
+        for (;;) {
+          const page = await importer.exportPage(audienceId, after, 1000);
+          if (!page.length) break;
+          const csv = toCsv([], page.map((r) => cols.map((k) => r[k])));
+          ctrl.enqueue(enc.encode(csv.slice(csv.indexOf("\r\n") + 2)));
+          after = String(page[page.length - 1].id);
+        }
+        ctrl.close();
+      } catch (err) {
+        ctrl.error(err);
+      }
+    },
+  });
+  const name = `${audience.name.replace(/[^\w-]+/g, "-").replace(/^-|-$/g, "") || "audience"}-${new Date().toISOString().slice(0, 10)}.csv`;
+  return new Response(body, {
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${name}"`,
+      "Cache-Control": "no-store",
+    },
+  });
 });
 
 app.post("/api/audiences/:id/contacts", async (c) => {
@@ -865,8 +928,9 @@ app.get("/api/crm/contacts", async (c) => {
   const result = await crm.listCrmContacts(await crmEnv(c), { page, limit: 50, search });
 
   // Mark what is already in the target audience so the picker can say so.
-  const local = audienceId ? await contacts.listContacts(audienceId) : [];
-  const byEmail = new Map(local.map((r) => [r.email.toLowerCase(), r.status]));
+  const byEmail = audienceId
+    ? await contacts.statusesOf(audienceId, result.contacts.map((r) => r.email ?? "").filter((e) => e.trim()))
+    : new Map<string, string>();
   const rows = result.contacts
     .filter((r) => !!r.email?.trim())
     .map((r) => ({
@@ -909,12 +973,13 @@ app.post("/api/audiences/:id/import-crm", async (c) => {
       skipped.push({ id, reason: row ? "no email in CRM" : "not found in CRM" });
       continue;
     }
-    const before = await contacts.listContacts(audienceId);
-    const wasUnsubscribed = before.some(
-      (x) => x.email === row.email.trim().toLowerCase() && x.status === "unsubscribed",
-    );
-    if (wasUnsubscribed) {
+    const here = (await contacts.findContact(audienceId, row.email))?.status;
+    if (here === "unsubscribed") {
       skipped.push({ id, reason: "unsubscribed here before; they must opt in again" });
+      continue;
+    }
+    if (here === "bounced") {
+      skipped.push({ id, reason: "their address bounced here before" });
       continue;
     }
     const contact = await contacts.addContact(
