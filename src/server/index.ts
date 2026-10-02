@@ -82,6 +82,7 @@ async function ensureSeed() {
     `ALTER TABLE mails ADD COLUMN preheader TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE deliveries ADD COLUMN first_name TEXT`,
     `ALTER TABLE deliveries ADD COLUMN last_name TEXT`,
+    `ALTER TABLE settings ADD COLUMN crm_enabled INTEGER NOT NULL DEFAULT 0`,
   ]) {
     try {
       await run(sql);
@@ -188,6 +189,7 @@ async function getSettings(): Promise<Settings> {
     senders,
     default_audience_id: row?.default_audience_id || null,
     footer_text: row?.footer_text || "",
+    crm_enabled: !!row?.crm_enabled,
   };
 }
 
@@ -213,6 +215,17 @@ function fromAddress(s: Settings): string | null {
   return s.from_name ? `${s.from_name} <${s.from_email}>` : s.from_email;
 }
 
+/**
+ * The gate for every CRM read/write: the CRM must be reachable AND the operator
+ * must have turned it on in Settings. Reachable-but-off does nothing — a sibling
+ * app never activates itself.
+ */
+async function crmActive(c: any): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!crm.crmConfigured(c.env)) return { ok: false, error: "No CRM connected to this workspace" };
+  if (!(await getSettings()).crm_enabled) return { ok: false, error: "The CRM connection is off. Turn it on in Settings → Connected apps." };
+  return { ok: true };
+}
+
 // ── status ───────────────────────────────────────────────────────────
 
 app.get("/api/status", async (c) => {
@@ -235,12 +248,17 @@ app.get("/api/status", async (c) => {
     }
   }
 
+  // A CRM being reachable (available) is separate from the operator having
+  // turned it on (enabled). Only the two together activate CRM features.
+  const crmAvailable = crm.crmConfigured(c.env);
+  const crmEnabled = (await getSettings()).crm_enabled;
   return c.json({
     resend_connected: !!provider,
     provider: provider?.name ?? null,
     ai_available: !!env.OPENROUTER_API_KEY,
     github_connected: !!env.GITHUB_TOKEN,
-    crm_connected: crm.crmConfigured(c.env),
+    crm_available: crmAvailable,
+    crm_connected: crmAvailable && crmEnabled,
     tracking: await trackingState(c),
     audiences,
     sending_domains,
@@ -269,8 +287,8 @@ app.put("/api/settings", async (c) => {
   const cur = await getSettings();
   const next = { ...cur, ...b };
   await run(
-    `UPDATE settings SET publication_name = ?, logo = ?, from_name = ?, from_email = ?, senders = ?, default_audience_id = ?, footer_text = ? WHERE id = 1`,
-    [next.publication_name, next.logo, next.from_name, next.from_email, JSON.stringify(next.senders || []), next.default_audience_id, next.footer_text],
+    `UPDATE settings SET publication_name = ?, logo = ?, from_name = ?, from_email = ?, senders = ?, default_audience_id = ?, footer_text = ?, crm_enabled = ? WHERE id = 1`,
+    [next.publication_name, next.logo, next.from_name, next.from_email, JSON.stringify(next.senders || []), next.default_audience_id, next.footer_text, next.crm_enabled ? 1 : 0],
   );
   return c.json(await getSettings());
 });
@@ -799,7 +817,8 @@ app.delete("/api/audiences/:id/contacts/:contactId", async (c) => {
 // evidence, and keeps the CRM id so an unsubscribe can be noted back there.
 
 app.get("/api/crm/contacts", async (c) => {
-  if (!crm.crmConfigured(c.env)) return c.json({ error: "No CRM connected to this workspace" }, 409);
+  const gate = await crmActive(c);
+  if (!gate.ok) return c.json({ error: gate.error }, 409);
   const page = Number(c.req.query("page") || "1") || 1;
   const search = c.req.query("search") || undefined;
   const audienceId = c.req.query("audience_id") || "";
@@ -823,7 +842,8 @@ app.get("/api/crm/contacts", async (c) => {
 });
 
 app.post("/api/audiences/:id/import-crm", async (c) => {
-  if (!crm.crmConfigured(c.env)) return c.json({ error: "No CRM connected to this workspace" }, 409);
+  const gate = await crmActive(c);
+  if (!gate.ok) return c.json({ error: gate.error }, 409);
   type ImportBody = { contact_ids?: unknown; consent_evidence?: unknown };
   const b = await c.req.json<ImportBody>().catch(() => ({}) as ImportBody);
   const ids = crm.pickIds(b.contact_ids);

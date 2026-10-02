@@ -7,11 +7,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 
 export function SettingsView() {
-  const { settings, status, saveSettings, setError } = useStore();
+  const { settings, status, saveSettings, refreshStatus, setError } = useStore();
   const [form, setForm] = useState<Settings>(
-    settings || { publication_name: "", logo: "", from_name: "", from_email: "", senders: [], default_audience_id: null, footer_text: "" },
+    settings || { publication_name: "", logo: "", from_name: "", from_email: "", senders: [], default_audience_id: null, footer_text: "", crm_enabled: false },
   );
   const [savedAt, setSavedAt] = useState(false);
   const [domains, setDomains] = useState<{ name: string; status: string }[]>([]);
@@ -25,6 +26,21 @@ export function SettingsView() {
       setSavedAt(true);
       setTimeout(() => setSavedAt(false), 1500);
     } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  // A connected-app toggle applies on flip (not on the Save button): it is a
+  // switch, not a form field. Persist with the rest of the current form so an
+  // unsaved edit above isn't lost, then refresh status so the feature appears
+  // or disappears immediately.
+  const toggleCrm = async (on: boolean) => {
+    setForm((f) => ({ ...f, crm_enabled: on }));
+    try {
+      await saveSettings({ ...form, crm_enabled: on });
+      await refreshStatus();
+    } catch (e) {
+      setForm((f) => ({ ...f, crm_enabled: !on }));
       setError((e as Error).message);
     }
   };
@@ -53,15 +69,6 @@ export function SettingsView() {
         <Status ok={!!status?.resend_connected} label="Resend" detail={status?.resend_connected ? "Connected" : "Connect Resend in your Clawnify dashboard (Settings → Integrations), or set RESEND_API_KEY"} />
         <Status ok={!!status?.ai_available} label="AI generation (OpenRouter)" detail={status?.ai_available ? "Ready" : "Set OPENROUTER_API_KEY to enable Generate"} />
         <Status
-          ok={!!status?.crm_connected}
-          label="CRM"
-          detail={
-            status?.crm_connected
-              ? "Connected — import contacts from your CRM in the Audience view"
-              : "Installed with a CRM in the same workspace, this app can import contacts from it"
-          }
-        />
-        <Status
           ok={!!status?.github_connected}
           label="GitHub (Hints)"
           detail={
@@ -70,6 +77,28 @@ export function SettingsView() {
               : "Set GITHUB_TOKEN in your Clawnify environment (Contents: read) to list private repos. Public repos work without it."
           }
         />
+      </section>
+
+      <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
+        <h2 className="text-sm font-semibold">Connected apps</h2>
+        <p className="text-xs text-muted-foreground">
+          Other apps in this workspace the newsletter can use. Each is off until you turn it on — nothing syncs or runs on its own.
+        </p>
+        {status?.crm_available ? (
+          <div className="flex items-start justify-between gap-4 rounded-sm shadow-edge px-3 py-2.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium">CRM</div>
+              <div className="text-xs text-muted-foreground">
+                {form.crm_enabled
+                  ? "On — import contacts from your CRM in the Audience view. Importing still records consent."
+                  : "Detected in this workspace. Turn on to import contacts (with recorded consent) into an audience."}
+              </div>
+            </div>
+            <Switch checked={!!form.crm_enabled} onCheckedChange={toggleCrm} aria-label="Use the CRM" />
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">No connected apps detected in this workspace.</p>
+        )}
       </section>
 
       <TrackingSection />

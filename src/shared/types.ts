@@ -141,6 +141,8 @@ export interface Settings {
   senders: Sender[];
   default_audience_id: string | null;
   footer_text: string;
+  /** Opt-in: use a sibling CRM app detected in this workspace. Off by default. */
+  crm_enabled: boolean;
 }
 
 /** Connection / capability status surfaced to the UI. */
@@ -148,7 +150,9 @@ export interface StatusInfo {
   resend_connected: boolean;
   ai_available: boolean;
   github_connected: boolean;
-  /** A CRM in the same workspace is reachable; enables "Import from CRM". */
+  /** A CRM in the same workspace is reachable (detected, not necessarily on). */
+  crm_available?: boolean;
+  /** CRM reachable AND turned on in Settings — this is what enables "Import from CRM". */
   crm_connected?: boolean;
   /** Delivery events (bounces, complaints, clicks) reach this app. */
   tracking?: { enabled: boolean; source: "env" | "stored" | null; endpoint: string; events: string[] };

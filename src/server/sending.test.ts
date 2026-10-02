@@ -99,7 +99,7 @@ const snapshot = (): SendSnapshot => ({
     broadcast_id: null, scheduled_at: null, sent_at: null, created_at: "", updated_at: "",
   },
   design: DEFAULT_DESIGN,
-  settings: { publication_name: "Pub", logo: "", from_name: "", from_email: "a@b.co", senders: [], default_audience_id: AUD, footer_text: "" },
+  settings: { publication_name: "Pub", logo: "", from_name: "", from_email: "a@b.co", senders: [], default_audience_id: AUD, footer_text: "", crm_enabled: false },
   from: "a@b.co",
   origin: "https://pub.apps.clawnify.com",
 });

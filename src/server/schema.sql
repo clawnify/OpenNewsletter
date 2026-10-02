@@ -55,7 +55,11 @@ CREATE TABLE IF NOT EXISTS settings (
   -- The Resend webhook "Turn on delivery tracking" registered, and its signing
   -- secret (verifies events; RESEND_WEBHOOK_SECRET in the env wins).
   resend_webhook_id TEXT,
-  resend_webhook_secret TEXT
+  resend_webhook_secret TEXT,
+  -- Opt-in to use a sibling CRM app detected in this workspace. OFF by default:
+  -- a CRM being reachable (CRM_APP_ID set) never activates anything on its own;
+  -- the operator turns it on in Settings before any CRM read happens.
+  crm_enabled INTEGER NOT NULL DEFAULT 0
 );
 
 -- Audiences (lists). Previously Resend segments; now local, so the list is the
