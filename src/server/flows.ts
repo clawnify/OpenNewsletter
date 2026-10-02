@@ -238,6 +238,40 @@ export async function listFlows(): Promise<FlowSummary[]> {
   return out;
 }
 
+/** Per-step counts for the detail canvas: how many sent, were skipped/failed, and are waiting here now. */
+export interface StepStat {
+  sent: number;
+  skipped: number;
+  waiting: number;
+}
+export async function stepStats(flowId: string): Promise<Record<string, StepStat>> {
+  const out: Record<string, StepStat> = {};
+  const bump = (id: string): StepStat => (out[id] ??= { sent: 0, skipped: 0, waiting: 0 });
+  const events = (await query(
+    `SELECT ev.step_id AS step_id, ev.outcome AS outcome, COUNT(*) AS n
+       FROM flow_step_events ev JOIN flow_enrollments e ON e.id = ev.enrollment_id
+      WHERE e.flow_id = ? GROUP BY ev.step_id, ev.outcome`,
+    [flowId],
+  )) as unknown as { step_id: string; outcome: string; n: number }[];
+  for (const r of events) {
+    if (!r.step_id) continue;
+    const s = bump(r.step_id);
+    if (r.outcome === "sent") s.sent += Number(r.n);
+    else if (r.outcome === "skipped" || r.outcome === "failed") s.skipped += Number(r.n);
+  }
+  const waiting = (await query(
+    `SELECT current_step_id AS step_id, COUNT(*) AS n FROM flow_enrollments
+      WHERE flow_id = ? AND state = 'waiting' GROUP BY current_step_id`,
+    [flowId],
+  )) as unknown as { step_id: string; n: number }[];
+  for (const r of waiting) if (r.step_id) bump(r.step_id).waiting += Number(r.n);
+  return out;
+}
+
+export async function renameFlow(flowId: string, name: string): Promise<void> {
+  await run(`UPDATE flows SET name = ?, updated_at = ? WHERE id = ?`, [name, now(), flowId]);
+}
+
 // ── Authoring primitives (create / edit a flow) ─────────────────────────────
 
 export async function createFlow(spec: {

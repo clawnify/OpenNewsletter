@@ -1477,7 +1477,23 @@ app.get("/api/flows/:id", async (c) => {
   const flow = await flows.getFlow(c.req.param("id"));
   if (!flow) return c.json({ error: "Not found" }, 404);
   const steps = (await flows.stepsOf(flow.id)).filter((s) => !s.deleted_at);
-  return c.json({ ...flow, steps });
+  const stats = await flows.stepStats(flow.id);
+  const issues = await flows.validateFlow(flow.id, flowEmailReady(await getSettings()));
+  return c.json({ ...flow, steps, stats, issues });
+});
+
+// Rename a flow, or edit one step's config (a delay's duration). Structural edits
+// (add / delete / reorder steps) are a later increment; the engine supports them.
+app.patch("/api/flows/:id", async (c) => {
+  const { name } = await c.req.json<{ name?: string }>();
+  if (name?.trim()) await flows.renameFlow(c.req.param("id"), name.trim());
+  return c.json(await flows.getFlow(c.req.param("id")));
+});
+
+app.patch("/api/flows/:id/steps/:stepId", async (c) => {
+  const { config } = await c.req.json<{ config?: object }>();
+  if (config) await flows.editStepConfig(c.req.param("stepId"), config);
+  return c.json({ ok: true });
 });
 
 // Create an automation from a prebuilt. v1 ships one: the welcome series
