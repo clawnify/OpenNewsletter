@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, RefreshCw, Database, Send } from "lucide-react";
+import { Plus, Trash2, RefreshCw, Database, Send, FileUp, Download, Search } from "lucide-react";
 import { api } from "../api";
 import { useStore } from "../store";
 import type { ResendAudience, ResendContact } from "../../shared/types";
@@ -7,6 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CrmImportDialog } from "./crm-import-dialog";
+import { CsvImportDialog } from "./csv-import-dialog";
+
+const PAGE = 50;
 
 export function AudienceView() {
   const { status, setError, refreshStatus } = useStore();
@@ -17,19 +20,30 @@ export function AudienceView() {
   const [email, setEmail] = useState("");
   const [first, setFirst] = useState("");
   const [crmOpen, setCrmOpen] = useState(false);
+  const [csvOpen, setCsvOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [next, setNext] = useState<string | null>(null);
 
   useEffect(() => {
     if (!selected && audiences.length) setSelected(audiences[0].id);
   }, [audiences, selected]);
 
-  const load = async (id: string) => {
+  // A page at a time: an imported list can hold tens of thousands of people.
+  const load = async (id: string, cursor: string | null = null) => {
     if (!id) return;
     setLoading(true);
     try {
-      setContacts(await api<ResendContact[]>("GET", `/api/audiences/${id}/contacts`));
+      const q = new URLSearchParams({ limit: String(PAGE) });
+      if (search.trim()) q.set("search", search.trim());
+      if (statusFilter !== "all") q.set("status", statusFilter);
+      if (cursor) q.set("cursor", cursor);
+      const r = await api<{ contacts: ResendContact[]; next: string | null }>("GET", `/api/audiences/${id}/contacts?${q}`);
+      setContacts((p) => (cursor ? [...p, ...r.contacts] : r.contacts));
+      setNext(r.next);
     } catch (e) {
       setError((e as Error).message);
-      setContacts([]);
+      if (!cursor) setContacts([]);
     } finally {
       setLoading(false);
     }
@@ -37,7 +51,7 @@ export function AudienceView() {
 
   useEffect(() => {
     if (selected) load(selected);
-  }, [selected]);
+  }, [selected, statusFilter]);
 
   const current = audiences.find((a: ResendAudience) => a.id === selected);
 
@@ -96,7 +110,17 @@ export function AudienceView() {
               <Database size={15} /> Import from CRM
             </Button>
           ) : null}
-          <Button variant="outline" size="icon" onClick={() => load(selected)} aria-label="Refresh">
+          <Button variant="outline" disabled={!selected} onClick={() => setCsvOpen(true)}>
+            <FileUp size={15} /> Import CSV
+          </Button>
+          {selected ? (
+            <Button variant="outline" asChild>
+              <a href={`/api/audiences/${selected}/export`} download>
+                <Download size={15} /> Export
+              </a>
+            </Button>
+          ) : null}
+          <Button variant="outline" size="icon" onClick={() => { load(selected); refreshStatus(); }} aria-label="Refresh">
             <RefreshCw size={16} />
           </Button>
         </div>
@@ -110,6 +134,19 @@ export function AudienceView() {
           audienceId={selected}
           audienceName={audiences.find((a: ResendAudience) => a.id === selected)?.name ?? ""}
           onImported={() => load(selected)}
+        />
+      ) : null}
+
+      {selected ? (
+        <CsvImportDialog
+          open={csvOpen}
+          onOpenChange={setCsvOpen}
+          audienceId={selected}
+          audienceName={current?.name ?? ""}
+          onImported={() => {
+            load(selected);
+            refreshStatus();
+          }}
         />
       ) : null}
 
@@ -136,8 +173,36 @@ export function AudienceView() {
         </Button>
       </div>
 
+      <div className="mb-2 flex gap-2">
+        <div className="relative flex-1">
+          <Search size={15} className="pointer-events-none absolute left-2.5 top-2.5 text-muted-foreground" />
+          <Input
+            className="pl-8"
+            placeholder="Search email or name"
+            aria-label="Search contacts"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") load(selected);
+            }}
+          />
+        </div>
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
+          <SelectTrigger className="w-44" aria-label="Filter by status">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Everyone</SelectItem>
+            <SelectItem value="subscribed">Subscribed</SelectItem>
+            <SelectItem value="pending">Waiting to confirm</SelectItem>
+            <SelectItem value="unsubscribed">Unsubscribed</SelectItem>
+            <SelectItem value="bounced">Bounced</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
       <div className="overflow-hidden rounded-md bg-card shadow-edge">
-        {loading ? (
+        {loading && contacts.length === 0 ? (
           <div className="p-6 text-center text-sm text-muted-foreground">Loading…</div>
         ) : contacts.length === 0 ? (
           <div className="p-6 text-center text-sm text-muted-foreground">No contacts in this audience yet.</div>
@@ -151,6 +216,11 @@ export function AudienceView() {
                     <div className="truncate text-xs text-muted-foreground">{[c.first_name, c.last_name].filter(Boolean).join(" ")}</div>
                   ) : null}
                 </div>
+                {c.consent_source === "import" && c.status === "subscribed" ? (
+                  <span className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground" title="Imported with a recorded consent statement">
+                    Imported
+                  </span>
+                ) : null}
                 {c.consent_source === "crm_sync" ? (
                   <span className="rounded-xs bg-muted px-1.5 py-0.5 text-xs text-muted-foreground" title="Imported from your CRM with recorded consent">
                     CRM
@@ -188,6 +258,13 @@ export function AudienceView() {
           </ul>
         )}
       </div>
+      {next ? (
+        <div className="mt-3 text-center">
+          <Button variant="ghost" size="sm" disabled={loading} onClick={() => load(selected, next)}>
+            {loading ? "Loading…" : "Show more"}
+          </Button>
+        </div>
+      ) : null}
       </div>
     </div>
   );
