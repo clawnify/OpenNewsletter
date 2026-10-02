@@ -83,6 +83,7 @@ async function ensureSeed() {
     `ALTER TABLE deliveries ADD COLUMN first_name TEXT`,
     `ALTER TABLE deliveries ADD COLUMN last_name TEXT`,
     `ALTER TABLE settings ADD COLUMN crm_enabled INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE settings ADD COLUMN crm_app_id TEXT`,
   ]) {
     try {
       await run(sql);
@@ -189,8 +190,22 @@ async function getSettings(): Promise<Settings> {
     senders,
     default_audience_id: row?.default_audience_id || null,
     footer_text: row?.footer_text || "",
-    crm_enabled: !!row?.crm_enabled,
+    crm_app_id: (row?.crm_app_id as string | null) ?? null,
   };
+}
+
+/**
+ * Which sibling app is the contacts source: the operator's pick from the app
+ * directory, else the CRM_APP_ID env var a bundle install set. Null = none.
+ */
+async function effectiveCrmAppId(c: any): Promise<string | null> {
+  const picked = (await getSettings()).crm_app_id;
+  return picked || (c.env as { CRM_APP_ID?: string }).CRM_APP_ID || null;
+}
+
+/** The CrmEnv the broker helpers read, with the effective app id resolved in. */
+async function crmEnv(c: any): Promise<crm.CrmEnv> {
+  return { CRM_APP_ID: (await effectiveCrmAppId(c)) || undefined, CLAWNIFY_TOKEN: (c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN };
 }
 
 async function templateDesign(slug: string | null): Promise<DesignTokens> {
@@ -221,8 +236,8 @@ function fromAddress(s: Settings): string | null {
  * app never activates itself.
  */
 async function crmActive(c: any): Promise<{ ok: true } | { ok: false; error: string }> {
-  if (!crm.crmConfigured(c.env)) return { ok: false, error: "No CRM connected to this workspace" };
-  if (!(await getSettings()).crm_enabled) return { ok: false, error: "The CRM connection is off. Turn it on in Settings → Connected apps." };
+  if (!(c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN) return { ok: false, error: "This app has no Clawnify token, so it can't reach a sibling app." };
+  if (!(await effectiveCrmAppId(c))) return { ok: false, error: "No CRM connected. Pick one in Settings → Connected apps." };
   return { ok: true };
 }
 
@@ -248,17 +263,16 @@ app.get("/api/status", async (c) => {
     }
   }
 
-  // A CRM being reachable (available) is separate from the operator having
-  // turned it on (enabled). Only the two together activate CRM features.
-  const crmAvailable = crm.crmConfigured(c.env);
-  const crmEnabled = (await getSettings()).crm_enabled;
+  // Connected when a sibling has been picked (or a bundle set CRM_APP_ID) AND
+  // the app can reach siblings. The Connected-apps picker fetches the directory
+  // separately (GET /api/connected-apps), so status only reports the result.
+  const crmConnected = (await crmActive(c)).ok;
   return c.json({
     resend_connected: !!provider,
     provider: provider?.name ?? null,
     ai_available: !!env.OPENROUTER_API_KEY,
     github_connected: !!env.GITHUB_TOKEN,
-    crm_available: crmAvailable,
-    crm_connected: crmAvailable && crmEnabled,
+    crm_connected: crmConnected,
     tracking: await trackingState(c),
     audiences,
     sending_domains,
@@ -287,8 +301,8 @@ app.put("/api/settings", async (c) => {
   const cur = await getSettings();
   const next = { ...cur, ...b };
   await run(
-    `UPDATE settings SET publication_name = ?, logo = ?, from_name = ?, from_email = ?, senders = ?, default_audience_id = ?, footer_text = ?, crm_enabled = ? WHERE id = 1`,
-    [next.publication_name, next.logo, next.from_name, next.from_email, JSON.stringify(next.senders || []), next.default_audience_id, next.footer_text, next.crm_enabled ? 1 : 0],
+    `UPDATE settings SET publication_name = ?, logo = ?, from_name = ?, from_email = ?, senders = ?, default_audience_id = ?, footer_text = ?, crm_app_id = ? WHERE id = 1`,
+    [next.publication_name, next.logo, next.from_name, next.from_email, JSON.stringify(next.senders || []), next.default_audience_id, next.footer_text, next.crm_app_id || null],
   );
   return c.json(await getSettings());
 });
@@ -816,13 +830,37 @@ app.delete("/api/audiences/:id/contacts/:contactId", async (c) => {
 // picker; a contact becomes a subscriber here only with stated consent
 // evidence, and keeps the CRM id so an unsubscribe can be noted back there.
 
+// Discover the org's other apps so the operator can pick a contacts source,
+// without a configured id. Calls the platform app directory with this app's
+// service token (same transport crm.ts uses for the proxy), drops this app
+// itself, and says which sibling is the current CRM pick.
+app.get("/api/connected-apps", async (c) => {
+  const token = (c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN;
+  const crm_app_id = (await getSettings()).crm_app_id;
+  if (!token) return c.json({ apps: [], crm_app_id });
+  const selfUrl = new URL(c.req.url).origin;
+  let apps: Array<{ id: string; slug: string; name: string; icon_glyph: string | null; icon_svg: string | null; framework: string | null; url: string }> = [];
+  try {
+    const res = await fetch("https://provision.clawnify.com/v1/apps/directory", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { apps?: typeof apps };
+      apps = (data.apps || []).filter((a) => a.url !== selfUrl);
+    }
+  } catch {
+    /* directory unreachable (no platform / offline) → report none, stay standalone */
+  }
+  return c.json({ apps, crm_app_id });
+});
+
 app.get("/api/crm/contacts", async (c) => {
   const gate = await crmActive(c);
   if (!gate.ok) return c.json({ error: gate.error }, 409);
   const page = Number(c.req.query("page") || "1") || 1;
   const search = c.req.query("search") || undefined;
   const audienceId = c.req.query("audience_id") || "";
-  const result = await crm.listCrmContacts(c.env, { page, limit: 50, search });
+  const result = await crm.listCrmContacts(await crmEnv(c), { page, limit: 50, search });
 
   // Mark what is already in the target audience so the picker can say so.
   const local = audienceId ? await contacts.listContacts(audienceId) : [];
@@ -860,10 +898,11 @@ app.post("/api/audiences/:id/import-crm", async (c) => {
   const audience = (await contacts.listAudiences()).find((a) => a.id === audienceId);
   if (!audience) return c.json({ error: "Audience not found" }, 404);
 
+  const cenv = await crmEnv(c);
   const imported: contacts.Contact[] = [];
   const skipped: { id: string; reason: string }[] = [];
   for (const id of ids) {
-    const row = await crm.getCrmContact(c.env, id);
+    const row = await crm.getCrmContact(cenv, id);
     if (!row || !row.email?.trim()) {
       skipped.push({ id, reason: row ? "no email in CRM" : "not found in CRM" });
       continue;
@@ -883,7 +922,7 @@ app.post("/api/audiences/:id/import-crm", async (c) => {
     );
     imported.push(contact);
     await crm.logCrmActivity(
-      c.env,
+      cenv,
       row.id,
       `Added to newsletter audience "${audience.name}". Consent: ${evidence}`,
     );

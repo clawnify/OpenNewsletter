@@ -56,10 +56,11 @@ CREATE TABLE IF NOT EXISTS settings (
   -- secret (verifies events; RESEND_WEBHOOK_SECRET in the env wins).
   resend_webhook_id TEXT,
   resend_webhook_secret TEXT,
-  -- Opt-in to use a sibling CRM app detected in this workspace. OFF by default:
-  -- a CRM being reachable (CRM_APP_ID set) never activates anything on its own;
-  -- the operator turns it on in Settings before any CRM read happens.
-  crm_enabled INTEGER NOT NULL DEFAULT 0
+  -- Which sibling app (from GET /v1/apps/directory) the operator picked as the
+  -- contacts source, NULL = none. This IS the opt-in: a CRM being reachable never
+  -- activates anything on its own; the operator chooses one in Settings before
+  -- any CRM read happens. Falls back to the CRM_APP_ID env var (bundle installs).
+  crm_app_id TEXT
 );
 
 -- Audiences (lists). Previously Resend segments; now local, so the list is the

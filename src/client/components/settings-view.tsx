@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { CheckCircle2, XCircle, Trash2, Database } from "lucide-react";
+import { CheckCircle2, XCircle, Trash2, AppWindow } from "lucide-react";
 import { useStore } from "../store";
 import { api } from "../api";
-import type { Settings, Sender } from "../../shared/types";
+import type { Settings, Sender, ConnectedApp } from "../../shared/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -12,12 +12,14 @@ import { Switch } from "@/components/ui/switch";
 export function SettingsView() {
   const { settings, status, saveSettings, refreshStatus, setError } = useStore();
   const [form, setForm] = useState<Settings>(
-    settings || { publication_name: "", logo: "", from_name: "", from_email: "", senders: [], default_audience_id: null, footer_text: "", crm_enabled: false },
+    settings || { publication_name: "", logo: "", from_name: "", from_email: "", senders: [], default_audience_id: null, footer_text: "", crm_app_id: null },
   );
   const [savedAt, setSavedAt] = useState(false);
   const [domains, setDomains] = useState<{ name: string; status: string }[]>([]);
+  const [connectedApps, setConnectedApps] = useState<ConnectedApp[] | null>(null);
   useEffect(() => {
     api<{ domains: { name: string; status: string }[] }>("GET", "/api/senders").then((d) => setDomains(d.domains || [])).catch(() => {});
+    api<{ apps: ConnectedApp[] }>("GET", "/api/connected-apps").then((d) => setConnectedApps(d.apps || [])).catch(() => setConnectedApps([]));
   }, []);
 
   const save = async () => {
@@ -30,17 +32,19 @@ export function SettingsView() {
     }
   };
 
-  // A connected-app toggle applies on flip (not on the Save button): it is a
-  // switch, not a form field. Persist with the rest of the current form so an
-  // unsaved edit above isn't lost, then refresh status so the feature appears
-  // or disappears immediately.
-  const toggleCrm = async (on: boolean) => {
-    setForm((f) => ({ ...f, crm_enabled: on }));
+  // Picking a contacts source applies on click (not on the Save button): it's a
+  // switch, not a form field. Only one sibling can be the source, so turning one
+  // on clears the others; turning the current one off sets null. Persist with
+  // the rest of the current form so an unsaved edit above isn't lost, then
+  // refresh status so "Import from CRM" appears or disappears immediately.
+  const pickCrm = async (appId: string | null) => {
+    const prev = form.crm_app_id;
+    setForm((f) => ({ ...f, crm_app_id: appId }));
     try {
-      await saveSettings({ ...form, crm_enabled: on });
+      await saveSettings({ ...form, crm_app_id: appId });
       await refreshStatus();
     } catch (e) {
-      setForm((f) => ({ ...f, crm_enabled: !on }));
+      setForm((f) => ({ ...f, crm_app_id: prev }));
       setError((e as Error).message);
     }
   };
@@ -82,25 +86,30 @@ export function SettingsView() {
       <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
         <h2 className="text-sm font-semibold">Connected apps</h2>
         <p className="text-xs text-muted-foreground">
-          Other apps in this workspace the newsletter can use. Each is off until you turn it on — nothing syncs or runs on its own.
+          Other apps in this workspace. Turn one on to pull contacts from it (with recorded consent) in the Audience view — nothing syncs on its own, and only one can be the contacts source at a time.
         </p>
-        {status?.crm_available ? (
-          <div className="flex items-start gap-3 rounded-sm shadow-edge px-3 py-2.5">
-            <span className="mt-0.5 grid size-8 shrink-0 place-items-center rounded-[0.55rem] bg-muted text-muted-foreground">
-              <Database size={16} />
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium">CRM</div>
-              <div className="text-xs text-muted-foreground">
-                {form.crm_enabled
-                  ? "On — import contacts from your CRM in the Audience view. Importing still records consent."
-                  : "Detected in this workspace. Turn on to import contacts (with recorded consent) into an audience."}
-              </div>
-            </div>
-            <Switch checked={!!form.crm_enabled} onCheckedChange={toggleCrm} aria-label="Use the CRM" />
-          </div>
+        {connectedApps === null ? (
+          <p className="text-xs text-muted-foreground">Looking for apps in this workspace…</p>
+        ) : connectedApps.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No other apps found in this workspace.</p>
         ) : (
-          <p className="text-xs text-muted-foreground">No connected apps detected in this workspace.</p>
+          <div className="space-y-1.5">
+            {connectedApps.map((app) => {
+              const on = form.crm_app_id === app.id;
+              return (
+                <div key={app.id} className="flex items-center gap-3 rounded-sm shadow-edge px-3 py-2.5">
+                  <AppGlyph svg={app.icon_svg} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium">{app.name}</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {on ? "Contacts source — import from it in the Audience view" : "Use as the contacts source for imports"}
+                    </div>
+                  </div>
+                  <Switch checked={on} onCheckedChange={(v) => pickCrm(v ? app.id : null)} aria-label={`Use ${app.name} as the contacts source`} />
+                </div>
+              );
+            })}
+          </div>
         )}
       </section>
 
@@ -202,6 +211,17 @@ function AddSender({ domains, onAdd }: { domains: { name: string; status: string
       </div>
       <Button size="sm" disabled={!valid} onClick={add}>Add</Button>
     </div>
+  );
+}
+
+// A sibling app's icon: its own inline SVG (from the app directory), else a
+// generic glyph. The SVG is the app's declared icon.svg, served by the platform
+// directory — same first-party source the dashboard renders inline.
+function AppGlyph({ svg }: { svg: string | null }) {
+  return (
+    <span className="grid size-8 shrink-0 place-items-center overflow-hidden rounded-[0.55rem] bg-muted text-muted-foreground [&_svg]:size-5">
+      {svg ? <span className="contents" dangerouslySetInnerHTML={{ __html: svg }} /> : <AppWindow size={16} />}
+    </span>
   );
 }
 
