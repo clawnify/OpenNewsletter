@@ -41,7 +41,7 @@ export function SettingsView() {
     const prev = form.crm_app_id;
     setForm((f) => ({ ...f, crm_app_id: appId }));
     try {
-      await saveSettings({ ...form, crm_app_id: appId });
+      await saveSettings({ crm_app_id: appId });
       await refreshStatus();
     } catch (e) {
       setForm((f) => ({ ...f, crm_app_id: prev }));
@@ -97,16 +97,23 @@ export function SettingsView() {
             {connectedApps.map((app) => {
               const on = form.crm_app_id === app.id;
               return (
-                <div key={app.id} className="flex items-center gap-3 rounded-sm shadow-edge px-3 py-2.5">
+                <button
+                  key={app.id}
+                  type="button"
+                  onClick={() => pickCrm(on ? null : app.id)}
+                  aria-pressed={on}
+                  className="flex w-full items-center gap-3 rounded-sm px-3 py-2.5 text-left shadow-edge transition hover:bg-muted"
+                >
                   <AppGlyph svg={app.icon_svg} />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm font-medium">{app.name}</div>
                     <div className="truncate text-xs text-muted-foreground">
-                      {on ? "Contacts source — import from it in the Audience view" : "Use as the contacts source for imports"}
+                      {on ? "Contacts source — import from it in the Audience view" : "Pick as your contacts source"}
                     </div>
                   </div>
-                  <Switch checked={on} onCheckedChange={(v) => pickCrm(v ? app.id : null)} aria-label={`Use ${app.name} as the contacts source`} />
-                </div>
+                  {/* Visual state only — the whole card is the control. */}
+                  <Switch checked={on} aria-hidden tabIndex={-1} className="pointer-events-none" />
+                </button>
               );
             })}
           </div>
