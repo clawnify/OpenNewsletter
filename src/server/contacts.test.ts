@@ -133,3 +133,41 @@ describe("allowSignup", () => {
     expect(stored!.ip_hash).not.toContain("203.0.113");
   });
 });
+
+describe("addContact on an address already in the list", () => {
+  it("never downgrades a subscriber or replaces their consent record", async () => {
+    const s = await signup("sub@example.com", T0);
+    await confirmSignup(s.token, "click", T0 + 1);
+    const before = (await get(`SELECT * FROM contacts WHERE email = ?`, ["sub@example.com"])) as any;
+
+    // Added again by hand (no evidence), then again with a CRM consent note.
+    await addContact(AUD, { email: "Sub@Example.com", first_name: "Ann" });
+    await addContact(AUD, { email: "sub@example.com", crm_contact_id: "crm_9" }, {
+      source: "crm_sync",
+      status: "subscribed",
+      evidence: "Opted in at a webinar",
+    });
+
+    const after = (await get(`SELECT * FROM contacts WHERE email = ?`, ["sub@example.com"])) as any;
+    expect(after).toMatchObject({
+      status: "subscribed",
+      consent_source: before.consent_source,
+      consent_at: before.consent_at,
+      consent_evidence: before.consent_evidence,
+      first_name: "Ann",
+      crm_contact_id: "crm_9",
+    });
+  });
+
+  it("upgrades pending to subscribed only when consent is given, and keeps a pending signup's source otherwise", async () => {
+    await signup("p@example.com", T0);
+    await addContact(AUD, { email: "p@example.com" });
+    expect(await get(`SELECT status, consent_source FROM contacts WHERE email = ?`, ["p@example.com"]))
+      .toMatchObject({ status: "pending", consent_source: "signup_form" });
+
+    await addContact(AUD, { email: "p@example.com" }, { source: "import", status: "subscribed", evidence: "Mailchimp export, opted in 2024" });
+    const row = (await get(`SELECT * FROM contacts WHERE email = ?`, ["p@example.com"])) as any;
+    expect(row).toMatchObject({ status: "subscribed", consent_source: "import", consent_evidence: "Mailchimp export, opted in 2024" });
+    expect(row.consent_at).toBeTruthy();
+  });
+});
