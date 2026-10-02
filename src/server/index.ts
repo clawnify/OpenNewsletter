@@ -10,6 +10,7 @@ import { renderEmailHtml } from "./render";
 import { SAMPLE_VALUES, fillSubject, type MergeValues } from "../shared/merge";
 import { sendVerdict } from "./schedule";
 import * as sending from "./sending";
+import * as flows from "./flows";
 import { applyDeliveryEvent } from "./events";
 import { parseResendEvent, verifyResendWebhook, RESEND_EVENTS } from "./providers/resend-webhook";
 import { WebhookSetupError } from "./providers/types";
@@ -91,6 +92,7 @@ async function ensureSeed() {
   // Idempotent, and outside the try: a mistake here must surface, not be read
   // as "already exists".
   for (const sql of sending.DELIVERIES_DDL) await run(sql);
+  for (const sql of flows.FLOWS_DDL) await run(sql);
   for (const sql of [
     `CREATE TABLE IF NOT EXISTS signup_attempts (ip_hash TEXT NOT NULL, at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts ON signup_attempts(ip_hash, at)`,
@@ -645,6 +647,84 @@ function provider(c: any) {
   return getEmailProvider(c.env);
 }
 
+// ── automations wiring ───────────────────────────────────────────────
+//
+// flows.ts is the engine; this gives it the three things it can't do itself:
+// book a wake on the platform queue, send one rendered email, and (below) a
+// route the queue calls back to advance an enrollment. Mirrors how sending.ts
+// is driven from here.
+
+/** The outside-world dependencies the flow engine needs. */
+function flowDeps(c: any): flows.FlowDeps {
+  const origin = new URL(c.req.url).origin;
+  return {
+    scheduleWake: async (enrollmentId, wakeSeq, dueAt) => {
+      if (!hasQueue(c)) return false; // no managed queue: the row waits for one
+      try {
+        await enqueueJob(c.env, {
+          targetUrl: `${origin}/api/jobs/flow-step`,
+          payload: { enrollment_id: enrollmentId, wake_seq: wakeSeq },
+          runAt: dueAt,
+          // Per (enrollment, seq): a double-enqueue of the same wake dedupes,
+          // and a genuinely new wake (new seq) is a new job.
+          idempotencyKey: `flow-wake-${enrollmentId}-${wakeSeq}`,
+        });
+        return true;
+      } catch (e) {
+        console.error("[flow] could not schedule wake", e);
+        return false;
+      }
+    },
+    send: async ({ mailId, contactId, contact, idempotencyKey }) => {
+      const p = await provider(c);
+      if (!p) return { ok: false, error: "No email provider connected." };
+      const row = await get<any>("SELECT * FROM mails WHERE id = ?", [mailId]);
+      if (!row) return { ok: false, error: "Flow email no longer exists." };
+      const s = await getSettings();
+      const from = fromAddress(s);
+      if (!from) return { ok: false, error: "No sender configured." };
+      const mail = parseMail(row);
+      const merge: MergeValues = { first_name: contact.first_name ?? "", last_name: contact.last_name ?? "", email: contact.email };
+      // Per-recipient, unguessable (the contact id is a UUID): a shared link
+      // would let one click unsubscribe the whole list. Same link the send
+      // engine uses (src/server/sending.ts).
+      const unsubscribeUrl = `${origin}/api/unsubscribe?c=${contactId}`;
+      const html = renderEmailHtml(mail, await resolveDesign(mail), s, { merge, unsubscribeUrl });
+      try {
+        const r = await p.sendEmail({
+          from,
+          to: contact.email,
+          subject: fillSubject(mail.title, merge),
+          html,
+          idempotencyKey,
+          headers: { "List-Unsubscribe": `<${unsubscribeUrl}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" },
+        });
+        return { ok: true, id: r.id };
+      } catch (e: any) {
+        // v1: a transport error skips this one email (logged on the step) and
+        // the contact continues the flow. The idempotency key still protects
+        // against a duplicate if the send actually landed. A retry-with-backoff
+        // of the individual email is a later refinement.
+        return { ok: false, error: e?.message || "Send failed" };
+      }
+    },
+  };
+}
+
+/** A mail is sendable in a flow when it has a subject, some body, and a sender. */
+function flowEmailReady(s: Settings): (mailId: number) => Promise<string | null> {
+  return async (mailId: number) => {
+    const row = await get<{ title: string; blocks: string }>("SELECT title, blocks FROM mails WHERE id = ?", [mailId]);
+    if (!row) return "This newsletter no longer exists.";
+    if (!row.title?.trim()) return "This newsletter has no subject.";
+    let blocks: Block[] = [];
+    try { blocks = JSON.parse(row.blocks || "[]"); } catch { /* corrupt → empty */ }
+    if (!blocks.length) return "This newsletter is empty — add some content before turning the automation on.";
+    if (!fromAddress(s)) return "Set a sender (from name and email) in Settings before turning this on.";
+    return null;
+  };
+}
+
 /** Local escape for the subscriber-facing HTML responses below. */
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (ch) =>
@@ -1035,6 +1115,19 @@ app.get("/api/confirm", async (c) => {
 app.post("/api/confirm", async (c) => {
   const token = c.req.query("token") || "";
   const contact = token ? await contacts.confirmSignup(token, `double opt-in: confirmed by click at ${new Date().toISOString()}`) : null;
+  // Just became `subscribed`: enroll into any live welcome-style automation.
+  // Best-effort — consent is already recorded, so a scheduling hiccup here must
+  // never turn a successful confirm into an error.
+  if (contact) {
+    try {
+      await flows.enrollOnSubscribed(
+        { id: contact.id, audience_id: contact.audience_id, email: contact.email, first_name: contact.first_name, last_name: contact.last_name, consent_source: contact.consent_source },
+        flowDeps(c),
+      );
+    } catch (e) {
+      console.error("[flow] enroll on confirm failed", e);
+    }
+  }
   const s = await getSettings();
   const body = contact
     ? `<h1>You're subscribed</h1><p>${escapeHtml(contact.email)} will receive ${escapeHtml(s.publication_name || "our newsletter")}.</p>`
@@ -1351,6 +1444,104 @@ app.post("/api/jobs/send-mail", async (c) => {
   // timestamp compare they cannot answer — see sendVerdict.
   const r = await sendMailNow(c, id, body.from, body.scheduled_for ?? null);
   return c.json(r.body, r.status);
+});
+
+// Queue callback that advances one flow enrollment. Same signed-delivery auth
+// as send-mail. Always answers 2xx on a handled wake (even a no-op one) so the
+// queue marks the job done; a thrown error surfaces as 500 and is retried.
+app.post("/api/jobs/flow-step", async (c) => {
+  const raw = await c.req.text();
+  const ok = await verifyDelivery(raw, {
+    signature: c.req.header("X-Queue-Signature") ?? null,
+    timestamp: c.req.header("X-Queue-Timestamp") ?? null,
+    keyId: c.req.header("X-Queue-Key-Id") ?? null,
+  });
+  if (!ok) return c.json({ error: "unauthorized" }, 401);
+
+  let body: { enrollment_id?: string; wake_seq?: number };
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return c.json({ error: "bad_request" }, 400);
+  }
+  if (!body.enrollment_id || !Number.isFinite(body.wake_seq)) return c.json({ error: "bad_request" }, 400);
+  const result = await flows.runWake(body.enrollment_id, Number(body.wake_seq), flowDeps(c));
+  return c.json({ ok: true, ...result });
+});
+
+// ── automations (flows) CRUD ─────────────────────────────────────────
+
+app.get("/api/flows", async (c) => c.json(await flows.listFlows()));
+
+app.get("/api/flows/:id", async (c) => {
+  const flow = await flows.getFlow(c.req.param("id"));
+  if (!flow) return c.json({ error: "Not found" }, 404);
+  const steps = (await flows.stepsOf(flow.id)).filter((s) => !s.deleted_at);
+  return c.json({ ...flow, steps });
+});
+
+// Create an automation from a prebuilt. v1 ships one: the welcome series
+// (email now, +3 days, +4 days), the most-asked-for flow in the user research.
+// Lands in `draft` with three editable newsletters; the operator fills them in
+// and turns it on. Other prebuilts (winback, anniversary) are a later change.
+app.post("/api/flows", async (c) => {
+  const b = await c.req.json<{ prebuilt?: string; name?: string; audience_id?: string }>().catch(() => ({}) as any);
+  if (b.prebuilt && b.prebuilt !== "welcome") return c.json({ error: `Unknown prebuilt "${b.prebuilt}"` }, 400);
+  const s = await getSettings();
+  const audienceId = b.audience_id || s.default_audience_id || (await contacts.defaultAudience()).id;
+
+  const flow = await flows.createFlow({
+    name: b.name || "Welcome series",
+    trigger_type: "subscribed",
+    trigger_config: { audience_id: audienceId },
+    reentry: "none",
+  });
+
+  // Each email is its own mails row, copied from a template skeleton like any
+  // newsletter, so editing it never touches a template or another flow.
+  const t = await get<any>("SELECT * FROM templates WHERE slug = ?", ["classic-editorial"]);
+  const skeleton = t ? JSON.parse(t.skeleton) : {};
+  const makeMail = async (title: string): Promise<number> => {
+    const m = mailFromSkeleton(skeleton, s.publication_name || "");
+    const row = await get<any>(
+      `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      [m.eyebrow, title, m.subtitle, m.byline_name, m.byline_date, m.feature_image, JSON.stringify(m.blocks), "classic-editorial", audienceId],
+    );
+    return row.id as number;
+  };
+
+  const DAY = 86400;
+  const e1 = await flows.addStep(flow.id, "email", { mail_id: await makeMail("Welcome aboard") });
+  const d1 = await flows.addStep(flow.id, "delay", { seconds: 3 * DAY });
+  const e2 = await flows.addStep(flow.id, "email", { mail_id: await makeMail("Getting the most out of this") });
+  const d2 = await flows.addStep(flow.id, "delay", { seconds: 4 * DAY });
+  const e3 = await flows.addStep(flow.id, "email", { mail_id: await makeMail("One more thing") });
+  const end = await flows.addStep(flow.id, "end");
+  await flows.setNext(e1.id, d1.id);
+  await flows.setNext(d1.id, e2.id);
+  await flows.setNext(e2.id, d2.id);
+  await flows.setNext(d2.id, e3.id);
+  await flows.setNext(e3.id, end.id);
+  await flows.setEntry(flow.id, e1.id);
+
+  return c.json(await flows.getFlow(flow.id), 201);
+});
+
+// Turn an automation on / pause / resume / archive. Turning it live runs the
+// pre-flight check first and refuses with the list of what would misbehave.
+app.post("/api/flows/:id/status", async (c) => {
+  const id = c.req.param("id");
+  const { status } = await c.req.json<{ status: flows.FlowStatus }>();
+  if (!["draft", "live", "paused", "archived"].includes(status)) return c.json({ error: "bad status" }, 400);
+  const flow = await flows.getFlow(id);
+  if (!flow) return c.json({ error: "Not found" }, 404);
+  if (status === "live") {
+    const issues = await flows.validateFlow(id, flowEmailReady(await getSettings()));
+    if (issues.length) return c.json({ error: "This automation isn't ready to turn on yet.", issues }, 400);
+  }
+  await flows.setFlowStatus(id, status, flowDeps(c));
+  return c.json(await flows.getFlow(id));
 });
 
 // ── delivery events (Resend webhook) ─────────────────────────────────
