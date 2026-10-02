@@ -65,8 +65,11 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 export type DeliveryEvent =
   | { kind: "delivered"; deliveryId: string | null; messageId: string; at: string }
-  | { kind: "bounced"; deliveryId: string | null; messageId: string; at: string; permanent: boolean; reason: string }
-  | { kind: "complained"; deliveryId: string | null; messageId: string; at: string }
+  // `to` (the recipient the provider reports) lets a hard bounce or complaint
+  // suppress the contact even when there is no delivery row — e.g. a flow email,
+  // which sends without one.
+  | { kind: "bounced"; deliveryId: string | null; messageId: string; at: string; permanent: boolean; reason: string; to: string | null }
+  | { kind: "complained"; deliveryId: string | null; messageId: string; at: string; to: string | null }
   | { kind: "opened"; deliveryId: string | null; messageId: string; at: string }
   | { kind: "clicked"; deliveryId: string | null; messageId: string; at: string };
 
@@ -77,6 +80,7 @@ export function parseResendEvent(body: unknown): DeliveryEvent | null {
     created_at?: string;
     data?: {
       email_id?: string;
+      to?: string[] | string;
       tags?: Record<string, string> | { name: string; value: string }[];
       bounce?: { type?: string; message?: string };
     };
@@ -85,6 +89,8 @@ export function parseResendEvent(body: unknown): DeliveryEvent | null {
   if (!e?.type || !messageId) return null;
   const at = e.created_at || new Date().toISOString();
   const deliveryId = tagValue(e.data?.tags, DELIVERY_TAG);
+  const toRaw = Array.isArray(e.data?.to) ? e.data?.to[0] : e.data?.to;
+  const to = toRaw?.trim().toLowerCase() || null;
 
   switch (e.type) {
     case "email.delivered":
@@ -95,10 +101,10 @@ export function parseResendEvent(body: unknown): DeliveryEvent | null {
       // mailing a real subscriber for good, the opposite error only costs one
       // more attempt.
       const permanent = e.data?.bounce?.type === "Permanent";
-      return { kind: "bounced", deliveryId, messageId, at, permanent, reason: e.data?.bounce?.message || "" };
+      return { kind: "bounced", deliveryId, messageId, at, permanent, reason: e.data?.bounce?.message || "", to };
     }
     case "email.complained":
-      return { kind: "complained", deliveryId, messageId, at };
+      return { kind: "complained", deliveryId, messageId, at, to };
     case "email.opened":
       return { kind: "opened", deliveryId, messageId, at };
     case "email.clicked":
