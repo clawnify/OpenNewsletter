@@ -86,12 +86,12 @@ export function SettingsView() {
       <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
         <h2 className="text-sm font-semibold">Connected apps</h2>
         <p className="text-xs text-muted-foreground">
-          Other apps in this workspace. Turn one on to pull contacts from it (with recorded consent) in the Audience view — nothing syncs on its own, and only one can be the contacts source at a time.
+          Apps in this workspace that can be your contacts source. Turn one on to import from it (with recorded consent) in the Audience view — nothing syncs on its own, and only one can be the source at a time.
         </p>
         {connectedApps === null ? (
-          <p className="text-xs text-muted-foreground">Looking for apps in this workspace…</p>
+          <p className="text-xs text-muted-foreground">Looking for a contacts app in this workspace…</p>
         ) : connectedApps.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No other apps found in this workspace.</p>
+          <p className="text-xs text-muted-foreground">No app here provides contacts yet. A CRM declares this with <code className="rounded bg-muted px-1">provides: ["contacts"]</code>.</p>
         ) : (
           <div className="space-y-1.5">
             {connectedApps.map((app) => {

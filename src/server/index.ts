@@ -830,23 +830,29 @@ app.delete("/api/audiences/:id/contacts/:contactId", async (c) => {
 // picker; a contact becomes a subscriber here only with stated consent
 // evidence, and keeps the CRM id so an unsubscribe can be noted back there.
 
-// Discover the org's other apps so the operator can pick a contacts source,
-// without a configured id. Calls the platform app directory with this app's
-// service token (same transport crm.ts uses for the proxy), drops this app
-// itself, and says which sibling is the current CRM pick.
+// Discover a contacts source among the org's other apps, without a configured
+// id. Calls the platform app directory with this app's service token (same
+// transport crm.ts uses for the proxy), drops this app itself, and keeps only
+// apps that DECLARE they provide contacts (clawnify.json `app.provides`) — so a
+// video or dialer app is never offered as a contacts source. Also says which
+// sibling is the current pick.
+const CONTACTS_CAPABILITY = "contacts";
 app.get("/api/connected-apps", async (c) => {
   const token = (c.env as { CLAWNIFY_TOKEN?: string }).CLAWNIFY_TOKEN;
   const crm_app_id = (await getSettings()).crm_app_id;
   if (!token) return c.json({ apps: [], crm_app_id });
   const selfUrl = new URL(c.req.url).origin;
-  let apps: Array<{ id: string; slug: string; name: string; icon_glyph: string | null; icon_svg: string | null; framework: string | null; url: string }> = [];
+  type Sib = { id: string; slug: string; name: string; icon_glyph: string | null; icon_svg: string | null; framework: string | null; provides?: string[]; url: string };
+  let apps: Sib[] = [];
   try {
     const res = await fetch("https://provision.clawnify.com/v1/apps/directory", {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (res.ok) {
-      const data = (await res.json()) as { apps?: typeof apps };
-      apps = (data.apps || []).filter((a) => a.url !== selfUrl);
+      const data = (await res.json()) as { apps?: Sib[] };
+      apps = (data.apps || []).filter(
+        (a) => a.url !== selfUrl && Array.isArray(a.provides) && a.provides.includes(CONTACTS_CAPABILITY),
+      );
     }
   } catch {
     /* directory unreachable (no platform / offline) → report none, stay standalone */

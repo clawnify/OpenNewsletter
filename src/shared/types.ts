@@ -153,6 +153,8 @@ export interface ConnectedApp {
   icon_glyph: string | null;
   icon_svg: string | null;
   framework: string | null;
+  /** Capabilities the app declares (clawnify.json `app.provides`). */
+  provides: string[];
   url: string;
 }
 
