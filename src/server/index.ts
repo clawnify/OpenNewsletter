@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { CredentialBinding } from "@clawnify/connections";
 import { enqueueJob, verifyDelivery } from "@clawnify/queue";
-import { initDB, query, get, run } from "./db";
+import { initDB, query, get, run, addColumns } from "./db";
 import * as contacts from "./contacts";
 import * as crm from "./crm";
 import { getEmailProvider } from "./providers";
@@ -61,8 +61,10 @@ async function ensureSeed() {
     );
   }
   await run(`INSERT OR IGNORE INTO settings (id) VALUES (1)`);
-  // Additive migrations for DBs created before these columns existed.
-  for (const sql of [
+  // Additive migrations for DBs created before these columns existed. A
+  // failure other than "already exists" leaves `seeded` false so the next
+  // request tries again.
+  const columnsOk = await addColumns([
     `ALTER TABLE mails ADD COLUMN design_mobile TEXT`,
     `ALTER TABLE mails ADD COLUMN blocks TEXT NOT NULL DEFAULT '[]'`,
     `ALTER TABLE mails ADD COLUMN conversation TEXT NOT NULL DEFAULT '[]'`,
@@ -77,13 +79,7 @@ async function ensureSeed() {
     `ALTER TABLE contacts ADD COLUMN confirm_sent_at TEXT`,
     `ALTER TABLE contacts ADD COLUMN confirm_attempts INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE contacts ADD COLUMN confirm_error TEXT`,
-  ]) {
-    try {
-      await run(sql);
-    } catch {
-      /* column already exists */
-    }
-  }
+  ]);
   // Idempotent, and outside the try: a mistake here must surface, not be read
   // as "already exists".
   for (const sql of sending.DELIVERIES_DDL) await run(sql);
@@ -92,7 +88,7 @@ async function ensureSeed() {
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts ON signup_attempts(ip_hash, at)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at)`,
   ]) await run(sql);
-  seeded = true;
+  seeded = columnsOk;
 }
 
 app.use("*", async (c, next) => {
