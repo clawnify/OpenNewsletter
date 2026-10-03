@@ -147,18 +147,19 @@ describe("the default audience", () => {
 
   it("drops the empty duplicates the old race created, and keeps any list in use", async () => {
     const at = "2026-10-02 09:13:42";
-    for (const id of ["aud_a", "aud_b", "aud_c", "aud_d", "aud_e"])
+    for (const id of ["aud_a", "aud_b", "aud_c", "aud_d", "aud_e", "aud_f"])
       await run(`INSERT INTO audiences (id, name, description, created_at) VALUES (?, 'Subscribers', '', ?)`, [id, at]);
     await run(`INSERT INTO audiences (id, name, description, created_at) VALUES ('aud_later', 'Subscribers', '', '2026-10-03 08:00:00')`);
     await addContact("aud_b", { email: "x@example.com" });
     await run(`INSERT INTO settings (id, default_audience_id) VALUES (1, 'aud_c')`);
     await run(`INSERT INTO mails (title, audience_id) VALUES ('Hi', 'aud_d')`);
+    await run(`INSERT INTO flows (id, name, trigger_type, trigger_config) VALUES ('flo_1', 'Welcome', 'subscribed', '{"audience_id":"aud_e"}')`);
 
     await dropDuplicateDefaultAudiences();
     await dropDuplicateDefaultAudiences();
 
     const left = (await listAudiences()).map((a) => a.id);
-    expect(left).toEqual(["aud_a", "aud_b", "aud_c", "aud_d", "aud_later"]);
+    expect(left).toEqual(["aud_a", "aud_b", "aud_c", "aud_d", "aud_e", "aud_later"]);
     expect((await defaultAudience()).id).toBe("aud_a");
   });
 });
