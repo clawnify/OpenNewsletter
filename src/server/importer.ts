@@ -139,17 +139,20 @@ export async function importChunk(audienceId: string, rows: Clean[], nowIso = ne
   }
   const upgrade = consent.filter((r) => existing.get(r.e) === "pending");
   if (upgrade.length) {
-    // UPDATE ... FROM: one index lookup per row. A correlated subquery per
-    // column re-scanned the whole chunk for every row.
+    // Correlated subqueries, not UPDATE ... FROM json_each: SQLite plans the
+    // FROM form as a scan of the whole audience, so its cost grows with the
+    // list. This form looks up only the chunk's addresses by index.
+    const j = JSON.stringify(upgrade);
     await run(
       `UPDATE contacts
           SET status = 'subscribed', consent_source = 'import',
-              consent_at = COALESCE(json_extract(j.value, '$.at'), ?),
-              consent_evidence = json_extract(j.value, '$.ev')
-         FROM json_each(?) j
-        WHERE contacts.audience_id = ? AND contacts.status = 'pending'
-          AND contacts.email = json_extract(j.value, '$.e')`,
-      [nowIso, JSON.stringify(upgrade), audienceId],
+              consent_at = COALESCE((SELECT json_extract(j.value, '$.at') FROM json_each(?) j
+                                      WHERE json_extract(j.value, '$.e') = contacts.email), ?),
+              consent_evidence = (SELECT json_extract(j.value, '$.ev') FROM json_each(?) j
+                                   WHERE json_extract(j.value, '$.e') = contacts.email)
+        WHERE audience_id = ? AND status = 'pending'
+          AND email IN (SELECT json_extract(value, '$.e') FROM json_each(?))`,
+      [j, nowIso, j, audienceId, j],
     );
   }
   // Fill names nobody has typed yet; never overwrite one. Only rows that gain
@@ -159,13 +162,16 @@ export async function importChunk(audienceId: string, rows: Clean[], nowIso = ne
     return !!h && ((!h.first_name && !!r.f) || (!h.last_name && !!r.l));
   });
   if (named.length) {
+    const j = JSON.stringify(named);
     await run(
       `UPDATE contacts
-          SET first_name = CASE WHEN contacts.first_name = '' THEN json_extract(j.value, '$.f') ELSE contacts.first_name END,
-              last_name = CASE WHEN contacts.last_name = '' THEN json_extract(j.value, '$.l') ELSE contacts.last_name END
-         FROM json_each(?) j
-        WHERE contacts.audience_id = ? AND contacts.email = json_extract(j.value, '$.e')`,
-      [JSON.stringify(named), audienceId],
+          SET first_name = CASE WHEN first_name = '' THEN COALESCE((SELECT json_extract(j.value, '$.f') FROM json_each(?) j
+                                 WHERE json_extract(j.value, '$.e') = contacts.email), '') ELSE first_name END,
+              last_name = CASE WHEN last_name = '' THEN COALESCE((SELECT json_extract(j.value, '$.l') FROM json_each(?) j
+                                 WHERE json_extract(j.value, '$.e') = contacts.email), '') ELSE last_name END
+        WHERE audience_id = ?
+          AND email IN (SELECT json_extract(value, '$.e') FROM json_each(?))`,
+      [j, j, audienceId, j],
     );
   }
   return out;
