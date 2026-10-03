@@ -287,7 +287,7 @@ function FileMapping({ file, onChange }: { file: ParsedFile; onChange: (p: Parti
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <span>Everyone in this file is</span>
           <ChoiceSelect
-            value={file.fileStatus ?? "column"}
+            value={file.fileStatus ?? (file.cols.status >= 0 ? "column" : "subscribed")}
             withColumn={file.cols.status >= 0}
             onChange={(v) => onChange({ fileStatus: v === "column" ? null : (v as StatusChoice) })}
           />

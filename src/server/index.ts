@@ -823,20 +823,20 @@ app.get("/api/audiences/:id/export", async (c) => {
   if (!audience) return c.json({ error: "Audience not found" }, 404);
   const cols = importer.EXPORT_COLUMNS;
   const enc = new TextEncoder();
-  // Streamed a page at a time, so a large list never sits in memory whole.
+  // Streamed a page at a time, read only as fast as the download takes it,
+  // so a large list never sits in memory whole.
+  let after = "";
   const body = new ReadableStream<Uint8Array>({
-    async start(ctrl) {
+    start(ctrl) {
+      ctrl.enqueue(enc.encode(toCsv([...cols], [])));
+    },
+    async pull(ctrl) {
       try {
-        ctrl.enqueue(enc.encode(toCsv([...cols], [])));
-        let after = "";
-        for (;;) {
-          const page = await importer.exportPage(audienceId, after, 1000);
-          if (!page.length) break;
-          const csv = toCsv([], page.map((r) => cols.map((k) => r[k])));
-          ctrl.enqueue(enc.encode(csv.slice(csv.indexOf("\r\n") + 2)));
-          after = String(page[page.length - 1].id);
-        }
-        ctrl.close();
+        const page = await importer.exportPage(audienceId, after, 1000);
+        if (!page.length) return ctrl.close();
+        const csv = toCsv([], page.map((r) => cols.map((k) => r[k])));
+        ctrl.enqueue(enc.encode(csv.slice(csv.indexOf("\r\n") + 2)));
+        after = String(page[page.length - 1].id);
       } catch (err) {
         ctrl.error(err);
       }

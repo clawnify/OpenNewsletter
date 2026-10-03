@@ -27,6 +27,9 @@ export const IMPORT_CHUNK = 500;
 export const MIN_EVIDENCE = 12;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const STATUSES = new Set(["subscribed", "pending", "unsubscribed", "bounced"]);
+// An address listed twice keeps its most cautious status: an opt-out anywhere
+// in the file wins over a subscribed row elsewhere in it.
+const CAUTION: Record<ImportRow["status"], number> = { subscribed: 0, pending: 1, unsubscribed: 2, bounced: 3 };
 
 export interface ImportOutcome {
   /** New rows, by the status they landed in. */
@@ -49,7 +52,7 @@ const clip = (v: unknown, n: number) => (typeof v === "string" ? v.trim().slice(
 export function cleanRows(input: unknown, evidence: string, source: string): { rows: Clean[]; rejected: ImportOutcome["rejected"] } {
   const rows: Clean[] = [];
   const rejected: ImportOutcome["rejected"] = [];
-  const seen = new Set<string>();
+  const seen = new Map<string, number>(); // email -> index in rows
   if (!Array.isArray(input)) return { rows, rejected };
   for (const r of input as Partial<ImportRow>[]) {
     const e = clip(r?.email, 320).toLowerCase();
@@ -57,25 +60,28 @@ export function cleanRows(input: unknown, evidence: string, source: string): { r
       rejected.push({ email: e || "(blank)", reason: "not an email address" });
       continue;
     }
-    if (seen.has(e)) {
-      rejected.push({ email: e, reason: "appears twice in the file" });
-      continue;
-    }
-    seen.add(e);
     const s = STATUSES.has(r?.status as string) ? (r!.status as ImportRow["status"]) : "pending";
     const at = typeof r?.opted_in_at === "string" && !Number.isNaN(Date.parse(r.opted_in_at)) ? new Date(r.opted_in_at).toISOString() : null;
     const rowEvidence = clip(r?.evidence, 1000);
     // Subscribed needs consent someone stated: the row's own record, or the
     // operator's sentence for the whole file. Without it: pending.
     const ev = rowEvidence.length >= MIN_EVIDENCE ? rowEvidence : evidence.length >= MIN_EVIDENCE ? `${evidence} (${source})` : "";
-    rows.push({
+    const clean: Clean = {
       e,
       f: clip(r?.first_name, 200),
       l: clip(r?.last_name, 200),
       s: s === "subscribed" && !ev ? "pending" : s,
       at,
       ev: s === "subscribed" ? ev : "",
-    });
+    };
+    const prev = seen.get(e);
+    if (prev !== undefined) {
+      rejected.push({ email: e, reason: "appears twice in the file" });
+      if (CAUTION[clean.s] > CAUTION[rows[prev].s]) rows[prev] = clean;
+      continue;
+    }
+    seen.set(e, rows.length);
+    rows.push(clean);
   }
   return { rows, rejected };
 }

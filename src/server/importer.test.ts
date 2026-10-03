@@ -64,12 +64,24 @@ describe("import into an empty list", () => {
   });
 
   it("refuses bad addresses and in-file duplicates, and says why", async () => {
-    const r = await importRows([row("nope", "subscribed"), row("x@example.com", "subscribed"), row("X@example.com ", "unsubscribed")]);
+    const r = await importRows([row("nope", "subscribed"), row("x@example.com", "subscribed"), row("X@example.com ", "subscribed")]);
     expect(r.added.subscribed).toBe(1);
     expect(r.rejected).toEqual([
       { email: "nope", reason: "not an email address" },
       { email: "x@example.com", reason: "appears twice in the file" },
     ]);
+  });
+
+  it("keeps the opt-out when an address is listed twice with different statuses", async () => {
+    const r = await importRows([
+      row("x@example.com", "subscribed"),
+      row("x@example.com", "unsubscribed"),
+      row("y@example.com", "bounced"),
+      row("y@example.com", "subscribed"),
+    ]);
+    expect(r.added).toEqual({ subscribed: 0, pending: 0, unsubscribed: 1, bounced: 1 });
+    expect(await byEmail("x@example.com")).toMatchObject({ status: "unsubscribed" });
+    expect(await byEmail("y@example.com")).toMatchObject({ status: "bounced" });
   });
 
   it("writes a full chunk in one go", async () => {
