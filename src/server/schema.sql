@@ -264,3 +264,5 @@ CREATE INDEX IF NOT EXISTS idx_contacts_crm ON contacts(audience_id, crm_contact
   WHERE crm_contact_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_confirm
   ON contacts(confirm_token) WHERE confirm_token IS NOT NULL;
+-- Audience view pages newest first (src/server/contacts.ts pageContacts).
+CREATE INDEX IF NOT EXISTS idx_contacts_created ON contacts(audience_id, created_at, id);

@@ -141,6 +141,62 @@ export async function listContacts(audienceId: string): Promise<Contact[]> {
   )) as unknown as Contact[];
 }
 
+export async function findContact(audienceId: string, email: string): Promise<Contact | null> {
+  return (await get(`SELECT ${CONTACT_COLS} FROM contacts WHERE audience_id = ? AND email = ?`, [
+    audienceId,
+    normalize(email),
+  ])) as Contact | null;
+}
+
+/** Status of each address that is in the audience; absent = not in it. */
+export async function statusesOf(audienceId: string, emails: string[]): Promise<Map<string, ContactStatus>> {
+  if (!emails.length) return new Map();
+  const rows = (await query(
+    `SELECT email, status FROM contacts
+      WHERE audience_id = ? AND email IN (SELECT value FROM json_each(?))`,
+    [audienceId, JSON.stringify(emails.map(normalize))],
+  )) as unknown as { email: string; status: ContactStatus }[];
+  return new Map(rows.map((r) => [r.email, r.status]));
+}
+
+/**
+ * One page of an audience, newest first, optionally searched (email or name)
+ * and filtered by status. `cursor` is the `next` of the previous page.
+ */
+export async function pageContacts(
+  audienceId: string,
+  opts: { search?: string; status?: string; cursor?: string; limit: number },
+): Promise<{ contacts: Contact[]; next: string | null }> {
+  const where = [`audience_id = ?`];
+  const params: unknown[] = [audienceId];
+  const term = opts.search?.trim().toLowerCase();
+  if (term) {
+    const like = `%${term.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+    where.push(`(email LIKE ? ESCAPE '\\' OR lower(first_name) LIKE ? ESCAPE '\\' OR lower(last_name) LIKE ? ESCAPE '\\')`);
+    params.push(like, like, like);
+  }
+  if (opts.status && ["pending", "subscribed", "unsubscribed", "bounced"].includes(opts.status)) {
+    where.push(`status = ?`);
+    params.push(opts.status);
+  }
+  const sep = opts.cursor?.lastIndexOf("|") ?? -1;
+  if (opts.cursor && sep > 0) {
+    const at = opts.cursor.slice(0, sep);
+    where.push(`(created_at < ? OR (created_at = ? AND id < ?))`);
+    params.push(at, at, opts.cursor.slice(sep + 1));
+  }
+  params.push(opts.limit + 1);
+  const rows = (await query(
+    `SELECT ${CONTACT_COLS} FROM contacts WHERE ${where.join(" AND ")}
+      ORDER BY created_at DESC, id DESC LIMIT ?`,
+    params,
+  )) as unknown as Contact[];
+  const more = rows.length > opts.limit;
+  const page = more ? rows.slice(0, opts.limit) : rows;
+  const last = page[page.length - 1];
+  return { contacts: page, next: more && last ? `${last.created_at}|${last.id}` : null };
+}
+
 /**
  * Add a contact directly (operator action or import).
  *
@@ -170,22 +226,29 @@ export async function addContact(
     // address that hard-bounced: re-importing it only bounces again, and bounce
     // rates are what mailbox providers judge a sender by.
     if (existing.status === "unsubscribed" || existing.status === "bounced") return existing;
+    // Consent only moves forward. A subscriber added again (by hand, or from
+    // the CRM) stays subscribed with the record of how they first agreed: that
+    // record is what answers "when did this person opt in". A pending row only
+    // changes its consent fields when this call brings consent.
+    const upgrade = existing.status === "pending" && status === "subscribed";
     await run(
-      `UPDATE contacts SET first_name = ?, last_name = ?, status = ?,
-              consent_source = ?, consent_at = ?, consent_evidence = ?,
+      `UPDATE contacts SET first_name = ?, last_name = ?,
               crm_contact_id = COALESCE(?, crm_contact_id)
          WHERE id = ?`,
       [
         input.first_name ?? existing.first_name,
         input.last_name ?? existing.last_name,
-        status,
-        consent.source,
-        status === "subscribed" ? (existing.consent_at ?? now()) : existing.consent_at,
-        consent.evidence ?? "",
         input.crm_contact_id ?? null,
         existing.id,
       ],
     );
+    if (upgrade) {
+      await run(
+        `UPDATE contacts SET status = 'subscribed', consent_source = ?, consent_at = ?, consent_evidence = ?
+           WHERE id = ? AND status = 'pending'`,
+        [consent.source, now(), consent.evidence ?? "", existing.id],
+      );
+    }
     return (await get(`SELECT ${CONTACT_COLS} FROM contacts WHERE id = ?`, [
       existing.id,
     ])) as Contact;
