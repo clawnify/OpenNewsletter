@@ -89,13 +89,14 @@ export function cleanRows(input: unknown, evidence: string, source: string): { r
 export async function importChunk(audienceId: string, rows: Clean[], nowIso = new Date().toISOString()): Promise<Omit<ImportOutcome, "rejected">> {
   const out = { added: { subscribed: 0, pending: 0, unsubscribed: 0, bounced: 0 }, confirmed: 0, suppressed: 0, unchanged: 0 };
   if (!rows.length) return out;
-  const existing = new Map(
+  const here = new Map(
     ((await query(
-      `SELECT email, status FROM contacts
-        WHERE audience_id = ? AND email IN (SELECT json_extract(value, '$.e') FROM json_each(?))`,
-      [audienceId, JSON.stringify(rows.map((r) => ({ e: r.e })))],
-    )) as unknown as { email: string; status: string }[]).map((r) => [r.email, r.status]),
+      `SELECT email, status, first_name, last_name FROM contacts
+        WHERE audience_id = ? AND email IN (SELECT value FROM json_each(?))`,
+      [audienceId, JSON.stringify(rows.map((r) => r.e))],
+    )) as unknown as { email: string; status: string; first_name: string; last_name: string }[]).map((r) => [r.email, r]),
   );
+  const existing = new Map([...here].map(([e, r]) => [e, r.status]));
 
   const fresh = rows.filter((r) => !existing.has(r.e));
   const optOut = rows.filter((r) => existing.has(r.e) && (r.s === "unsubscribed" || r.s === "bounced"));
@@ -136,33 +137,35 @@ export async function importChunk(audienceId: string, rows: Clean[], nowIso = ne
       [status, status, nowIso, audienceId, JSON.stringify(emails)],
     );
   }
-  if (consent.length) {
-    const j = JSON.stringify(consent);
+  const upgrade = consent.filter((r) => existing.get(r.e) === "pending");
+  if (upgrade.length) {
+    // UPDATE ... FROM: one index lookup per row. A correlated subquery per
+    // column re-scanned the whole chunk for every row.
     await run(
       `UPDATE contacts
           SET status = 'subscribed', consent_source = 'import',
-              consent_at = COALESCE((SELECT json_extract(j.value, '$.at') FROM json_each(?) j
-                                      WHERE json_extract(j.value, '$.e') = contacts.email), ?),
-              consent_evidence = (SELECT json_extract(j.value, '$.ev') FROM json_each(?) j
-                                   WHERE json_extract(j.value, '$.e') = contacts.email)
-        WHERE audience_id = ? AND status = 'pending'
-          AND email IN (SELECT json_extract(value, '$.e') FROM json_each(?))`,
-      [j, nowIso, j, audienceId, j],
+              consent_at = COALESCE(json_extract(j.value, '$.at'), ?),
+              consent_evidence = json_extract(j.value, '$.ev')
+         FROM json_each(?) j
+        WHERE contacts.audience_id = ? AND contacts.status = 'pending'
+          AND contacts.email = json_extract(j.value, '$.e')`,
+      [nowIso, JSON.stringify(upgrade), audienceId],
     );
   }
-  // Fill names nobody has typed yet; never overwrite one.
-  const named = rows.filter((r) => existing.has(r.e) && (r.f || r.l));
+  // Fill names nobody has typed yet; never overwrite one. Only rows that gain
+  // a name are written, so re-importing the same file writes nothing.
+  const named = rows.filter((r) => {
+    const h = here.get(r.e);
+    return !!h && ((!h.first_name && !!r.f) || (!h.last_name && !!r.l));
+  });
   if (named.length) {
-    const j = JSON.stringify(named);
     await run(
       `UPDATE contacts
-          SET first_name = CASE WHEN first_name = '' THEN COALESCE((SELECT json_extract(j.value, '$.f') FROM json_each(?) j
-                                 WHERE json_extract(j.value, '$.e') = contacts.email), '') ELSE first_name END,
-              last_name = CASE WHEN last_name = '' THEN COALESCE((SELECT json_extract(j.value, '$.l') FROM json_each(?) j
-                                 WHERE json_extract(j.value, '$.e') = contacts.email), '') ELSE last_name END
-        WHERE audience_id = ? AND (first_name = '' OR last_name = '')
-          AND email IN (SELECT json_extract(value, '$.e') FROM json_each(?))`,
-      [j, j, audienceId, j],
+          SET first_name = CASE WHEN contacts.first_name = '' THEN json_extract(j.value, '$.f') ELSE contacts.first_name END,
+              last_name = CASE WHEN contacts.last_name = '' THEN json_extract(j.value, '$.l') ELSE contacts.last_name END
+         FROM json_each(?) j
+        WHERE contacts.audience_id = ? AND contacts.email = json_extract(j.value, '$.e')`,
+      [JSON.stringify(named), audienceId],
     );
   }
   return out;
