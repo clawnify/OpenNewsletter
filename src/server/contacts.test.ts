@@ -12,6 +12,8 @@ import {
   allowSignup,
   confirmSignup,
   confirmationsDue,
+  defaultAudience,
+  dropDuplicateDefaultAudiences,
   listAudiences,
   peekConfirmation,
   recordConfirmation,
@@ -131,5 +133,32 @@ describe("allowSignup", () => {
     expect(await allowSignup("203.0.113.9", T0 + 3600_000 + 100)).toBe(true);
     const stored = await get<{ ip_hash: string }>(`SELECT ip_hash FROM signup_attempts LIMIT 1`);
     expect(stored!.ip_hash).not.toContain("203.0.113");
+  });
+});
+
+describe("the default audience", () => {
+  beforeEach(() => useSqlite());
+
+  it("is created once when a fresh install's first requests arrive together", async () => {
+    const got = await Promise.all([defaultAudience(), defaultAudience(), defaultAudience(), defaultAudience()]);
+    expect(new Set(got.map((a) => a.id)).size).toBe(1);
+    expect(await get(`SELECT COUNT(*) AS n FROM audiences`)).toMatchObject({ n: 1 });
+  });
+
+  it("drops the empty duplicates the old race created, and keeps any list in use", async () => {
+    const at = "2026-10-02 09:13:42";
+    for (const id of ["aud_a", "aud_b", "aud_c", "aud_d", "aud_e"])
+      await run(`INSERT INTO audiences (id, name, description, created_at) VALUES (?, 'Subscribers', '', ?)`, [id, at]);
+    await run(`INSERT INTO audiences (id, name, description, created_at) VALUES ('aud_later', 'Subscribers', '', '2026-10-03 08:00:00')`);
+    await addContact("aud_b", { email: "x@example.com" });
+    await run(`INSERT INTO settings (id, default_audience_id) VALUES (1, 'aud_c')`);
+    await run(`INSERT INTO mails (title, audience_id) VALUES ('Hi', 'aud_d')`);
+
+    await dropDuplicateDefaultAudiences();
+    await dropDuplicateDefaultAudiences();
+
+    const left = (await listAudiences()).map((a) => a.id);
+    expect(left).toEqual(["aud_a", "aud_b", "aud_c", "aud_d", "aud_later"]);
+    expect((await defaultAudience()).id).toBe("aud_a");
   });
 });
