@@ -4,7 +4,7 @@ import { DEFAULT_DESIGN } from "../shared/design";
 import { renderBlock } from "../shared/email-blocks";
 import type { Block, Mail, Settings } from "../shared/types";
 
-const settings: Settings = { publication_name: "Pub", logo: "", from_name: "", from_email: "a@b.co", senders: [], default_audience_id: null, footer_text: "" } as Settings;
+const settings: Settings = { publication_name: "Pub", logo: "", from_name: "", from_email: "a@b.co", senders: [], default_audience_id: null, footer_text: "", crm_app_id: null } as Settings;
 
 function mail(blocks: Block[], preheader = ""): Mail {
   return {

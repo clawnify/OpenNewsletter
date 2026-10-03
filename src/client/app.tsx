@@ -4,12 +4,13 @@ import { AppNav, reportLocation, type AppNavItem } from "@clawnify/app/client";
 import { StoreProvider, useStore } from "./store";
 import { HomeView } from "./components/home-view";
 import { MailsView } from "./components/mails-view";
+import { FlowsView } from "./components/flows-view";
 import { TemplatesView } from "./components/templates-view";
 import { AudienceView } from "./components/audience-view";
 import { SettingsView } from "./components/settings-view";
 import { Editor } from "./components/editor";
 
-export type View = "home" | "mail" | "templates" | "audience" | "settings";
+export type View = "home" | "mail" | "automations" | "templates" | "audience" | "settings";
 
 // One definition of the navigation. <AppNav> paints it as this app's own
 // sidebar when opened directly, and hands it to the Clawnify dashboard's
@@ -18,6 +19,7 @@ export type View = "home" | "mail" | "templates" | "audience" | "settings";
 const NAV: (AppNavItem & { view: View })[] = [
   { id: "home", view: "home", label: "Home", href: "/", icon: "home", home: true },
   { id: "mail", view: "mail", label: "Mail", href: "/mail", icon: "send", color: "sky" },
+  { id: "automations", view: "automations", label: "Automations", href: "/automations", icon: "zap", color: "amber" },
   { id: "templates", view: "templates", label: "Templates", href: "/templates", icon: "layout-grid", color: "violet" },
   { id: "audience", view: "audience", label: "Audience", href: "/audience", icon: "users", color: "blue" },
   { id: "settings", view: "settings", label: "Settings", href: "/settings", icon: "settings" },
@@ -98,6 +100,8 @@ function Shell() {
           <HomeView openMail={setEditing} onNavigate={navigate} />
         ) : view === "mail" ? (
           <MailsView openMail={setEditing} />
+        ) : view === "automations" ? (
+          <FlowsView openMail={setEditing} />
         ) : view === "templates" ? (
           <TemplatesView openMail={setEditing} />
         ) : view === "audience" ? (
