@@ -373,12 +373,13 @@ app.post("/api/mails", async (c) => {
   if (skeleton.feature_image) masthead.push({ id: blockId(), type: "image", src: skeleton.feature_image, alt: "", caption: "", href: "" });
   const blocks: Block[] = [...masthead, ...((skeleton.blocks as Block[]) || [])];
 
-  const result = await run(
+  // RETURNING, not lastInsertRowid: the preview-lane storage binding reports
+  // no insert id (it would read 0 and return nothing).
+  const row = await get<any>(
     `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     [eyebrow, title, subtitle, skeleton.byline_name || "", skeleton.byline_date || "", skeleton.feature_image || "", JSON.stringify(blocks), slug, s.default_audience_id],
   );
-  const row = await get<any>("SELECT * FROM mails WHERE id = ?", [result.lastInsertRowid]);
   return c.json(parseMail(row), 201);
 });
 
