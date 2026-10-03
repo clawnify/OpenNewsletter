@@ -98,6 +98,7 @@ async function ensureSeed() {
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts ON signup_attempts(ip_hash, at)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at)`,
   ]) await run(sql);
+  await contacts.dropDuplicateDefaultAudiences();
   seeded = columnsOk;
 }
 
