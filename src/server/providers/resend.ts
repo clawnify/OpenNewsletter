@@ -89,7 +89,7 @@ export class ResendProvider implements EmailProvider {
           input.messages.map((m) => ({
             from: input.from,
             to: [m.to],
-            subject: input.subject,
+            subject: m.subject ?? input.subject,
             html: m.html,
             headers: unsubscribeHeaders(m.unsubscribeUrl),
             // Echoed back on every webhook event for this message.

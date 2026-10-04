@@ -7,6 +7,7 @@ import * as crm from "./crm";
 import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
+import { SAMPLE_VALUES, fillSubject, type MergeValues } from "../shared/merge";
 import { sendVerdict } from "./schedule";
 import * as sending from "./sending";
 import { applyDeliveryEvent } from "./events";
@@ -77,6 +78,9 @@ async function ensureSeed() {
     `ALTER TABLE contacts ADD COLUMN confirm_sent_at TEXT`,
     `ALTER TABLE contacts ADD COLUMN confirm_attempts INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE contacts ADD COLUMN confirm_error TEXT`,
+    `ALTER TABLE mails ADD COLUMN preheader TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE deliveries ADD COLUMN first_name TEXT`,
+    `ALTER TABLE deliveries ADD COLUMN last_name TEXT`,
   ]) {
     try {
       await run(sql);
@@ -319,15 +323,26 @@ app.post("/api/templates", async (c) => {
   }
   if (!design) return c.json({ error: "design required" }, 400);
 
-  const slug =
-    (b.slug?.trim() || b.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")) +
-    "-" +
-    Math.random().toString(36).slice(2, 6);
+  // A slug the caller names is kept as-is: mails refer to templates by slug,
+  // and a silently changed one renders those mails with the default look.
+  // Only a slug derived from the name gets a suffix, since that collision
+  // isn't the caller's choice.
+  if (b.slug !== undefined && b.slug !== null && typeof b.slug !== "string") {
+    return c.json({ error: "slug must be a string" }, 400);
+  }
+  const explicit = b.slug?.trim();
+  if (explicit !== undefined && explicit !== "" && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(explicit)) {
+    return c.json({ error: "slug must be lowercase letters, digits and single hyphens" }, 400);
+  }
+  const slug = explicit ||
+    b.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") + "-" + Math.random().toString(36).slice(2, 6);
 
-  await run(
-    `INSERT INTO templates (slug, name, description, design, skeleton, builtin) VALUES (?, ?, ?, ?, ?, 0)`,
+  const inserted = await query<{ slug: string }>(
+    `INSERT INTO templates (slug, name, description, design, skeleton, builtin) VALUES (?, ?, ?, ?, ?, 0)
+     ON CONFLICT(slug) DO NOTHING RETURNING slug`,
     [slug, b.name.trim(), b.description || "", JSON.stringify(design), JSON.stringify(skeleton || {})],
   );
+  if (inserted.length === 0) return c.json({ error: `A template with the slug "${slug}" already exists.` }, 409);
   const row = await get<any>("SELECT * FROM templates WHERE slug = ?", [slug]);
   return c.json({ ...row, builtin: false, design: JSON.parse(row.design), skeleton: JSON.parse(row.skeleton) }, 201);
 });
@@ -373,12 +388,12 @@ app.post("/api/mails", async (c) => {
   if (skeleton.feature_image) masthead.push({ id: blockId(), type: "image", src: skeleton.feature_image, alt: "", caption: "", href: "" });
   const blocks: Block[] = [...masthead, ...((skeleton.blocks as Block[]) || [])];
 
-  const result = await run(
+  // RETURNING, not lastInsertRowid: the app-supervisor storage binding reports no insert id.
+  const row = await get<any>(
     `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     [eyebrow, title, subtitle, skeleton.byline_name || "", skeleton.byline_date || "", skeleton.feature_image || "", JSON.stringify(blocks), slug, s.default_audience_id],
   );
-  const row = await get<any>("SELECT * FROM mails WHERE id = ?", [result.lastInsertRowid]);
   return c.json(parseMail(row), 201);
 });
 
@@ -391,6 +406,7 @@ app.put("/api/mails/:id", async (c) => {
   const fields: Record<string, unknown> = {
     eyebrow: b.eyebrow ?? existing.eyebrow,
     title: b.title ?? existing.title,
+    preheader: b.preheader ?? existing.preheader,
     subtitle: b.subtitle ?? existing.subtitle,
     byline_name: b.byline_name ?? existing.byline_name,
     byline_date: b.byline_date ?? existing.byline_date,
@@ -420,12 +436,12 @@ app.put("/api/mails/:id", async (c) => {
     // Decided inside the UPDATE, not from the row read above, so a send that
     // starts between the two can't be overwritten. Content edits still save;
     // the send delivers its own snapshot.
-    `UPDATE mails SET eyebrow=?, title=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_mobile=?, template_slug=?, audience_id=?,
+    `UPDATE mails SET eyebrow=?, title=?, preheader=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_mobile=?, template_slug=?, audience_id=?,
        status = CASE WHEN status IN ('sending', 'sent', 'failed') THEN status ELSE ? END,
        scheduled_at = CASE WHEN status IN ('sending', 'sent', 'failed') THEN scheduled_at ELSE ? END,
        updated_at=datetime('now') WHERE id=?`,
     [
-      fields.eyebrow, fields.title, fields.subtitle, fields.byline_name, fields.byline_date,
+      fields.eyebrow, fields.title, fields.preheader, fields.subtitle, fields.byline_name, fields.byline_date,
       fields.feature_image, fields.blocks, fields.design, fields.design_mobile, fields.template_slug, fields.audience_id,
       fields.status, fields.scheduled_at, id,
     ],
@@ -589,7 +605,7 @@ app.get("/api/mails/:id/preview", async (c) => {
   if (!row) return c.json({ error: "Not found" }, 404);
   const mail = parseMail(row);
   const design = await resolveDesign(mail);
-  const html = renderEmailHtml(mail, design, await getSettings(), { mobile: mail.design_mobile });
+  const html = renderEmailHtml(mail, design, await getSettings(), { mobile: mail.design_mobile, merge: SAMPLE_VALUES });
   return c.html(html);
 });
 
@@ -1043,9 +1059,16 @@ app.post("/api/mails/:id/test", async (c) => {
   const from = fromOverride?.includes("@") ? fromOverride : fromAddress(s);
   if (!from) return c.json({ error: "Pick a sender, or set a from name and email in Settings first." }, 400);
 
-  const html = renderEmailHtml(mail, await resolveDesign(mail), s);
+  // The recipient's own values when they're on a list, so a test to yourself
+  // shows your name; otherwise the sample the editor's preview uses.
+  const known = await get<MergeValues>(
+    `SELECT first_name, last_name, email FROM contacts WHERE email = ? ORDER BY created_at LIMIT 1`,
+    [to.trim().toLowerCase()],
+  );
+  const merge = known ?? SAMPLE_VALUES;
+  const html = renderEmailHtml(mail, await resolveDesign(mail), s, { merge });
   try {
-    const r = await p.sendEmail({ from, to: to.trim(), subject: mail.title, html });
+    const r = await p.sendEmail({ from, to: to.trim(), subject: fillSubject(mail.title, merge), html });
     return c.json({ ok: true, id: r.id });
   } catch (e: any) {
     return c.json({ error: e?.message || "Test send failed" }, 502);
@@ -1228,6 +1251,7 @@ async function sendMailNow(
     settings: s,
     from,
     origin: new URL(c.req.url).origin,
+    renderer: 2,
   });
   if (!begun.ok) {
     return begun.reason === "already-sent"

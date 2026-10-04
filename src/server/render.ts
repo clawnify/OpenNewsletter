@@ -11,6 +11,7 @@
 import { markdownToHtml } from "../shared/markdown";
 import { fontStack, applyMobile, type DesignTokens } from "../shared/design";
 import { readableTextOn } from "../shared/contrast";
+import { fillTags, type MergeValues } from "../shared/merge";
 import type { Block, Mail, Settings, TextColor } from "../shared/types";
 
 export interface RenderOpts {
@@ -23,6 +24,14 @@ export interface RenderOpts {
    * Omitted for previews and test sends, which fall back to a dead link.
    */
   unsubscribeUrl?: string;
+  /**
+   * This subscriber's merge-tag values. Omitted, tags render as written:
+   * a send whose snapshot predates merge tags must render byte for byte as it
+   * did, since its retries reuse idempotency keys.
+   */
+  merge?: MergeValues;
+  /** The pre-v2 column padding, for sends begun before it changed. */
+  legacyColumns?: boolean;
 }
 
 function esc(s: string): string {
@@ -45,7 +54,11 @@ function styleInline(html: string, d: DesignTokens): string {
   return repl.reduce((acc, [re, s]) => acc.replace(re, s), html);
 }
 
-function renderBlock(b: Block, d: DesignTokens): string {
+function renderBlock(b: Block, d: DesignTokens, merge?: MergeValues, legacyColumns?: boolean): string {
+  /** Escaped plain text, tags filled. */
+  const t = (s: string) => fillTags(s, merge, esc);
+  /** Markdown, tags filled after parsing so a value can't add markup. */
+  const md = (s: string) => fillTags(s, merge, (x) => styleInline(markdownToHtml(x), d));
   const body = fontStack(d.typography.bodyFont);
   const heading = fontStack(d.typography.headingFont);
   const base = d.typography.baseSize;
@@ -55,7 +68,7 @@ function renderBlock(b: Block, d: DesignTokens): string {
       const size = b.level === 1 ? d.typography.titleSize : b.level === 2 ? base + 8 : base + 3;
       const lh = b.level === 1 ? 1.12 : 1.25;
       const cls = b.level === 1 ? "nl-title" : "";
-      return `<h${b.level} class="${cls}" style="margin:0;font-family:${heading};font-weight:${d.typography.headingWeight};font-size:${size}px;line-height:${lh};letter-spacing:${b.level === 1 ? "-0.01em" : "0"};color:${d.colors.foreground};text-align:${b.align || "left"};">${esc(b.text)}</h${b.level}>`;
+      return `<h${b.level} class="${cls}" style="margin:0;font-family:${heading};font-weight:${d.typography.headingWeight};font-size:${size}px;line-height:${lh};letter-spacing:${b.level === 1 ? "-0.01em" : "0"};color:${d.colors.foreground};text-align:${b.align || "left"};">${t(b.text)}</h${b.level}>`;
     }
     case "text": {
       const size = Math.round(base * (b.scale || 1));
@@ -68,37 +81,37 @@ function renderBlock(b: Block, d: DesignTokens): string {
         b.italic ? "font-style:italic" : "",
         b.uppercase ? "text-transform:uppercase;letter-spacing:0.06em;font-weight:600" : "",
       ].filter(Boolean).join(";");
-      return `<div class="nl-text" style="${css}">${styleInline(markdownToHtml(b.md), d)}</div>`;
+      return `<div class="nl-text" style="${css}">${md(b.md)}</div>`;
     }
     case "image": {
       const img = `<img src="${esc(b.src)}" alt="${esc(b.alt)}" width="100%" style="width:100%;height:auto;display:block;border:0;border-radius:${d.layout.imageRadius}px;">`;
       const wrapped = b.href ? `<a href="${esc(b.href)}" target="_blank">${img}</a>` : img;
-      const cap = b.caption ? `<div style="font-family:${body};font-size:13px;color:${d.colors.secondary};text-align:center;margin-top:8px;">${esc(b.caption)}</div>` : "";
+      const cap = b.caption ? `<div style="font-family:${body};font-size:13px;color:${d.colors.secondary};text-align:center;margin-top:8px;">${t(b.caption)}</div>` : "";
       return wrapped + cap;
     }
     case "button": {
       const fg = d.options.autoButtonText === false ? d.colors.onPrimary : readableTextOn(d.colors.primary);
-      return `<table role="presentation" border="0" cellpadding="0" cellspacing="0" align="${b.align || "left"}" style="border-collapse:separate;"><tr><td align="center" bgcolor="${d.colors.primary}" style="border-radius:${d.layout.buttonRadius}px;background:${d.colors.primary};"><a href="${esc(b.href)}" target="_blank" style="display:inline-block;font-family:${body};font-weight:600;font-size:${base}px;color:${fg};text-decoration:none;padding:12px 22px;border-radius:${d.layout.buttonRadius}px;">${esc(b.text)}</a></td></tr></table>`;
+      return `<table role="presentation" border="0" cellpadding="0" cellspacing="0" align="${b.align || "left"}" style="border-collapse:separate;"><tr><td align="center" bgcolor="${d.colors.primary}" style="border-radius:${d.layout.buttonRadius}px;background:${d.colors.primary};"><a href="${esc(b.href)}" target="_blank" style="display:inline-block;font-family:${body};font-weight:600;font-size:${base}px;color:${fg};text-decoration:none;padding:12px 22px;border-radius:${d.layout.buttonRadius}px;">${t(b.text)}</a></td></tr></table>`;
     }
     case "list": {
       const tag = b.ordered ? "ol" : "ul";
-      const items = b.items.map((it) => `<li style="margin:0 0 8px;">${styleInline(markdownToHtml(it), d).replace(/^<p[^>]*>|<\/p>$/g, "")}</li>`).join("");
+      const items = b.items.map((it) => `<li style="margin:0 0 8px;">${md(it).replace(/^<p[^>]*>|<\/p>$/g, "")}</li>`).join("");
       return `<${tag} style="margin:0;padding-left:22px;font-family:${body};font-size:${base}px;line-height:${d.typography.lineHeight};color:${d.colors.foreground};">${items}</${tag}>`;
     }
     case "quote":
-      return `<blockquote style="margin:0;border-left:3px solid ${d.colors.primary};padding-left:18px;font-family:${heading};font-style:italic;font-size:${base + 4}px;line-height:1.4;color:${d.colors.secondary};">${esc(b.text)}${b.cite ? `<div style="font-style:normal;font-size:13px;margin-top:8px;">— ${esc(b.cite)}</div>` : ""}</blockquote>`;
+      return `<blockquote style="margin:0;border-left:3px solid ${d.colors.primary};padding-left:18px;font-family:${heading};font-style:italic;font-size:${base + 4}px;line-height:1.4;color:${d.colors.secondary};">${t(b.text)}${b.cite ? `<div style="font-style:normal;font-size:13px;margin-top:8px;">— ${t(b.cite)}</div>` : ""}</blockquote>`;
     case "divider":
       return `<hr style="border:0;border-top:1px solid ${d.colors.border};margin:0;">`;
     case "spacer":
       return `<div style="height:${b.size}px;line-height:${b.size}px;font-size:0;">&nbsp;</div>`;
     case "columns": {
       const n = b.items.length || 1;
-      const cells = b.items.map((c) => {
+      const cells = b.items.map((c, i) => {
         const inner =
           (c.image ? `<img src="${esc(c.image)}" alt="" width="100%" style="width:100%;height:auto;display:block;border:0;border-radius:${d.layout.imageRadius}px;margin-bottom:10px;">` : "") +
-          (c.heading ? `<div style="font-family:${heading};font-weight:${d.typography.headingWeight};font-size:${base + 1}px;color:${d.colors.foreground};margin-bottom:4px;">${esc(c.heading)}</div>` : "") +
-          (c.text ? `<div style="font-family:${body};font-size:${base - 1}px;line-height:1.5;color:${d.colors.secondary};">${esc(c.text)}</div>` : "");
-        return `<td class="nl-col" width="${Math.floor(100 / n)}%" valign="top" style="width:${Math.floor(100 / n)}%;padding:0 8px;vertical-align:top;">${inner}</td>`;
+          (c.heading ? `<div style="font-family:${heading};font-weight:${d.typography.headingWeight};font-size:${base + 1}px;color:${d.colors.foreground};margin-bottom:4px;">${t(c.heading)}</div>` : "") +
+          (c.text ? `<div style="font-family:${body};font-size:${base - 1}px;line-height:1.5;color:${d.colors.secondary};">${t(c.text)}</div>` : "");
+        return `<td class="nl-col" width="${Math.floor(100 / n)}%" valign="top" style="width:${Math.floor(100 / n)}%;padding:${legacyColumns ? "0 8px" : `0 0 0 ${i === 0 ? 0 : 16}px`};vertical-align:top;">${inner}</td>`;
       }).join("");
       return `<table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;"><tr>${cells}</tr></table>`;
     }
@@ -114,7 +127,7 @@ export function renderInner(mail: Mail, d: DesignTokens, settings: Settings, opt
   if (d.options.showHeader && logo) {
     rows.push(`<tr><td style="padding:0 0 ${space}px;"><img src="${esc(logo)}" alt="${esc(settings.publication_name)}" height="28" style="height:28px;width:auto;display:block;border:0;"></td></tr>`);
   }
-  for (const b of mail.blocks || []) rows.push(`<tr><td style="padding:${space}px 0 0;">${renderBlock(b, d)}</td></tr>`);
+  for (const b of mail.blocks || []) rows.push(`<tr><td style="padding:${space}px 0 0;">${renderBlock(b, d, opts.merge, opts.legacyColumns)}</td></tr>`);
 
   if (d.options.showFooter) {
     // Was `{{{RESEND_UNSUBSCRIBE_URL}}}`, a Resend-Broadcasts-only variable —
@@ -144,6 +157,17 @@ function mobileStyle(desktop: DesignTokens, mobile?: Partial<DesignTokens> | nul
   return `@media only screen and (max-width:600px){${rules.join("")}}`;
 }
 
+/**
+ * The inbox preview line. Hidden in the body, and padded with zero-width
+ * joiners and spaces so the client doesn't fill the rest of the line with
+ * the first words of the body (often the eyebrow).
+ */
+function preheaderHtml(text: string | undefined, merge?: MergeValues): string {
+  if (!text?.trim()) return "";
+  const pad = "&zwnj;&nbsp;".repeat(80);
+  return `<div style="display:none;max-height:0;max-width:0;overflow:hidden;mso-hide:all;font-size:1px;line-height:1px;opacity:0;color:transparent;">${fillTags(text.trim(), merge, esc)}${pad}</div>\n`;
+}
+
 export function renderEmailHtml(mail: Mail, d: DesignTokens, settings: Settings, opts: RenderOpts = {}): string {
   const inner = renderInner(mail, d, settings, { ...opts, forEmail: true });
   const pad = d.layout.cardRadius > 0 ? 32 : 0;
@@ -157,7 +181,7 @@ export function renderEmailHtml(mail: Mail, d: DesignTokens, settings: Settings,
 <style>${mobileStyle(d, opts.mobile)}</style>
 </head>
 <body style="margin:0;padding:0;background:${d.colors.page};">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${d.colors.page};">
+${preheaderHtml(mail.preheader, opts.merge)}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${d.colors.page};">
 <tr><td align="center" style="padding:${d.layout.outerPadding || 24}px 16px;">
 <table class="nl-content" role="presentation" width="${d.layout.contentWidth}" cellpadding="0" cellspacing="0" style="width:100%;max-width:${d.layout.contentWidth}px;">
 <tr><td class="nl-card" style="background:${d.colors.background};border-radius:${d.layout.cardRadius}px;padding:${pad}px;">

@@ -3,6 +3,8 @@ CREATE TABLE IF NOT EXISTS mails (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   eyebrow TEXT NOT NULL DEFAULT '',
   title TEXT NOT NULL DEFAULT 'Untitled',
+  -- Inbox preview line (preheader), rendered hidden as the body's first child.
+  preheader TEXT NOT NULL DEFAULT '',
   subtitle TEXT NOT NULL DEFAULT '',
   byline_name TEXT NOT NULL DEFAULT '',
   byline_date TEXT NOT NULL DEFAULT '',
@@ -124,6 +126,9 @@ CREATE TABLE IF NOT EXISTS deliveries (
   mail_id INTEGER NOT NULL,
   contact_id TEXT NOT NULL,
   email TEXT NOT NULL,
+  -- Merge-tag values as they were when the send started, like the email.
+  first_name TEXT,
+  last_name TEXT,
   batch INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),

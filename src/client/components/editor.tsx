@@ -6,6 +6,7 @@ import { baseDesign, effectiveDesign } from "../lib/design";
 import { diffTokens, withDefaults, type DesignTokens } from "../../shared/design";
 import { newBlock, markdownToBlocks, deriveTitle, blockId } from "../../shared/blocks";
 import type { Block, BlockType, Mail } from "../../shared/types";
+import { SAMPLE_VALUES, fillBlocksText } from "../../shared/merge";
 import { Preview, type EditHandlers } from "./preview";
 import { DesignPanel } from "./design-panel";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
@@ -45,12 +46,18 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   const design = useMemo<DesignTokens>(() => (mail ? effectiveDesign(mail, store.templates, device) : withDefaults(null)), [mail, store.templates, device]);
 
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Edits inside one debounce window are merged: saving only the last patch
+  // dropped an earlier edit to another field (preview text, then a block).
+  const pending = useRef<Partial<Mail>>({});
   const queueSave = (next: Mail, patch: Partial<Mail>) => {
     setSaved(false);
+    pending.current = { ...pending.current, ...patch };
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(async () => {
+      const merged = pending.current;
+      pending.current = {};
       try {
-        await store.saveMail(next.id, patch);
+        await store.saveMail(next.id, merged);
         setSaved(true);
       } catch (e) {
         store.setError((e as Error).message);
@@ -310,7 +317,15 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
 
           <div className="flex-1 overflow-auto p-6" onClick={(e) => e.stopPropagation()}>
             <div className="mx-auto transition-all" style={{ maxWidth: device === "mobile" ? 390 : design.layout.contentWidth + 80 }}>
-              <Preview mail={mail} design={design} settings={store.settings!} edit={mode === "edit" ? edit : undefined} />
+              {mode === "edit" ? (
+                <InboxLine mail={mail} onPreheader={(preheader) => patch({ preheader })} />
+              ) : null}
+              <Preview
+                mail={mode === "edit" ? mail : { ...mail, blocks: fillBlocksText(mail.blocks, SAMPLE_VALUES) }}
+                design={design}
+                settings={store.settings!}
+                edit={mode === "edit" ? edit : undefined}
+              />
             </div>
           </div>
         </div>
@@ -335,6 +350,34 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
         </Dialog>
       )}
       {showSend ? <SendDialog mail={mail} onClose={() => setShowSend(false)} onSent={(i) => { setMail(i); setShowSend(false); store.refreshMails(); }} /> : null}
+    </div>
+  );
+}
+
+/**
+ * What the inbox shows before the mail is opened: the subject (the title
+ * block) and the preview text. Saved on blur, so one edit is one undo step.
+ */
+function InboxLine({ mail, onPreheader }: { mail: Mail; onPreheader: (v: string) => void }) {
+  return (
+    <div className="mb-4 rounded-md bg-card p-3 text-sm shadow-edge">
+      <div className="flex items-baseline gap-3">
+        <span className="w-24 shrink-0 text-muted-foreground">Subject</span>
+        <span className="truncate font-medium">{mail.title || "Untitled"}</span>
+      </div>
+      <label className="mt-2 flex items-center gap-3">
+        <span className="w-24 shrink-0 text-muted-foreground">Preview text</span>
+        <Input
+          key={`${mail.id}:${mail.preheader}`}
+          defaultValue={mail.preheader}
+          placeholder="Shown after the subject in the inbox"
+          maxLength={150}
+          onBlur={(e) => { if (e.target.value !== mail.preheader) onPreheader(e.target.value); }}
+        />
+      </label>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Personalize any text with <code>{"{{first_name|there}}"}</code>, <code>{"{{last_name}}"}</code> or <code>{"{{email}}"}</code>. The word after the bar shows when the value is empty. Preview fills in a sample reader.
+      </p>
     </div>
   );
 }
