@@ -84,14 +84,17 @@ async function ensureSeed() {
     `ALTER TABLE contacts ADD COLUMN confirm_attempts INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE contacts ADD COLUMN confirm_error TEXT`,
     `ALTER TABLE mails ADD COLUMN preheader TEXT NOT NULL DEFAULT ''`,
-    `ALTER TABLE deliveries ADD COLUMN first_name TEXT`,
-    `ALTER TABLE deliveries ADD COLUMN last_name TEXT`,
     `ALTER TABLE settings ADD COLUMN crm_enabled INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE settings ADD COLUMN crm_app_id TEXT`,
   ]);
   // Idempotent, and outside the try: a mistake here must surface, not be read
   // as "already exists".
   for (const sql of sending.DELIVERIES_DDL) await run(sql);
+  // After the CREATE: on an install from before deliveries existed, the table isn't there yet.
+  const deliveryColumnsOk = await addColumns([
+    `ALTER TABLE deliveries ADD COLUMN first_name TEXT`,
+    `ALTER TABLE deliveries ADD COLUMN last_name TEXT`,
+  ]);
   for (const sql of flows.FLOWS_DDL) await run(sql);
   for (const sql of [
     `CREATE TABLE IF NOT EXISTS signup_attempts (ip_hash TEXT NOT NULL, at TEXT NOT NULL)`,
@@ -99,7 +102,7 @@ async function ensureSeed() {
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at)`,
   ]) await run(sql);
   await contacts.dropDuplicateDefaultAudiences();
-  seeded = columnsOk;
+  seeded = columnsOk && deliveryColumnsOk;
 }
 
 app.use("*", async (c, next) => {

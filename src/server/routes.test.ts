@@ -1,6 +1,6 @@
 // Routes against real SQLite behind a storage binding that, like the
 // app-supervisor's, returns rows and nothing else: no insert id, no counts.
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import app from "./index";
 import { DEFAULT_DESIGN } from "../shared/design";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
@@ -109,5 +109,31 @@ describe("GET /api/templates/:slug/preview", () => {
 
   it("is a 404 for an unknown template", async () => {
     expect((await app.request("/api/templates/nope/preview", {}, env)).status).toBe(404);
+  });
+});
+
+describe("boot migration", () => {
+  it("upgrades an install from before the deliveries table without reporting a failed column", async () => {
+    vi.resetModules();
+    const fresh = (await import("./index")).default;
+    const db = new DatabaseSync(":memory:");
+    db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
+    db.exec(`DROP TABLE deliveries`);
+    const old = {
+      STORAGE: {
+        async query(sql: string, params: unknown[] = []) {
+          const stmt = db.prepare(sql);
+          if (/^\s*(select|with|pragma)\b/i.test(sql) || /\breturning\b/i.test(sql)) return { rows: stmt.all(...(params as any[])) };
+          stmt.run(...(params as any[]));
+          return { rows: [] };
+        },
+      },
+    };
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect((await fresh.request("/api/settings", {}, old)).status).toBe(200);
+    expect(log.mock.calls.filter((c) => c[0] === "[migrate]")).toEqual([]);
+    log.mockRestore();
+    const cols = db.prepare(`PRAGMA table_info(deliveries)`).all().map((c: any) => c.name);
+    expect(cols).toEqual(expect.arrayContaining(["first_name", "last_name"]));
   });
 });
