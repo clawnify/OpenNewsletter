@@ -15,3 +15,12 @@ export function readableTextOn(bg: string): string {
     return "#FFFFFF";
   }
 }
+
+/** `color` when it reads on `bg` (WCAG AA for body text), otherwise near-white or near-black. */
+export function readableOr(color: string, bg: string): string {
+  try {
+    return chroma.contrast(bg, color) >= 4.5 ? color : readableTextOn(bg);
+  } catch {
+    return color;
+  }
+}

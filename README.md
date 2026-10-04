@@ -42,6 +42,10 @@ account. The provider is just delivery, and it's swappable.
   always inserted as plain text, so a signup can't slip a link into your issue.
 - **Preview text** — set the line inboxes show after the subject, instead of
   letting them borrow the first words of the body.
+- **Styling without code** — give any block a coloured section with its own
+  padding (a dark hero, a light callout band); text inside switches to a
+  readable colour on its own. Size and align images, and make a button
+  outline or full width. The assistant can do all of it too.
 - **HTML when blocks aren't enough** — add an HTML block for a design the
   blocks can't express (a hero with a background, a coloured band, buttons in
   columns), or choose **Edit as HTML** on any block to start from exactly the
