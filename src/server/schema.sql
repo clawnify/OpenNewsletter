@@ -11,8 +11,12 @@ CREATE TABLE IF NOT EXISTS mails (
   feature_image TEXT NOT NULL DEFAULT '',
   -- Body as an ordered JSON array of blocks.
   blocks TEXT NOT NULL DEFAULT '[]',
-  -- Per-mail DESIGN.md token overrides (JSON), or NULL to inherit template/default.
+  -- The DESIGN.md tokens this mail changed from its template (partial JSON), or
+  -- NULL to follow the template. A mail with no template layers on the default.
   design TEXT,
+  -- 1: `design` may be the old format, a full copy (converted at boot).
+  -- 2: `design` holds only the changes.
+  design_v INTEGER NOT NULL DEFAULT 1,
   -- Mobile-only token overrides (partial JSON), layered on top of `design` when device=mobile.
   design_mobile TEXT,
   template_slug TEXT,

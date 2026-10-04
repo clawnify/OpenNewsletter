@@ -281,23 +281,29 @@ export function setPath<T>(obj: T, path: string, value: unknown): T {
   return clone;
 }
 
-/** Layer a partial mobile override on top of a fully-resolved base. */
-export function applyMobile(base: DesignTokens, mobile?: Partial<DesignTokens> | null): DesignTokens {
-  if (!mobile) return base;
+/**
+ * Layer partial tokens on top of a fully-resolved base: a mail's own tokens
+ * over its template, or its mobile tokens over its desktop ones.
+ */
+export function layerTokens(base: DesignTokens, over?: Partial<DesignTokens> | null): DesignTokens {
+  if (!over) return base;
   return {
-    colors: { ...base.colors, ...(mobile.colors || {}) },
-    typography: { ...base.typography, ...(mobile.typography || {}) },
-    layout: { ...base.layout, ...(mobile.layout || {}) },
-    options: { ...base.options, ...(mobile.options || {}) },
+    colors: { ...base.colors, ...(over.colors || {}) },
+    typography: { ...base.typography, ...(over.typography || {}) },
+    layout: { ...base.layout, ...(over.layout || {}) },
+    options: { ...base.options, ...(over.options || {}) },
   };
 }
 
-/** Tokens in `over` that differ from `base` — the minimal mobile override to store. */
+/**
+ * Tokens in `over` that differ from `base`: the minimal override to store.
+ * Only keys `base` has count, so a stray key in stored or posted JSON drops out.
+ */
 export function diffTokens(base: DesignTokens, over: DesignTokens): Partial<DesignTokens> {
   const out: Partial<DesignTokens> = {};
   for (const group of ["colors", "typography", "layout", "options"] as const) {
     const g: Record<string, unknown> = {};
-    for (const k of Object.keys(over[group])) {
+    for (const k of Object.keys(base[group])) {
       if ((over[group] as any)[k] !== (base[group] as any)[k]) g[k] = (over[group] as any)[k];
     }
     if (Object.keys(g).length) (out as any)[group] = g;

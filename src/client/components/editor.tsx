@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Monitor, Smartphone, ArrowLeft, Send, Save, RotateCcw, MousePointer2, Undo2, Redo2, Eye, SquarePen } from "lucide-react";
 import { useStore } from "../store";
 import { api } from "../api";
-import { baseDesign, effectiveDesign } from "../lib/design";
+import { baseDesign, effectiveDesign, templateTokens } from "../lib/design";
 import { diffTokens, withDefaults, type DesignTokens } from "../../shared/design";
 import { newBlock, markdownToBlocks, deriveTitle, blockId } from "../../shared/blocks";
 import type { Block, BlockType, Mail } from "../../shared/types";
@@ -42,6 +42,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
     if (!mail) api<Mail>("GET", `/api/mails/${mailId}`).then(setMail).catch((e) => store.setError((e as Error).message));
   }, [mailId]);
 
+  const inherited = useMemo(() => (mail ? templateTokens(mail, store.templates) : withDefaults(null)), [mail, store.templates]);
   const base = useMemo(() => (mail ? baseDesign(mail, store.templates) : withDefaults(null)), [mail, store.templates]);
   const design = useMemo<DesignTokens>(() => (mail ? effectiveDesign(mail, store.templates, device) : withDefaults(null)), [mail, store.templates, device]);
 
@@ -129,11 +130,20 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   };
   const onDelete = (index: number) => setBlocks((mail!.blocks || []).filter((_, i) => i !== index));
 
+  // Stored as changes only (mobile over desktop, desktop over the template),
+  // so a template edit still reaches every token this mail left alone.
+  const desktopOverride = (edited: DesignTokens) => {
+    const d = diffTokens(inherited, edited);
+    return Object.keys(d).length ? d : null;
+  };
   const patchDesign = (edited: DesignTokens) => {
     if (device === "mobile") patch({ design_mobile: diffTokens(base, edited) });
-    else patch({ design: edited });
+    else patch({ design: desktopOverride(edited) });
   };
   const resetMobile = () => patch({ design_mobile: null });
+  const resetDesign = () => patch({ design: null });
+  const designChanges = Object.values(mail?.design || {}).reduce((n, g) => n + Object.keys(g || {}).length, 0);
+  const templateLabel = store.templates.find((t) => t.slug === mail?.template_slug)?.name ?? "the default design";
 
   const toggleAI = (id: string) =>
     setAiSelected((prev) => {
@@ -211,7 +221,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
       case "set_design": {
         const next = setDesignKey(base, String(input.key), input.value);
         if (!next) return `I can't set "${input.key}".`;
-        commit(device === "mobile" ? { design_mobile: diffTokens(base, next) } : { design: next });
+        commit(device === "mobile" ? { design_mobile: diffTokens(base, next) } : { design: desktopOverride(next) });
         return `Set ${input.key}.`;
       }
       case "style_block": {
@@ -362,8 +372,20 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
           </div>
         </div>
 
-        <aside className="hidden w-80 shrink-0 border-l bg-background lg:block">
-          <DesignPanel design={design} onChange={patchDesign} />
+        <aside className="hidden w-80 shrink-0 border-l bg-background lg:flex lg:flex-col">
+          {device === "desktop" && designChanges > 0 && mail.status !== "sent" && mail.status !== "sending" ? (
+            <div className="flex items-center justify-between gap-2 border-b px-3 py-2 text-xs text-muted-foreground">
+              <span>
+                {designChanges} {designChanges === 1 ? "change" : "changes"} from {templateLabel}
+              </span>
+              <button className="inline-flex items-center gap-1 rounded-xs px-1.5 py-0.5 shadow-edge hover:bg-card" onClick={resetDesign}>
+                <RotateCcw size={11} /> Reset
+              </button>
+            </div>
+          ) : null}
+          <div className="min-h-0 flex-1">
+            <DesignPanel design={design} onChange={patchDesign} />
+          </div>
         </aside>
       </div>
 

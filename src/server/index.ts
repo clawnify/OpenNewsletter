@@ -17,7 +17,7 @@ import { applyDeliveryEvent } from "./events";
 import { parseResendEvent, verifyResendWebhook, RESEND_EVENTS } from "./providers/resend-webhook";
 import { WebhookSetupError } from "./providers/types";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
-import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
+import { DEFAULT_DESIGN, diffTokens, layerTokens, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle, mailFromSkeleton } from "../shared/blocks";
 import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
 import type { Block, Mail, Settings, Template } from "../shared/types";
@@ -86,6 +86,7 @@ async function ensureSeed() {
     `ALTER TABLE mails ADD COLUMN preheader TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN crm_enabled INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE settings ADD COLUMN crm_app_id TEXT`,
+    `ALTER TABLE mails ADD COLUMN design_v INTEGER NOT NULL DEFAULT 1`,
   ]);
   // Idempotent, and outside the try: a mistake here must surface, not be read
   // as "already exists".
@@ -102,6 +103,7 @@ async function ensureSeed() {
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at)`,
   ]) await run(sql);
   await contacts.dropDuplicateDefaultAudiences();
+  if (columnsOk) await relinkMailDesigns();
   seeded = columnsOk && deliveryColumnsOk;
 }
 
@@ -221,10 +223,68 @@ async function templateDesign(slug: string | null): Promise<DesignTokens> {
   }
 }
 
-/** Effective tokens: mail override → template → default. */
+/**
+ * Effective tokens: the template's (or the default's), with the tokens the mail
+ * changed on top. `design_v` 1 is the old format, a full copy made the first
+ * time the design was touched; relinkMailDesigns converts those at boot.
+ */
 async function resolveDesign(mail: Mail): Promise<DesignTokens> {
-  if (mail.design) return withDefaults(mail.design);
-  return templateDesign(mail.template_slug);
+  if (mail.design && (mail as { design_v?: number }).design_v === 1) return withDefaults(mail.design);
+  return layerTokens(await templateDesign(mail.template_slug), mail.design);
+}
+
+/** A design as stored: only the tokens that differ from `base`, or null when none do. */
+function designChanges(base: DesignTokens, input: Partial<DesignTokens> | null | undefined): string | null {
+  if (!input || typeof input !== "object") return null;
+  const d = diffTokens(base, layerTokens(base, input));
+  return Object.keys(d).length ? JSON.stringify(d) : null;
+}
+
+/**
+ * Cut a mail loose from its template, keeping exactly the look it has now:
+ * its design becomes its changes from the default, with no template under it.
+ * Used when a send starts (a sent issue never changes look) and before a
+ * template is deleted. Compare-and-swap on the design read, so an edit saved
+ * in between is never overwritten; returns false when that happened.
+ */
+async function detachMail(row: { id: number; design: string | null; design_v: number; template_slug: string | null }, look: DesignTokens): Promise<boolean> {
+  const done = await get<{ id: number }>(
+    `UPDATE mails SET design = ?, design_v = 2, template_slug = NULL
+      WHERE id = ? AND design IS ? AND design_v = ? AND template_slug IS ? RETURNING id`,
+    [designChanges(DEFAULT_DESIGN, look), row.id, row.design, row.design_v, row.template_slug],
+  );
+  return !!done;
+}
+
+/**
+ * One-time conversion of old-format designs (full copies, `design_v` 1) to
+ * changes from the template. Each row converts with the look it renders now,
+ * and flips to 2 in the same UPDATE, so a rerun after a crash skips it. A sent
+ * issue is detached instead, with the look it was sent with when the send
+ * snapshot has it.
+ */
+async function relinkMailDesigns(): Promise<void> {
+  const rows = await query<any>(
+    `SELECT id, status, design, design_v, template_slug, send_snapshot FROM mails
+      WHERE design_v = 1 AND (design IS NOT NULL OR status IN ('sending', 'sent'))`,
+  );
+  for (const row of rows) {
+    const mail = parseMail(row);
+    if (row.status === "sending" || row.status === "sent") {
+      let sentWith: DesignTokens | null = null;
+      try {
+        sentWith = row.send_snapshot ? withDefaults(JSON.parse(row.send_snapshot).design) : null;
+      } catch {
+        sentWith = null;
+      }
+      await detachMail(row, sentWith ?? (await resolveDesign(mail)));
+      continue;
+    }
+    await run(`UPDATE mails SET design = ?, design_v = 2 WHERE id = ? AND design_v = 1`, [
+      designChanges(await templateDesign(row.template_slug), await resolveDesign(mail)),
+      row.id,
+    ]);
+  }
 }
 
 function fromAddress(s: Settings): string | null {
@@ -396,6 +456,14 @@ app.delete("/api/templates/:slug", async (c) => {
   const t = await get<any>("SELECT builtin FROM templates WHERE slug = ?", [slug]);
   if (!t) return c.json({ error: "Not found" }, 404);
   if (t.builtin) return c.json({ error: "Cannot delete a built-in template" }, 400);
+  // Mails on this template keep their look: each is detached before the
+  // template goes, so a failure part way leaves the template in place.
+  for (let pass = 0; ; pass++) {
+    const rows = await query<any>(`SELECT * FROM mails WHERE template_slug = ?`, [slug]);
+    if (!rows.length) break;
+    if (pass === 3) return c.json({ error: "Mails on this template kept changing; try again." }, 409);
+    for (const row of rows) await detachMail(row, await resolveDesign(parseMail(row)));
+  }
   await run("DELETE FROM templates WHERE slug = ?", [slug]);
   return c.json({ ok: true });
 });
@@ -444,7 +512,13 @@ app.put("/api/mails/:id", async (c) => {
     byline_date: b.byline_date ?? existing.byline_date,
     feature_image: b.feature_image ?? existing.feature_image,
     blocks: b.blocks !== undefined ? JSON.stringify(b.blocks) : existing.blocks,
-    design: b.design !== undefined ? (b.design ? JSON.stringify(b.design) : null) : existing.design,
+    // Stored as changes from the template, whatever the caller sent (a full
+    // set of tokens or only the changed ones).
+    design:
+      b.design !== undefined
+        ? designChanges(await templateDesign(b.template_slug ?? existing.template_slug), b.design)
+        : existing.design,
+    design_v: b.design !== undefined ? 2 : existing.design_v,
     design_mobile:
       b.design_mobile !== undefined
         ? b.design_mobile && Object.keys(b.design_mobile).length
@@ -468,13 +542,13 @@ app.put("/api/mails/:id", async (c) => {
     // Decided inside the UPDATE, not from the row read above, so a send that
     // starts between the two can't be overwritten. Content edits still save;
     // the send delivers its own snapshot.
-    `UPDATE mails SET eyebrow=?, title=?, preheader=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_mobile=?, template_slug=?, audience_id=?,
+    `UPDATE mails SET eyebrow=?, title=?, preheader=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_v=?, design_mobile=?, template_slug=?, audience_id=?,
        status = CASE WHEN status IN ('sending', 'sent', 'failed') THEN status ELSE ? END,
        scheduled_at = CASE WHEN status IN ('sending', 'sent', 'failed') THEN scheduled_at ELSE ? END,
        updated_at=datetime('now') WHERE id=?`,
     [
       fields.eyebrow, fields.title, fields.preheader, fields.subtitle, fields.byline_name, fields.byline_date,
-      fields.feature_image, fields.blocks, fields.design, fields.design_mobile, fields.template_slug, fields.audience_id,
+      fields.feature_image, fields.blocks, fields.design, fields.design_v, fields.design_mobile, fields.template_slug, fields.audience_id,
       fields.status, fields.scheduled_at, id,
     ],
   );
@@ -1466,10 +1540,19 @@ async function sendMailNow(
     return { status: 400, body: { error: "No confirmed subscribers on this audience yet." } };
   }
 
-  const { conversation: _conversation, ...frozen } = mail as Mail & { conversation?: unknown };
+  // A sent issue keeps the look it went out with, whatever later happens to
+  // its template. Detached before the snapshot, so a retried send snapshots
+  // the same mail as its first attempt. Best effort: an edit landing in
+  // between leaves it linked, and the send still carries its own snapshot.
+  let current = mail;
+  if (row.template_slug !== null || row.design_v === 1) {
+    await detachMail(row, await resolveDesign(mail));
+    current = parseMail(await get<any>("SELECT * FROM mails WHERE id = ?", [id]));
+  }
+  const { conversation: _conversation, ...frozen } = current as Mail & { conversation?: unknown };
   const begun = await sending.beginSend(id, mail.audience_id, {
     mail: frozen,
-    design: await resolveDesign(mail),
+    design: await resolveDesign(current),
     settings: s,
     from,
     origin: new URL(c.req.url).origin,

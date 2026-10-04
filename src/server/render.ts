@@ -8,7 +8,7 @@
  * The masthead (eyebrow / title / subtitle) is just styled text and
  * display-heading blocks — there are no special masthead fields here.
  */
-import { fontStack, applyMobile, type DesignTokens } from "../shared/design";
+import { fontStack, layerTokens, type DesignTokens } from "../shared/design";
 import { fillTags, type MergeValues } from "../shared/merge";
 import { esc, renderBlock } from "../shared/email-blocks";
 import type { Mail, Settings } from "../shared/types";
@@ -64,7 +64,7 @@ export function renderInner(mail: Mail, d: DesignTokens, settings: Settings, opt
 function mobileStyle(desktop: DesignTokens, mobile?: Partial<DesignTokens> | null): string {
   const rules: string[] = [".nl-col{display:block!important;width:100%!important;padding:8px 0!important}"];
   if (mobile) {
-    const m = applyMobile(desktop, mobile);
+    const m = layerTokens(desktop, mobile);
     if (m.typography.titleSize !== desktop.typography.titleSize) rules.push(`.nl-title{font-size:${m.typography.titleSize}px!important}`);
     if (m.typography.baseSize !== desktop.typography.baseSize) rules.push(`.nl-text{font-size:${m.typography.baseSize}px!important}`);
     if (m.colors.background !== desktop.colors.background) rules.push(`.nl-card{background:${m.colors.background}!important}`);

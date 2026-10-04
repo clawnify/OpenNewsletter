@@ -85,8 +85,11 @@ export interface Mail {
   feature_image: string;
   /** Body as an ordered list of blocks. AI-generated, hand-editable. */
   blocks: Block[];
-  /** Per-mail DESIGN.md token overrides (merged onto template/default). */
-  design: DesignTokens | null;
+  /**
+   * The DESIGN.md tokens this mail changed from its template (the default when
+   * it has none), or null. Only the changes: the rest follows the template.
+   */
+  design: Partial<DesignTokens> | null;
   /** Mobile-only partial overrides, layered on `design` when viewing/editing mobile. */
   design_mobile: Partial<DesignTokens> | null;
   template_slug: string | null;
