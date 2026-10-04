@@ -170,22 +170,29 @@ export async function addContact(
     // address that hard-bounced: re-importing it only bounces again, and bounce
     // rates are what mailbox providers judge a sender by.
     if (existing.status === "unsubscribed" || existing.status === "bounced") return existing;
+    // Consent only moves forward. A subscriber added again (by hand, or from
+    // the CRM) stays subscribed with the record of how they first agreed: that
+    // record is what answers "when did this person opt in". A pending row only
+    // changes its consent fields when this call brings consent.
+    const upgrade = existing.status === "pending" && status === "subscribed";
     await run(
-      `UPDATE contacts SET first_name = ?, last_name = ?, status = ?,
-              consent_source = ?, consent_at = ?, consent_evidence = ?,
+      `UPDATE contacts SET first_name = ?, last_name = ?,
               crm_contact_id = COALESCE(?, crm_contact_id)
          WHERE id = ?`,
       [
         input.first_name ?? existing.first_name,
         input.last_name ?? existing.last_name,
-        status,
-        consent.source,
-        status === "subscribed" ? (existing.consent_at ?? now()) : existing.consent_at,
-        consent.evidence ?? "",
         input.crm_contact_id ?? null,
         existing.id,
       ],
     );
+    if (upgrade) {
+      await run(
+        `UPDATE contacts SET status = 'subscribed', consent_source = ?, consent_at = ?, consent_evidence = ?
+           WHERE id = ? AND status = 'pending'`,
+        [consent.source, now(), consent.evidence ?? "", existing.id],
+      );
+    }
     return (await get(`SELECT ${CONTACT_COLS} FROM contacts WHERE id = ?`, [
       existing.id,
     ])) as Contact;
