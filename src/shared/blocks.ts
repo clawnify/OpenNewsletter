@@ -235,3 +235,46 @@ export function blocksToMarkdown(blocks: Block[]): string {
     .filter((s) => s !== "")
     .join("\n\n");
 }
+
+/** The masthead fields and body a template starts a mail with. */
+export interface TemplateStart {
+  eyebrow: string;
+  title: string;
+  subtitle: string;
+  byline_name: string;
+  byline_date: string;
+  feature_image: string;
+  blocks: Block[];
+}
+
+/**
+ * The mail a template creates. "Use template" and the library's miniature both
+ * go through this, so the miniature is exactly what you get.
+ *
+ * Built-in skeletons keep the masthead in fields (with a title) and only the
+ * body in blocks. A template saved from a mail is its blocks alone, masthead
+ * included. Templates saved before that also kept the fields, so a skeleton
+ * whose blocks already have a title doesn't get the fields a second time.
+ */
+export function mailFromSkeleton(skeleton: Partial<TemplateStart> & { blocks?: Block[] }, publicationName = ""): TemplateStart {
+  const body = skeleton.blocks || [];
+  const eyebrow = skeleton.eyebrow || publicationName.toUpperCase() || "";
+  const title = skeleton.title || "Untitled";
+  const subtitle = skeleton.subtitle || "";
+  const hasMasthead = !skeleton.title || body.some((b) => b.type === "heading" && b.level === 1);
+  const masthead: Block[] = [];
+  if (!hasMasthead) {
+    if (eyebrow) masthead.push(eyebrowBlock(eyebrow));
+    masthead.push(titleBlock(title));
+    if (subtitle) masthead.push(deckBlock(subtitle));
+    if (skeleton.byline_name) masthead.push(bylineBlock(skeleton.byline_date ? `${skeleton.byline_name} · ${skeleton.byline_date}` : skeleton.byline_name));
+    if (skeleton.feature_image) masthead.push({ id: blockId(), type: "image", src: skeleton.feature_image, alt: "", caption: "", href: "" });
+  }
+  return {
+    eyebrow, title, subtitle,
+    byline_name: skeleton.byline_name || "",
+    byline_date: skeleton.byline_date || "",
+    feature_image: skeleton.feature_image || "",
+    blocks: [...masthead, ...body],
+  };
+}

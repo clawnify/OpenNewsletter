@@ -15,7 +15,7 @@ import { parseResendEvent, verifyResendWebhook, RESEND_EVENTS } from "./provider
 import { WebhookSetupError } from "./providers/types";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
-import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle } from "../shared/blocks";
+import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle, mailFromSkeleton } from "../shared/blocks";
 import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
 import type { Block, Mail, Settings, Template } from "../shared/types";
 
@@ -310,15 +310,9 @@ app.post("/api/templates", async (c) => {
     if (row) {
       const mail = parseMail(row);
       design = design || (await resolveDesign(mail));
-      skeleton = skeleton || {
-        eyebrow: mail.eyebrow,
-        title: mail.title,
-        subtitle: mail.subtitle,
-        byline_name: mail.byline_name,
-        byline_date: mail.byline_date,
-        feature_image: mail.feature_image,
-        blocks: mail.blocks,
-      };
+      // The blocks are the whole mail, masthead included. The mail's masthead
+      // columns can be stale (set at creation, never shown), so they stay out.
+      skeleton = skeleton || { eyebrow: "", title: "", subtitle: "", byline_name: "", byline_date: "", feature_image: "", blocks: mail.blocks };
     }
   }
   if (!design) return c.json({ error: "design required" }, 400);
@@ -347,6 +341,20 @@ app.post("/api/templates", async (c) => {
   return c.json({ ...row, builtin: false, design: JSON.parse(row.design), skeleton: JSON.parse(row.skeleton) }, 201);
 });
 
+// The email a template starts, rendered for the library's miniature: the same
+// mail "Use template" creates, with merge tags filled for a sample reader.
+app.get("/api/templates/:slug/preview", async (c) => {
+  const t = await get<any>("SELECT * FROM templates WHERE slug = ?", [c.req.param("slug")]);
+  if (!t) return c.json({ error: "Not found" }, 404);
+  const s = await getSettings();
+  const m = mailFromSkeleton(JSON.parse(t.skeleton), s.publication_name || "");
+  const mail = { ...m, id: 0, title: deriveTitle(m.blocks), preheader: "", design: null, design_mobile: null, template_slug: t.slug } as unknown as Mail;
+  // Template HTML blocks are author-written, and this is the app's own origin.
+  c.header("Content-Security-Policy", "script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
+  c.header("Cache-Control", "no-store");
+  return c.html(renderEmailHtml(mail, withDefaults(JSON.parse(t.design)), s, { merge: SAMPLE_VALUES }));
+});
+
 app.delete("/api/templates/:slug", async (c) => {
   const slug = c.req.param("slug");
   const t = await get<any>("SELECT builtin FROM templates WHERE slug = ?", [slug]);
@@ -373,26 +381,14 @@ app.post("/api/mails", async (c) => {
   const b = await c.req.json<{ template_slug?: string }>().catch(() => ({}) as any);
   const slug = b.template_slug || "classic-editorial";
   const t = await get<any>("SELECT * FROM templates WHERE slug = ?", [slug]);
-  const skeleton = t ? JSON.parse(t.skeleton) : {};
   const s = await getSettings();
-
-  // Masthead is now a set of blocks at the top of the body.
-  const eyebrow = skeleton.eyebrow || s.publication_name?.toUpperCase() || "";
-  const title = skeleton.title || "Untitled";
-  const subtitle = skeleton.subtitle || "";
-  const masthead: Block[] = [];
-  if (eyebrow) masthead.push(eyebrowBlock(eyebrow));
-  masthead.push(titleBlock(title));
-  if (subtitle) masthead.push(deckBlock(subtitle));
-  if (skeleton.byline_name) masthead.push(bylineBlock(skeleton.byline_date ? `${skeleton.byline_name} · ${skeleton.byline_date}` : skeleton.byline_name));
-  if (skeleton.feature_image) masthead.push({ id: blockId(), type: "image", src: skeleton.feature_image, alt: "", caption: "", href: "" });
-  const blocks: Block[] = [...masthead, ...((skeleton.blocks as Block[]) || [])];
+  const m = mailFromSkeleton(t ? JSON.parse(t.skeleton) : {}, s.publication_name || "");
 
   // RETURNING, not lastInsertRowid: the app-supervisor storage binding reports no insert id.
   const row = await get<any>(
     `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-    [eyebrow, title, subtitle, skeleton.byline_name || "", skeleton.byline_date || "", skeleton.feature_image || "", JSON.stringify(blocks), slug, s.default_audience_id],
+    [m.eyebrow, deriveTitle(m.blocks) || m.title, m.subtitle, m.byline_name, m.byline_date, m.feature_image, JSON.stringify(m.blocks), slug, s.default_audience_id],
   );
   return c.json(parseMail(row), 201);
 });
