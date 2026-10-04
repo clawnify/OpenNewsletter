@@ -606,6 +606,9 @@ app.get("/api/mails/:id/preview", async (c) => {
   const mail = parseMail(row);
   const design = await resolveDesign(mail);
   const html = renderEmailHtml(mail, design, await getSettings(), { mobile: mail.design_mobile, merge: SAMPLE_VALUES });
+  // HTML blocks are author-written and this is the app's own origin: no script
+  // runs here, whatever a block contains.
+  c.header("Content-Security-Policy", "script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
   return c.html(html);
 });
 

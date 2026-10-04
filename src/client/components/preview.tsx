@@ -1,8 +1,10 @@
-import { useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   ChevronUp, ChevronDown, ChevronsUpDown, Trash2, Sparkles, Plus, Check,
-  Image as ImageIcon, Type, Heading, List as ListIcon, Quote, Minus, MousePointerClick, Columns as ColumnsIcon, Upload,
+  Image as ImageIcon, Type, Heading, List as ListIcon, Quote, Minus, MousePointerClick, Columns as ColumnsIcon, Upload, Code,
 } from "lucide-react";
+import { renderBlock, renderHtmlBlock } from "../../shared/email-blocks";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
 import { markdownToHtml } from "../../shared/markdown";
 import { designVars, fontStack, type DesignTokens } from "../../shared/design";
 import { TEXT_PRESETS, currentPreset, applyPreset, type TextPreset } from "../../shared/blocks";
@@ -91,6 +93,8 @@ export function Preview({ mail, design, settings, edit }: { mail: Mail; design: 
 }
 
 function BlockWrap({ edit, block, index, count, design, children }: { edit?: EditHandlers; block: Block; index: number; count: number; design: DesignTokens; children: React.ReactNode }) {
+  // The HTML being edited, or null. A block that isn't HTML yet is converted on Save, so Cancel leaves it as it was.
+  const [htmlDraft, setHtmlDraft] = useState<string | null>(null);
   if (!edit) return <div style={{ marginBottom: design.layout.spacing }}>{children}</div>;
 
   if (edit.selectMode) {
@@ -109,6 +113,8 @@ function BlockWrap({ edit, block, index, count, design, children }: { edit?: Edi
 
   const selected = edit.selectedId === block.id;
   const stylable = block.type === "heading" || block.type === "text";
+  // Any block can become HTML: it starts as exactly the email markup it sends today.
+  const openHtml = () => setHtmlDraft(block.type === "html" ? block.html : readable(renderBlock(block, design)));
   return (
     <div
       className={`group relative rounded-md p-0.5 transition ${selected ? "ring-2 ring-primary/40" : "hover:ring-1 hover:ring-border"}`}
@@ -118,13 +124,98 @@ function BlockWrap({ edit, block, index, count, design, children }: { edit?: Edi
       <div className={`absolute -top-3 right-2 z-10 flex items-center gap-0.5 rounded-lg border bg-background p-0.5 shadow-sm ${selected ? "" : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100"}`}>
         {stylable ? <PresetMenu block={block} onPick={(p) => edit.onReplace(block.id, applyPreset(block, p))} /> : null}
         <Tool icon={Sparkles} title="Rewrite with AI" onClick={() => edit.onBlockAI(block)} />
+        <Tool icon={Code} title={block.type === "html" ? "Edit HTML" : "Edit as HTML (stops following the design settings)"} onClick={openHtml} />
         <Tool icon={ChevronUp} title="Move up" disabled={index === 0} onClick={() => edit.onMove(index, -1)} />
         <Tool icon={ChevronDown} title="Move down" disabled={index === count - 1} onClick={() => edit.onMove(index, 1)} />
         <Tool icon={Trash2} title="Delete" onClick={() => edit.onDelete(index)} />
       </div>
       {children}
       <AddBar inline onAdd={(t) => edit.onAdd(index + 1, t)} />
+      {htmlDraft !== null ? (
+        <HtmlEditor
+          html={htmlDraft}
+          design={design}
+          onSave={(html) => {
+            if (block.type !== "html") edit.onReplace(block.id, { id: block.id, type: "html", html });
+            else if (html !== block.html) edit.onBlock(block.id, { html });
+            setHtmlDraft(null);
+          }}
+          onClose={() => setHtmlDraft(null)}
+        />
+      ) : null}
     </div>
+  );
+}
+
+/**
+ * One line per table row, cell and div, so converted markup is editable. Only
+ * between structural tags: a break between inline tags would add a space.
+ */
+function readable(html: string): string {
+  return html.replace(/(<\/?(?:table|tbody|tr|td|div)\b[^>]*>)(?=<)/g, "$1\n");
+}
+
+/**
+ * An HTML block on the canvas. Sandboxed with scripts off, so markup a teammate
+ * pasted can't run in this app. Same-origin only so the frame's height can be
+ * read; without scripts that grants the frame nothing.
+ */
+function HtmlFrame({ html, design }: { html: string; design: DesignTokens }) {
+  const ref = useRef<HTMLIFrameElement>(null);
+  const [height, setHeight] = useState(48);
+  const doc =
+    `<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:transparent;overflow:hidden}` +
+    `body{font-family:${fontStack(design.typography.bodyFont)};font-size:${design.typography.baseSize}px;line-height:${design.typography.lineHeight};color:${design.colors.foreground}}` +
+    `img{max-width:100%}</style></head><body>${renderHtmlBlock(html)}</body></html>`;
+  useEffect(() => {
+    const frame = ref.current;
+    if (!frame) return;
+    let observer: ResizeObserver | undefined;
+    const measure = () => {
+      const body = frame.contentDocument?.body;
+      if (body) setHeight(Math.max(24, Math.ceil(body.scrollHeight)));
+    };
+    const onLoad = () => {
+      measure();
+      const body = frame.contentDocument?.body;
+      if (body) (observer = new ResizeObserver(measure)).observe(body);
+    };
+    frame.addEventListener("load", onLoad);
+    return () => { frame.removeEventListener("load", onLoad); observer?.disconnect(); };
+  }, [doc]);
+  // pointer-events off: a click selects the block, and links can't open from a sandbox anyway.
+  return <iframe ref={ref} title="HTML block" sandbox="allow-same-origin" srcDoc={doc} style={{ display: "block", width: "100%", height, border: 0, pointerEvents: "none" }} />;
+}
+
+/** Code on the left, the block as it will look on the right. One save is one undo step. */
+function HtmlEditor({ html, design, onSave, onClose }: { html: string; design: DesignTokens; onSave: (html: string) => void; onClose: () => void }) {
+  const [draft, setDraft] = useState(html);
+  return (
+    <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
+      <DialogContent className="sm:max-w-5xl" onClick={(e) => e.stopPropagation()}>
+        <DialogHeader><DialogTitle>Edit HTML</DialogTitle></DialogHeader>
+        <div className="grid min-h-[420px] gap-3 md:grid-cols-2">
+          <textarea
+            autoFocus
+            spellCheck={false}
+            aria-label="HTML"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            className="min-h-[420px] w-full resize-none rounded-md bg-muted p-3 font-mono text-xs leading-relaxed shadow-edge outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+          <div className="overflow-auto rounded-md p-3 shadow-edge" style={{ background: design.colors.background }}>
+            <HtmlFrame html={draft} design={design} />
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Use tables and inline styles; mail clients ignore most other CSS. Scripts, forms and embeds are removed when the email is sent. Merge tags such as <code>{"{{first_name|there}}"}</code> work here too.
+        </p>
+        <DialogFooter>
+          <DialogClose asChild><Button type="button" variant="ghost">Cancel</Button></DialogClose>
+          <Button type="button" onClick={() => onSave(draft)}>Save</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -199,6 +290,8 @@ function BlockView({ block, design, edit }: { block: Block; design: DesignTokens
       return <hr style={{ border: 0, borderTop: `1px solid ${design.colors.border}`, margin: 0 }} />;
     case "spacer":
       return <div style={{ height: block.size }} className="rounded bg-muted/60" />;
+    case "html":
+      return <HtmlFrame html={block.html} design={design} />;
     case "columns":
       return (
         <div style={{ display: "flex", gap: 16 }}>
@@ -315,6 +408,7 @@ const BLOCK_TYPES: { type: BlockType; label: string; icon: typeof Type }[] = [
   { type: "quote", label: "Quote", icon: Quote },
   { type: "divider", label: "Divider", icon: Minus },
   { type: "columns", label: "Columns", icon: ColumnsIcon },
+  { type: "html", label: "HTML", icon: Code },
 ];
 
 function AddBar({ onAdd, inline }: { onAdd: (t: BlockType) => void; inline?: boolean }) {

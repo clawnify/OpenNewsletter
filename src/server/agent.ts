@@ -30,6 +30,11 @@ Starting fresh / restructuring:
 - Markdown for set_content / add_block: "# Title", "## Section", paragraphs separated by blank lines, "- item" lists, "> quote", "![alt](url)" images, "[label](url)" alone on a line for a button, "---" for a divider.
 - If the user attaches an image and wants it in the newsletter, call add_image with a short alt description — it uploads the attachment to storage and inserts an image block.
 
+HTML blocks (for designs the other blocks can't express: a hero with a background, a coloured band, a multi-column layout with buttons, a pasted snippet):
+- add_html_block adds one; edit_block on an html block replaces its whole HTML (the outline shows it in full).
+- Write email HTML: tables for layout, inline styles, absolute image URLs, at most 600px wide. No scripts, forms or external CSS; mail clients drop them. Merge tags work inside.
+- Prefer the regular blocks when they can do the job: they follow the design settings and an HTML block doesn't.
+
 Design:
 - Only touch design tokens (set_design) when the user asks about look, colour, fonts or roundness.
 
@@ -79,6 +84,14 @@ export const NEWSLETTER_TOOLS = {
     inputSchema: z.object({
       key: z.string(),
       value: z.union([z.string(), z.number(), z.boolean()]),
+    }),
+  }),
+  add_html_block: tool({
+    description:
+      "Add a block of raw email HTML (tables + inline styles) for a design the regular blocks can't express. It renders as written and does not follow the design tokens.",
+    inputSchema: z.object({
+      html: z.string().describe("Email-safe HTML: tables for layout, inline styles, no scripts."),
+      position: z.enum(["start", "end"]).default("end"),
     }),
   }),
   add_image: tool({
