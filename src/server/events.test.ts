@@ -65,9 +65,9 @@ describe("parseResendEvent", () => {
     const ev = parseResendEvent({
       type: "email.bounced",
       created_at: "2026-09-30T10:00:00Z",
-      data: { email_id: "e1", tags: { [DELIVERY_TAG]: "dlv_1" }, bounce: { type: "Permanent", message: "mailbox unavailable" } },
+      data: { email_id: "e1", to: ["Dead@Example.com"], tags: { [DELIVERY_TAG]: "dlv_1" }, bounce: { type: "Permanent", message: "mailbox unavailable" } },
     });
-    expect(ev).toEqual({ kind: "bounced", deliveryId: "dlv_1", messageId: "e1", at: "2026-09-30T10:00:00Z", permanent: true, reason: "mailbox unavailable" });
+    expect(ev).toEqual({ kind: "bounced", deliveryId: "dlv_1", messageId: "e1", at: "2026-09-30T10:00:00Z", permanent: true, reason: "mailbox unavailable", to: "dead@example.com" });
   });
 
   it("treats an unrecognised bounce type as temporary, and ignores events it doesn't act on", () => {
@@ -96,14 +96,14 @@ describe("applyDeliveryEvent", () => {
     Object.fromEntries((await query<{ id: string; status: string }>(`SELECT id, status FROM contacts ORDER BY id`)).map((r) => [r.id, r.status]));
 
   it("stops mailing a hard-bounced address on every list, but not a soft-bounced one", async () => {
-    await applyDeliveryEvent({ kind: "bounced", deliveryId: "d3", messageId: "e3", at, permanent: false, reason: "mailbox full" });
+    await applyDeliveryEvent({ kind: "bounced", deliveryId: "d3", messageId: "e3", at, permanent: false, reason: "mailbox full", to: null });
     expect((await statuses()).c3).toBe("subscribed");
-    await applyDeliveryEvent({ kind: "bounced", deliveryId: "d1", messageId: "e1", at, permanent: true, reason: "no such user" });
+    await applyDeliveryEvent({ kind: "bounced", deliveryId: "d1", messageId: "e1", at, permanent: true, reason: "no such user", to: null });
     expect(await statuses()).toEqual({ c1: "bounced", c2: "bounced", c3: "subscribed" });
   });
 
   it("unsubscribes a complainer from every list", async () => {
-    await applyDeliveryEvent({ kind: "complained", deliveryId: "d1", messageId: "e1", at });
+    await applyDeliveryEvent({ kind: "complained", deliveryId: "d1", messageId: "e1", at, to: null });
     expect(await statuses()).toEqual({ c1: "unsubscribed", c2: "unsubscribed", c3: "subscribed" });
   });
 
@@ -113,5 +113,25 @@ describe("applyDeliveryEvent", () => {
     const [d] = await query<{ clicked_at: string }>(`SELECT clicked_at FROM deliveries WHERE id = 'd1'`);
     expect(d.clicked_at).toBe(at);
     expect(await applyDeliveryEvent({ kind: "delivered", deliveryId: null, messageId: "confirmation-email", at })).toBe("unknown-delivery");
+  });
+
+  // Flow emails send without a delivery row. A hard bounce or complaint on one
+  // must still suppress the contact, keyed on the address the provider reports.
+  it("suppresses a hard bounce with no delivery row (e.g. a flow email) by recipient", async () => {
+    const r = await applyDeliveryEvent({ kind: "bounced", deliveryId: null, messageId: "flow-msg", at, permanent: true, reason: "no such user", to: "x@example.com" });
+    expect(r).toBe("suppressed-no-delivery");
+    expect(await statuses()).toEqual({ c1: "bounced", c2: "bounced", c3: "subscribed" });
+  });
+
+  it("unsubscribes a complaint with no delivery row by recipient", async () => {
+    const r = await applyDeliveryEvent({ kind: "complained", deliveryId: null, messageId: "flow-msg", at, to: "y@example.com" });
+    expect(r).toBe("suppressed-no-delivery");
+    expect((await statuses()).c3).toBe("unsubscribed");
+  });
+
+  it("a soft bounce with no delivery row changes nothing", async () => {
+    const r = await applyDeliveryEvent({ kind: "bounced", deliveryId: null, messageId: "flow-msg", at, permanent: false, reason: "mailbox full", to: "x@example.com" });
+    expect(r).toBe("unknown-delivery");
+    expect((await statuses()).c1).toBe("subscribed");
   });
 });

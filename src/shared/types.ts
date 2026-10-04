@@ -141,6 +141,21 @@ export interface Settings {
   senders: Sender[];
   default_audience_id: string | null;
   footer_text: string;
+  /** The sibling app chosen as the contacts source (from the app directory), or null. The opt-in. */
+  crm_app_id: string | null;
+}
+
+/** A sibling app discovered via GET /api/connected-apps. */
+export interface ConnectedApp {
+  id: string;
+  slug: string;
+  name: string;
+  icon_glyph: string | null;
+  icon_svg: string | null;
+  framework: string | null;
+  /** Capabilities the app declares (clawnify.json `app.provides`). */
+  provides: string[];
+  url: string;
 }
 
 /** Connection / capability status surfaced to the UI. */
@@ -148,7 +163,7 @@ export interface StatusInfo {
   resend_connected: boolean;
   ai_available: boolean;
   github_connected: boolean;
-  /** A CRM in the same workspace is reachable; enables "Import from CRM". */
+  /** A sibling CRM is picked (or a bundle set CRM_APP_ID) and reachable — enables "Import from CRM". */
   crm_connected?: boolean;
   /** Delivery events (bounces, complaints, clicks) reach this app. */
   tracking?: { enabled: boolean; source: "env" | "stored" | null; endpoint: string; events: string[] };

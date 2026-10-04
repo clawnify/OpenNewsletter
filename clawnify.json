@@ -51,6 +51,12 @@
         ]
       },
       {
+        "path": "/api/jobs/flow-step",
+        "methods": [
+          "POST"
+        ]
+      },
+      {
         "path": "/api/webhooks/resend",
         "methods": [
           "POST"
