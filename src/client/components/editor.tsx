@@ -134,6 +134,11 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
     else patch({ design: edited });
   };
   const resetMobile = () => patch({ design_mobile: null });
+  // How far this mail's own design has moved from its template's, if it has both.
+  const template = mail ? store.templates.find((t) => t.slug === mail.template_slug) : undefined;
+  const designChanges = mail?.design && template
+    ? Object.values(diffTokens(withDefaults(template.design), withDefaults(mail.design))).reduce((n, g) => n + Object.keys(g || {}).length, 0)
+    : 0;
 
   const toggleAI = (id: string) =>
     setAiSelected((prev) => {
@@ -362,8 +367,20 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
           </div>
         </div>
 
-        <aside className="hidden w-80 shrink-0 border-l bg-background lg:block">
-          <DesignPanel design={design} onChange={patchDesign} />
+        <aside className="hidden w-80 shrink-0 border-l bg-background lg:flex lg:flex-col">
+          {device === "desktop" && designChanges > 0 && mail.status !== "sent" && mail.status !== "sending" ? (
+            <div className="flex items-center justify-between gap-2 border-b px-3 py-2 text-xs text-muted-foreground">
+              <span>
+                {designChanges} {designChanges === 1 ? "change" : "changes"} from {template!.name}
+              </span>
+              <button className="inline-flex items-center gap-1 rounded-xs px-1.5 py-0.5 shadow-edge hover:bg-card" onClick={() => patch({ design: null })}>
+                <RotateCcw size={11} /> Reset
+              </button>
+            </div>
+          ) : null}
+          <div className="min-h-0 flex-1">
+            <DesignPanel design={design} onChange={patchDesign} />
+          </div>
         </aside>
       </div>
 

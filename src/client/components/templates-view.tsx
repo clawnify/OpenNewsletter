@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 export function TemplatesView({ openMail }: { openMail: (id: number) => void }) {
-  const { templates, createMail, refreshTemplates, setError } = useStore();
+  const { templates, createMail, refreshTemplates, refreshMails, setError } = useStore();
   const [tab, setTab] = useState<"library" | "saved">("library");
 
   const use = async (slug: string) => {
@@ -22,7 +22,8 @@ export function TemplatesView({ openMail }: { openMail: (id: number) => void }) 
   const remove = async (slug: string) => {
     try {
       await api("DELETE", `/api/templates/${slug}`);
-      await refreshTemplates();
+      // Mails that showed this template now carry a copy of its design.
+      await Promise.all([refreshTemplates(), refreshMails()]);
     } catch (e) {
       setError((e as Error).message);
     }
