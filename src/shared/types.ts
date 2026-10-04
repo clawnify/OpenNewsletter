@@ -7,6 +7,19 @@ import type { DesignTokens } from "./design";
 
 export interface BlockBase {
   id: string;
+  /** A coloured section around the block. Absent, the block renders bare, exactly as before boxes existed. */
+  box?: BlockBox;
+}
+
+/**
+ * `background` is a design colour name (BOX_COLORS) or a hex value. Text inside
+ * keeps its colours where they read on it and switches to near-black or
+ * near-white where they don't.
+ */
+export interface BlockBox {
+  background?: string;
+  /** Inner padding in px. */
+  padding?: number;
 }
 /** Which design-guideline color a text block uses (resolved from tokens). */
 export type TextColor = "default" | "primary" | "secondary";
@@ -25,13 +38,27 @@ export type Block =
       italic?: boolean;
       align?: "left" | "center";
     })
-  | (BlockBase & { type: "image"; src: string; alt: string; caption: string; href: string })
-  | (BlockBase & { type: "button"; text: string; href: string; align: "left" | "center" | "right" })
+  | (BlockBase & {
+      type: "image"; src: string; alt: string; caption: string; href: string;
+      /** Percent of the content width (absent = full width). */
+      width?: number;
+      align?: "left" | "center" | "right";
+    })
+  | (BlockBase & {
+      type: "button"; text: string; href: string; align: "left" | "center" | "right";
+      /** Absent = solid. */
+      variant?: "solid" | "outline";
+      fullWidth?: boolean;
+    })
   | (BlockBase & { type: "list"; ordered: boolean; items: string[] })
   | (BlockBase & { type: "quote"; text: string; cite: string })
   | (BlockBase & { type: "divider" })
   | (BlockBase & { type: "spacer"; size: number })
-  | (BlockBase & { type: "columns"; items: ColumnCell[] });
+  | (BlockBase & { type: "columns"; items: ColumnCell[] })
+  // Author-written email HTML, for designs the other blocks can't express. It
+  // doesn't follow the design tokens; it renders as written, cleaned (see
+  // shared/email-html.ts), inside its own row.
+  | (BlockBase & { type: "html"; html: string });
 
 export type BlockType = Block["type"];
 
@@ -48,6 +75,8 @@ export interface Mail {
   /** Publication eyebrow, e.g. "THE EDITORIAL REVIEW • VOLUME XXIII". */
   eyebrow: string;
   title: string;
+  /** Inbox preview line shown after the subject. Hidden in the body. */
+  preheader: string;
   /** Deck / standfirst (Ghost: custom_excerpt). */
   subtitle: string;
   byline_name: string;
@@ -112,6 +141,21 @@ export interface Settings {
   senders: Sender[];
   default_audience_id: string | null;
   footer_text: string;
+  /** The sibling app chosen as the contacts source (from the app directory), or null. The opt-in. */
+  crm_app_id: string | null;
+}
+
+/** A sibling app discovered via GET /api/connected-apps. */
+export interface ConnectedApp {
+  id: string;
+  slug: string;
+  name: string;
+  icon_glyph: string | null;
+  icon_svg: string | null;
+  framework: string | null;
+  /** Capabilities the app declares (clawnify.json `app.provides`). */
+  provides: string[];
+  url: string;
 }
 
 /** Connection / capability status surfaced to the UI. */
@@ -119,7 +163,7 @@ export interface StatusInfo {
   resend_connected: boolean;
   ai_available: boolean;
   github_connected: boolean;
-  /** A CRM in the same workspace is reachable; enables "Import from CRM". */
+  /** A sibling CRM is picked (or a bundle set CRM_APP_ID) and reachable — enables "Import from CRM". */
   crm_connected?: boolean;
   /** Delivery events (bounces, complaints, clicks) reach this app. */
   tracking?: { enabled: boolean; source: "env" | "stored" | null; endpoint: string; events: string[] };

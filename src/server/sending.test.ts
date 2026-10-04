@@ -94,12 +94,12 @@ async function seed(subscribers: number, extra: { email: string; status: string 
 
 const snapshot = (): SendSnapshot => ({
   mail: {
-    id: 1, eyebrow: "", title: "Issue 1", subtitle: "", byline_name: "", byline_date: "", feature_image: "",
+    id: 1, eyebrow: "", title: "Issue 1", preheader: "", subtitle: "", byline_name: "", byline_date: "", feature_image: "",
     blocks: [], design: null, design_mobile: null, template_slug: null, audience_id: AUD, status: "draft",
     broadcast_id: null, scheduled_at: null, sent_at: null, created_at: "", updated_at: "",
   },
   design: DEFAULT_DESIGN,
-  settings: { publication_name: "Pub", logo: "", from_name: "", from_email: "a@b.co", senders: [], default_audience_id: AUD, footer_text: "" },
+  settings: { publication_name: "Pub", logo: "", from_name: "", from_email: "a@b.co", senders: [], default_audience_id: AUD, footer_text: "", crm_app_id: null },
   from: "a@b.co",
   origin: "https://pub.apps.clawnify.com",
 });
@@ -419,5 +419,81 @@ describe("send engine", () => {
     const r = await drainSend(1, p, { now: () => t });
     expect(r).toMatchObject({ status: "sent", sent: 2 });
     expect(p.delivered).toHaveLength(2);
+  });
+});
+
+describe("merge tags in a send", () => {
+  let p: FakeProvider;
+  beforeEach(async () => {
+    useSqlite();
+    p = new FakeProvider();
+    await run(`INSERT INTO audiences (id, name) VALUES (?, 'List')`, [AUD]);
+    await run(`INSERT INTO contacts (id, audience_id, email, first_name, status) VALUES ('con_a', ?, 'ada@example.com', 'Ada', 'subscribed')`, [AUD]);
+    await run(`INSERT INTO contacts (id, audience_id, email, first_name, status) VALUES ('con_b', ?, 'nameless@example.com', '', 'subscribed')`, [AUD]);
+    await run(`INSERT INTO mails (id, title, audience_id, status) VALUES (1, 'Issue 1', ?, 'draft')`, [AUD]);
+  });
+
+  const greeting = (merge: boolean): SendSnapshot => {
+    const snap = snapshot();
+    snap.mail.blocks = [{ id: "b1", type: "text", md: "Hi {{first_name|there}}," }];
+    return merge ? { ...snap, renderer: 2 } : snap;
+  };
+  const htmlFor = (to: string) => p.calls.flatMap((c) => c.messages).filter((m) => m.to === to).map((m) => m.html);
+
+  it("fills each reader's name, and the fallback when there is none", async () => {
+    await beginSend(1, AUD, greeting(true));
+    expect(await drainSend(1, p)).toMatchObject({ status: "sent", sent: 2 });
+    expect(htmlFor("ada@example.com")[0]).toContain("Hi Ada,");
+    expect(htmlFor("nameless@example.com")[0]).toContain("Hi there,");
+  });
+
+  // A retry reuses its idempotency key, and a key reused with a different
+  // payload is refused. So the names a send uses are the ones it started with.
+  it("keeps the names from when the send began, so a retried batch carries the same payload", async () => {
+    p.script = (_i, call) => (call === 1 ? "deliver-then-unknown" : { kind: "sent", ids: [] });
+    await beginSend(1, AUD, greeting(true));
+    await drainSend(1, p);
+    await run(`UPDATE contacts SET first_name = 'Grace' WHERE id = 'con_a'`);
+    await run(`UPDATE deliveries SET claimed_at = '2000-01-01T00:00:00.000Z' WHERE mail_id = 1`);
+    const r = await drainSend(1, p);
+    expect(r).toMatchObject({ status: "sent", sent: 2, failed: 0 });
+    expect(p.calls).toHaveLength(2);
+    expect(p.calls[1].idempotencyKey).toBe(p.calls[0].idempotencyKey);
+    expect(htmlFor("ada@example.com").every((h) => h.includes("Hi Ada,"))).toBe(true);
+    expect(dupes(p.delivered)).toEqual([]);
+  });
+
+  it("renders a send begun before the upgrade exactly as before: tags as written, old column padding", async () => {
+    const snap = greeting(false);
+    snap.mail.title = "For {{first_name}}";
+    snap.mail.blocks.push({ id: "c", type: "columns", items: [{ image: "", heading: "A", text: "a" }, { image: "", heading: "B", text: "b" }] });
+    await beginSend(1, AUD, snap);
+    await drainSend(1, p);
+    const html = htmlFor("ada@example.com")[0];
+    expect(html).toContain("Hi {{first_name|there}},");
+    expect(html).toContain("padding:0 8px;");
+    expect(p.calls[0].messages.every((m) => m.subject === undefined)).toBe(true);
+  });
+
+  it("personalizes the subject per reader, on one line", async () => {
+    await run(`UPDATE contacts SET first_name = 'Ada\r\nBcc: x@evil.example' WHERE id = 'con_a'`);
+    const snap = greeting(true);
+    snap.mail.title = "{{first_name|Friend}}, your week";
+    await beginSend(1, AUD, snap);
+    await drainSend(1, p);
+    const subjects = Object.fromEntries(p.calls.flatMap((c) => c.messages).map((m) => [m.to, m.subject]));
+    expect(subjects["ada@example.com"]).toBe("Ada Bcc: x@evil.example, your week");
+    expect(subjects["nameless@example.com"]).toBe("Friend, your week");
+  });
+
+  it("gives rows written before names were copied their names when a failed send resumes", async () => {
+    p.gate = () => ({ kind: "fatal", message: "domain not verified" });
+    await beginSend(1, AUD, greeting(false));
+    await drainSend(1, p);
+    await run(`UPDATE deliveries SET first_name = NULL, last_name = NULL`);
+    p.gate = () => null;
+    await beginSend(1, AUD, greeting(true));
+    await drainSend(1, p);
+    expect(htmlFor("ada@example.com").at(-1)).toContain("Hi Ada,");
   });
 });

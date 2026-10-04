@@ -30,6 +30,8 @@ export interface BatchMessage {
   unsubscribeUrl: string;
   /** Tagged on the message so delivery events map back to this row. */
   deliveryId?: string;
+  /** This recipient's subject, when merge tags make it differ from the batch's. */
+  subject?: string;
 }
 
 export interface SendBatchInput {

@@ -36,6 +36,23 @@ account. The provider is just delivery, and it's swappable.
 - **Embeddable signup widget** — drop `<script src=".../widget.js">` on your
   own site; it starts the same opt-in flow.
 - **Sending** — send now, or send a test to yourself. Bring your own API key.
+- **Personalization** — write `Hi {{first_name|there}},` in any text. Each
+  reader gets their own name, and the word after the bar goes to readers
+  without one. `{{last_name}}` and `{{email}}` work the same way. Names are
+  always inserted as plain text, so a signup can't slip a link into your issue.
+- **Preview text** — set the line inboxes show after the subject, instead of
+  letting them borrow the first words of the body.
+- **Styling without code** — give any block a coloured section with its own
+  padding (a dark hero, a light callout band); text inside switches to a
+  readable colour on its own. Size and align images, and make a button
+  outline or full width. The assistant can do all of it too.
+- **HTML when blocks aren't enough** — add an HTML block for a design the
+  blocks can't express (a hero with a background, a coloured band, buttons in
+  columns), or choose **Edit as HTML** on any block to start from exactly the
+  email markup it sends today. You edit it with a live preview; the assistant
+  can write HTML blocks too. Merge tags work inside them. Scripts, forms and
+  embeds are removed, and a snippet left unclosed can't spill into the next
+  block.
 - **Delivery tracking** — one click in Settings registers a Resend webhook with
   your own key. Hard bounces and spam complaints then stop future sends to
   that address on every list, and each sent issue shows delivered, clicked,

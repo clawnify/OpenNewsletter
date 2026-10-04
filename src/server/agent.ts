@@ -18,6 +18,7 @@ You help the user write and design email newsletters. The newsletter body is an 
 Authoring rules:
 - Newsletters are a single vertical column. Favour clear headings, short paragraphs, the occasional list, a divider between sections, and at most one call-to-action button.
 - Write real, specific copy — not lorem ipsum or "[placeholder]". If the user is vague, make tasteful editorial choices.
+- To address each reader, use merge tags in any text: {{first_name}}, {{last_name}}, {{email}}, with a fallback after a bar for an empty value, e.g. "Hi {{first_name|there}},". Use no other tags.
 
 Working with EXISTING content (this is the common case):
 - The outline shows every current block with its id and type. These blocks already carry deliberate styling — an "eyebrow" (small uppercase accent), a "deck" (italic standfirst), a button, etc. PRESERVE that structure.
@@ -28,6 +29,13 @@ Starting fresh / restructuring:
 - Use set_content (entire body as Markdown) ONLY when the newsletter is empty, or when the user explicitly asks to start over or change the layout.
 - Markdown for set_content / add_block: "# Title", "## Section", paragraphs separated by blank lines, "- item" lists, "> quote", "![alt](url)" images, "[label](url)" alone on a line for a button, "---" for a divider.
 - If the user attaches an image and wants it in the newsletter, call add_image with a short alt description — it uploads the attachment to storage and inserts an image block.
+
+Styling blocks: style_block gives any block a coloured section (a band, a callout, a dark hero) with padding; text inside switches to a readable colour on its own. It also sizes and aligns images and sets a button to outline or full width. Reach for it before HTML.
+
+HTML blocks (for designs the other blocks can't express: a hero with a background, a coloured band, a multi-column layout with buttons, a pasted snippet):
+- add_html_block adds one; edit_block on an html block replaces its whole HTML (the outline shows it in full).
+- Write email HTML: tables for layout, inline styles, absolute image URLs, at most 600px wide. No scripts, forms or external CSS; mail clients drop them. Merge tags work inside.
+- Prefer the regular blocks when they can do the job: they follow the design settings and an HTML block doesn't.
 
 Design:
 - Only touch design tokens (set_design) when the user asks about look, colour, fonts or roundness.
@@ -78,6 +86,27 @@ export const NEWSLETTER_TOOLS = {
     inputSchema: z.object({
       key: z.string(),
       value: z.union([z.string(), z.number(), z.boolean()]),
+    }),
+  }),
+  style_block: tool({
+    description:
+      "Style one block: a coloured section behind it with padding, an image's width and alignment, or a button's look. Pass only what changes.",
+    inputSchema: z.object({
+      block_id: z.string(),
+      background: z.string().optional().describe('A design colour (page, primary, secondary, foreground, border), a hex like "#F4F4F5", or "none" to remove the section.'),
+      padding: z.number().optional().describe("Inner padding in px (0-64)."),
+      image_width: z.number().optional().describe("Image width as a percent of the content (10-100)."),
+      image_align: z.enum(["left", "center", "right"]).optional(),
+      button_variant: z.enum(["solid", "outline"]).optional(),
+      button_full_width: z.boolean().optional(),
+    }),
+  }),
+  add_html_block: tool({
+    description:
+      "Add a block of raw email HTML (tables + inline styles) for a design the regular blocks can't express. It renders as written and does not follow the design tokens.",
+    inputSchema: z.object({
+      html: z.string().describe("Email-safe HTML: tables for layout, inline styles, no scripts."),
+      position: z.enum(["start", "end"]).default("end"),
     }),
   }),
   add_image: tool({

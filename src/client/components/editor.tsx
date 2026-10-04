@@ -6,6 +6,7 @@ import { baseDesign, effectiveDesign } from "../lib/design";
 import { diffTokens, withDefaults, type DesignTokens } from "../../shared/design";
 import { newBlock, markdownToBlocks, deriveTitle, blockId } from "../../shared/blocks";
 import type { Block, BlockType, Mail } from "../../shared/types";
+import { SAMPLE_VALUES, fillBlocksText } from "../../shared/merge";
 import { Preview, type EditHandlers } from "./preview";
 import { DesignPanel } from "./design-panel";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
@@ -45,12 +46,18 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   const design = useMemo<DesignTokens>(() => (mail ? effectiveDesign(mail, store.templates, device) : withDefaults(null)), [mail, store.templates, device]);
 
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Edits inside one debounce window are merged: saving only the last patch
+  // dropped an earlier edit to another field (preview text, then a block).
+  const pending = useRef<Partial<Mail>>({});
   const queueSave = (next: Mail, patch: Partial<Mail>) => {
     setSaved(false);
+    pending.current = { ...pending.current, ...patch };
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(async () => {
+      const merged = pending.current;
+      pending.current = {};
       try {
-        await store.saveMail(next.id, patch);
+        await store.saveMail(next.id, merged);
         setSaved(true);
       } catch (e) {
         store.setError((e as Error).message);
@@ -141,7 +148,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
     const cur = live.current.mail;
     if (!cur) return {};
     const outline =
-      (cur.blocks || []).map((b) => `[${b.id}] ${b.type}: ${blockPreview(b)}`).join("\n") || "(empty)";
+      (cur.blocks || []).map((b) => `[${b.id}] ${b.type}${b.box?.background ? ` (section ${b.box.background})` : ""}: ${blockPreview(b)}`).join("\n") || "(empty)";
     const focus = [...aiSelected];
     const focusNote = focus.length ? `\n\nThe user has these block ids in focus — scope edits to them: ${focus.join(", ")}` : "";
     const d = `primary ${design.colors.primary}, background ${design.colors.background}, heading font ${design.typography.headingFont}, button radius ${design.layout.buttonRadius}px`;
@@ -185,6 +192,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
             case "quote": return { ...b, text };
             case "list": return { ...b, items: text.split("\n").map((s) => s.replace(/^\s*[-*+]\s+|^\s*\d+\.\s+/, "").trim()).filter(Boolean) };
             case "image": return { ...b, alt: text };
+            case "html": return { ...b, html: text };
             default: return b; // divider / spacer / columns — nothing textual to set
           }
         });
@@ -205,6 +213,37 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
         if (!next) return `I can't set "${input.key}".`;
         commit(device === "mobile" ? { design_mobile: diffTokens(base, next) } : { design: next });
         return `Set ${input.key}.`;
+      }
+      case "style_block": {
+        let found = false;
+        const blocks = (cur.blocks || []).map((b): Block => {
+          if (b.id !== input.block_id) return b;
+          found = true;
+          const next = { ...b } as Block & Record<string, unknown>;
+          if (input.background !== undefined || input.padding !== undefined) {
+            const bg = input.background === "none" ? undefined : input.background !== undefined ? String(input.background) : b.box?.background;
+            const pad = input.padding !== undefined ? Number(input.padding) : b.box?.padding;
+            next.box = bg || pad ? { ...(bg ? { background: bg } : {}), ...(pad !== undefined ? { padding: pad } : {}) } : undefined;
+          }
+          if (b.type === "image") {
+            if (input.image_width !== undefined) next.width = Number(input.image_width);
+            if (input.image_align !== undefined) next.align = input.image_align;
+          }
+          if (b.type === "button") {
+            if (input.button_variant !== undefined) next.variant = input.button_variant === "outline" ? "outline" : undefined;
+            if (input.button_full_width !== undefined) next.fullWidth = input.button_full_width ? true : undefined;
+          }
+          return next;
+        });
+        if (!found) return `No block ${input.block_id}.`;
+        commit({ blocks });
+        return "Styled the block.";
+      }
+      case "add_html_block": {
+        const block: Block = { id: blockId(), type: "html", html: String(input.html || "") };
+        const curBlocks = cur.blocks || [];
+        commit({ blocks: input.position === "start" ? [block, ...curBlocks] : [...curBlocks, block] });
+        return "Added the HTML block.";
       }
       case "add_image": {
         // src is resolved by the chat (it uploads the attachment before calling).
@@ -310,7 +349,15 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
 
           <div className="flex-1 overflow-auto p-6" onClick={(e) => e.stopPropagation()}>
             <div className="mx-auto transition-all" style={{ maxWidth: device === "mobile" ? 390 : design.layout.contentWidth + 80 }}>
-              <Preview mail={mail} design={design} settings={store.settings!} edit={mode === "edit" ? edit : undefined} />
+              {mode === "edit" ? (
+                <InboxLine mail={mail} onPreheader={(preheader) => patch({ preheader })} />
+              ) : null}
+              <Preview
+                mail={mode === "edit" ? mail : { ...mail, blocks: fillBlocksText(mail.blocks, SAMPLE_VALUES) }}
+                design={design}
+                settings={store.settings!}
+                edit={mode === "edit" ? edit : undefined}
+              />
             </div>
           </div>
         </div>
@@ -339,6 +386,34 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   );
 }
 
+/**
+ * What the inbox shows before the mail is opened: the subject (the title
+ * block) and the preview text. Saved on blur, so one edit is one undo step.
+ */
+function InboxLine({ mail, onPreheader }: { mail: Mail; onPreheader: (v: string) => void }) {
+  return (
+    <div className="mb-4 rounded-md bg-card p-3 text-sm shadow-edge">
+      <div className="flex items-baseline gap-3">
+        <span className="w-24 shrink-0 text-muted-foreground">Subject</span>
+        <span className="truncate font-medium">{mail.title || "Untitled"}</span>
+      </div>
+      <label className="mt-2 flex items-center gap-3">
+        <span className="w-24 shrink-0 text-muted-foreground">Preview text</span>
+        <Input
+          key={`${mail.id}:${mail.preheader}`}
+          defaultValue={mail.preheader}
+          placeholder="Shown after the subject in the inbox"
+          maxLength={150}
+          onBlur={(e) => { if (e.target.value !== mail.preheader) onPreheader(e.target.value); }}
+        />
+      </label>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Personalize any text with <code>{"{{first_name|there}}"}</code>, <code>{"{{last_name}}"}</code> or <code>{"{{email}}"}</code>. The word after the bar shows when the value is empty. Preview fills in a sample reader.
+      </p>
+    </div>
+  );
+}
+
 /** One-line preview of a block, for the assistant's outline. */
 function blockPreview(b: Block): string {
   const clip = (s: string) => (s.length > 60 ? s.slice(0, 57) + "…" : s);
@@ -352,6 +427,8 @@ function blockPreview(b: Block): string {
     case "divider": return "divider";
     case "spacer": return "spacer";
     case "columns": return `${b.items.length} columns`;
+    // In full (to a cap), so the assistant can rewrite it with edit_block.
+    case "html": return b.html.length > 4000 ? b.html.slice(0, 4000) + "\n…(truncated)" : b.html;
   }
 }
 

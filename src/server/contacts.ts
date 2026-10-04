@@ -81,7 +81,7 @@ export async function listAudiences(nowMs: number = Date.now()): Promise<Audienc
             (SELECT COUNT(*) FROM contacts c
               WHERE c.audience_id = a.id AND c.status = 'pending' AND c.confirm_sent_at < ?
                 AND c.confirm_attempts < ?) AS pending_due
-       FROM audiences a ORDER BY a.created_at`,
+       FROM audiences a ORDER BY a.created_at, a.rowid`,
     [new Date(nowMs - REMIND_AFTER_MS).toISOString(), MAX_CONFIRM_EMAILS],
   )) as unknown as Audience[];
 }
@@ -96,13 +96,40 @@ export async function createAudience(name: string, description = ""): Promise<Au
   return (await get(`SELECT * FROM audiences WHERE id = ?`, [id])) as Audience;
 }
 
-/** Every publication needs at least one list; create one on first use. */
+/**
+ * Every publication needs at least one list; create one on first use.
+ *
+ * One statement, so it is safe when a fresh install's first page load fires
+ * several requests at once. Reading first and inserting after made each of
+ * them see an empty table and create its own "Subscribers".
+ */
 export async function defaultAudience(): Promise<Audience> {
-  const existing = (await get(
-    `SELECT * FROM audiences ORDER BY created_at LIMIT 1`,
-    [],
-  )) as Audience | null;
-  return existing ?? (await createAudience("Subscribers"));
+  await run(
+    `INSERT INTO audiences (id, name, description)
+     SELECT ?, 'Subscribers', '' WHERE NOT EXISTS (SELECT 1 FROM audiences)`,
+    [`aud_${crypto.randomUUID().replace(/-/g, "")}`],
+  );
+  // rowid breaks the tie between lists created in the same second.
+  return (await get(`SELECT * FROM audiences ORDER BY created_at, rowid LIMIT 1`, [])) as Audience;
+}
+
+/**
+ * Remove the extra "Subscribers" lists the old first-use race created: same
+ * name and second as the first list, and nothing anywhere points at them (no
+ * contacts, no mail, not the default, no flow trigger). A list someone put people in or chose
+ * stays, even if it is one of them. Idempotent; runs at boot.
+ */
+export async function dropDuplicateDefaultAudiences(): Promise<void> {
+  await run(
+    `DELETE FROM audiences
+      WHERE name = 'Subscribers' AND description = ''
+        AND rowid <> (SELECT rowid FROM audiences ORDER BY created_at, rowid LIMIT 1)
+        AND created_at = (SELECT created_at FROM audiences ORDER BY created_at, rowid LIMIT 1)
+        AND NOT EXISTS (SELECT 1 FROM contacts WHERE contacts.audience_id = audiences.id)
+        AND NOT EXISTS (SELECT 1 FROM mails WHERE mails.audience_id = audiences.id)
+        AND NOT EXISTS (SELECT 1 FROM settings WHERE settings.default_audience_id = audiences.id)
+        AND NOT EXISTS (SELECT 1 FROM flows WHERE json_extract(flows.trigger_config, '$.audience_id') = audiences.id)`,
+  );
 }
 
 // ── Contacts ────────────────────────────────────────────────────────────────

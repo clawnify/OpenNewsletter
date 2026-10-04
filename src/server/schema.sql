@@ -3,6 +3,8 @@ CREATE TABLE IF NOT EXISTS mails (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   eyebrow TEXT NOT NULL DEFAULT '',
   title TEXT NOT NULL DEFAULT 'Untitled',
+  -- Inbox preview line (preheader), rendered hidden as the body's first child.
+  preheader TEXT NOT NULL DEFAULT '',
   subtitle TEXT NOT NULL DEFAULT '',
   byline_name TEXT NOT NULL DEFAULT '',
   byline_date TEXT NOT NULL DEFAULT '',
@@ -53,7 +55,12 @@ CREATE TABLE IF NOT EXISTS settings (
   -- The Resend webhook "Turn on delivery tracking" registered, and its signing
   -- secret (verifies events; RESEND_WEBHOOK_SECRET in the env wins).
   resend_webhook_id TEXT,
-  resend_webhook_secret TEXT
+  resend_webhook_secret TEXT,
+  -- Which sibling app (from GET /v1/apps/directory) the operator picked as the
+  -- contacts source, NULL = none. This IS the opt-in: a CRM being reachable never
+  -- activates anything on its own; the operator chooses one in Settings before
+  -- any CRM read happens. Falls back to the CRM_APP_ID env var (bundle installs).
+  crm_app_id TEXT
 );
 
 -- Audiences (lists). Previously Resend segments; now local, so the list is the
@@ -124,6 +131,9 @@ CREATE TABLE IF NOT EXISTS deliveries (
   mail_id INTEGER NOT NULL,
   contact_id TEXT NOT NULL,
   email TEXT NOT NULL,
+  -- Merge-tag values as they were when the send started, like the email.
+  first_name TEXT,
+  last_name TEXT,
   batch INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),
@@ -158,6 +168,91 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_recipient ON deliveries(mail_id
 CREATE INDEX IF NOT EXISTS idx_deliveries_batch ON deliveries(mail_id, status, batch);
 CREATE INDEX IF NOT EXISTS idx_deliveries_provider ON deliveries(provider_message_id)
   WHERE provider_message_id IS NOT NULL;
+
+-- ── Automations (flows) ──────────────────────────────────────────────────────
+-- A flow is a small chain of steps a contact walks once: send an email, wait,
+-- send another. The design rule, lifted from the Klaviyo teardown
+-- (~/wiki/OpenNewsletter/klaviyo-flows-teardown.md §11): the ENROLLMENT ROW is
+-- the truth and a queued job is only a wake-up that re-checks it, because the
+-- platform queue is at-least-once and a job can't be cancelled once enqueued.
+-- See src/server/flows.ts for the engine; these mirror its FLOWS_DDL.
+
+-- One automation. trigger_type is immutable after creation (the merge-tag and
+-- condition vocabulary depend on it); the target audience can change while the
+-- flow has no live enrollments.
+CREATE TABLE IF NOT EXISTS flows (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft'
+    CHECK (status IN ('draft', 'live', 'paused', 'archived')),
+  trigger_type TEXT NOT NULL
+    CHECK (trigger_type IN ('subscribed', 'date_anniversary', 'api_event')),
+  -- {audience_id, consent_sources:[...]} etc. Shape depends on trigger_type.
+  trigger_config TEXT NOT NULL DEFAULT '{}',
+  reentry TEXT NOT NULL DEFAULT 'none'
+    CHECK (reentry IN ('none', 'always', 'after')),
+  reentry_after_seconds INTEGER,
+  entry_step_id TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Steps are nodes with stable ids, NEVER hard-deleted while a waiter could
+-- point at one: a delete is a tombstone plus forward_to_step_id, so a waking
+-- enrollment finds its step gone and follows the forward link to the next live
+-- step instead of being dropped.
+CREATE TABLE IF NOT EXISTS flow_steps (
+  id TEXT PRIMARY KEY,
+  flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+  -- 'split' is reserved: the engine (src/server/flows.ts) does not act on it in
+  -- v1, but it is in the CHECK from day one so adding multi-branch splits later
+  -- never needs a per-app table rebuild to widen the constraint.
+  kind TEXT NOT NULL CHECK (kind IN ('email', 'delay', 'split', 'end')),
+  -- email: {mail_id}        a mails row, copied from a template, rendered at send time
+  -- delay: {seconds}        at_time / weekdays reserved for later; v1 is duration only
+  -- split: {paths, else}    reserved; not yet instantiable
+  config TEXT NOT NULL DEFAULT '{}',
+  next_step_id TEXT,              -- email/delay point forward; end is terminal
+  deleted_at TEXT,               -- tombstone
+  forward_to_step_id TEXT,       -- where waiters go when this step was deleted
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_flow_steps_flow ON flow_steps(flow_id);
+
+-- One contact's single journey through one flow.
+CREATE TABLE IF NOT EXISTS flow_enrollments (
+  id TEXT PRIMARY KEY,
+  flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+  contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+  state TEXT NOT NULL CHECK (state IN ('waiting', 'completed', 'exited')),
+  current_step_id TEXT NOT NULL,     -- the one step they are scheduled for
+  due_at TEXT NOT NULL,              -- frozen when they arrived at this step
+  wake_seq INTEGER NOT NULL DEFAULT 0,-- bumped on every (re)schedule; stale wakes no-op
+  trigger_payload TEXT NOT NULL DEFAULT '{}', -- merge-value snapshot
+  exit_reason TEXT,                  -- unsubscribed | bounced | flow_archived | contact_deleted | unsupported_step
+  entered_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+-- At most one live journey per contact per flow. Re-entry is a new row after
+-- the old one ends.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_enroll_active
+  ON flow_enrollments(flow_id, contact_id) WHERE state = 'waiting';
+CREATE INDEX IF NOT EXISTS idx_enroll_due ON flow_enrollments(state, due_at);
+CREATE INDEX IF NOT EXISTS idx_enroll_step ON flow_enrollments(current_step_id, state);
+
+-- Append-only per-step outcomes: analytics, skip reasons, and send idempotency.
+CREATE TABLE IF NOT EXISTS flow_step_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  enrollment_id TEXT NOT NULL REFERENCES flow_enrollments(id) ON DELETE CASCADE,
+  step_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,          -- sent | skipped | exited
+  detail TEXT,                    -- skip/exit reason, or the provider message id
+  created_at TEXT DEFAULT (datetime('now'))
+);
+-- A step sends at most once per enrollment, whatever the queue redelivers.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_step_sent_once
+  ON flow_step_events(enrollment_id, step_id) WHERE outcome = 'sent';
 
 CREATE INDEX IF NOT EXISTS idx_mails_status ON mails(status);
 CREATE INDEX IF NOT EXISTS idx_mails_updated ON mails(updated_at);
