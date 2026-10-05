@@ -1414,7 +1414,7 @@ async function sendMailNow(
   // means an operator pressed send just now, which needs no such check — they
   // are looking at the issue and their intent is the request itself.
   scheduledFor?: string | null,
-): Promise<{ status: 200 | 400 | 404 | 409 | 502; body: Record<string, unknown> }> {
+): Promise<{ status: 200 | 400 | 404 | 409 | 502 | 503; body: Record<string, unknown> }> {
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   if (!row) return { status: 404, body: { error: "Not found" } };
   const mail = parseMail(row);
@@ -1436,7 +1436,10 @@ async function sendMailNow(
   if (row.status === "sent") return { status: 409, body: { error: "This issue has already been sent." } };
 
   const p = await provider(c);
-  if (!p) return { status: 400, body: { error: "No sending backend is configured." } };
+  // 503, not 400: with no key of its own the app resolves Resend through the
+  // org's connection, and a failed lookup (a network blip) also comes back
+  // null. A queued job must retry that, never treat it as the operator's to fix.
+  if (!p) return { status: 503, body: { error: "No sending backend could be resolved. Check Resend is connected, then try again." } };
   if (!mail.audience_id) {
     return { status: 400, body: { error: "Pick an audience before sending." } };
   }
@@ -1510,7 +1513,7 @@ async function sendMailNow(
   }
 
   const result = await drain(c, id, begun.sendId);
-  if (!result) return { status: 400, body: { error: "No sending backend is configured." } };
+  if (!result) return { status: 503, body: { error: "No sending backend could be resolved. Check Resend is connected, then try again." } };
   const updated = parseMail(await get<any>("SELECT * FROM mails WHERE id = ?", [id]));
   return sendResponse(result, updated);
 }
@@ -1623,9 +1626,10 @@ app.post("/api/jobs/send-mail", async (c) => {
   // retry with backoff, and no retry changes the outcome.
   if (r.status === 404) return c.json({ ok: true, skipped: "not-found" });
   if (r.status === 400) {
-    // Stopped before anything went out (no sender, unverified domain, nobody
-    // confirmed). The operator fixes that, so the issue goes back to draft and
-    // says why, instead of reading "scheduled" forever.
+    // Stopped before anything went out on something only the operator can fix
+    // (no audience, no sender, unverified domain, nobody confirmed), so the
+    // issue goes back to draft and says why, instead of reading "scheduled"
+    // forever. A backend that couldn't be resolved is a 503 and retries.
     const error = `Scheduled send didn't go out: ${String(r.body.error ?? "it couldn't start")}`;
     await run(
       `UPDATE mails SET status='draft', scheduled_at=NULL, send_error=?, updated_at=datetime('now')

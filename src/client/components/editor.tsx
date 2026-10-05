@@ -79,11 +79,12 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   };
 
   // Undo and redo move content only. Whether the issue is scheduled, sending
-  // or sent is what happened since, and an older copy must not put it back.
+  // or sent, and who it goes to (picked in the send dialog), is what happened
+  // since, and an older copy must not put it back.
   const restore = (snap: Mail) => {
     const cur = live.current.mail;
     const next = cur
-      ? { ...snap, status: cur.status, scheduled_at: cur.scheduled_at, sent_at: cur.sent_at, send_error: cur.send_error }
+      ? { ...snap, status: cur.status, scheduled_at: cur.scheduled_at, sent_at: cur.sent_at, send_error: cur.send_error, audience_id: cur.audience_id }
       : snap;
     setMail(next);
     queueSave(next, next);
@@ -278,6 +279,8 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
       store.refreshMails();
     } catch (e) {
       store.setError((e as Error).message);
+      // Most likely the job already ran: show the mail as it is now.
+      api<Mail>("GET", `/api/mails/${mailId}`).then(setMail).catch(() => {});
     }
   };
   const saveAsTemplate = () => { if (mail) setTemplateName(mail.title?.slice(0, 40) || "My template"); };

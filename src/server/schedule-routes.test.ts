@@ -141,6 +141,18 @@ describe("a scheduled job that finds the mail can't go out", () => {
     expect(row.send_error).toMatch(/^Scheduled send didn't go out: example\.com isn't a verified sending domain/);
   });
 
+  // Without a key of its own the app resolves Resend through the org's
+  // connection, and a failed lookup also comes back as "no provider".
+  it("retries, and keeps the schedule, when the sending backend can't be resolved", async () => {
+    const id = await readyMail();
+    const at = inAnHour();
+    await call("POST", `/api/mails/${id}/send`, { scheduled_at: at });
+    delete env.RESEND_API_KEY; // the connection lookup now hits the stub's 500
+    const fired = await call("POST", "/api/jobs/send-mail", jobs[0].payload);
+    expect(fired.status).toBe(503);
+    expect(mailRow(id)).toMatchObject({ status: "scheduled", scheduled_at: at, send_error: null });
+  });
+
   it("answers 200 for a mail deleted since it was scheduled", async () => {
     const id = await readyMail();
     await call("POST", `/api/mails/${id}/send`, { scheduled_at: inAnHour() });
