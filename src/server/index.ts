@@ -1484,7 +1484,20 @@ async function sendMailNow(
     return { status: 400, body: { error: "No confirmed subscribers on this audience yet." } };
   }
 
-  const { conversation: _conversation, ...frozen } = mail as Mail & { conversation?: unknown };
+  // The content the send delivers, without the send's own bookkeeping: a
+  // retried send must snapshot the same thing as its first attempt (beginSend
+  // compares them), and the previous snapshot must not nest inside the next.
+  const {
+    conversation: _conversation,
+    status: _status,
+    send_id: _sendId,
+    send_snapshot: _sendSnapshot,
+    send_error: _sendError,
+    scheduled_at: _scheduledAt,
+    sent_at: _sentAt,
+    updated_at: _updatedAt,
+    ...frozen
+  } = mail as Mail & Record<string, unknown>;
   const begun = await sending.beginSend(id, mail.audience_id, {
     mail: frozen,
     design: await resolveDesign(mail),

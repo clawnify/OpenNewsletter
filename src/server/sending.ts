@@ -103,7 +103,8 @@ export const DELIVERIES_DDL = [
 
 /** Everything a send needs, frozen at the moment it starts. */
 export interface SendSnapshot {
-  mail: Omit<Mail, "conversation">;
+  /** Content only. The send's own fields (status, send_snapshot, ...) are left out so a retry snapshots the same thing. */
+  mail: Omit<Mail, "conversation" | "status" | "scheduled_at" | "sent_at" | "updated_at">;
   design: DesignTokens;
   settings: Settings;
   from: string;
