@@ -62,3 +62,28 @@ export function sendVerdict(mail: ScheduledMailState, scheduledFor: string | nul
 
   return { send: true };
 }
+
+/** How far in the past a requested time may be and still count as "now" (clock skew, a slow click). */
+export const PAST_GRACE_MS = 60_000;
+
+/**
+ * The instant a schedule request names, or why it names none.
+ *
+ * The time must carry its own offset (`Z` or `+02:00`). A Worker runs in UTC,
+ * so `new Date("2026-10-05T14:00")` here is 14:00 UTC, while the operator who
+ * picked 14:00 in Amsterdam meant 12:00 UTC: the issue went out two hours late.
+ * Refusing a bare time makes every caller (the send dialog, an agent, a
+ * script) say which 14:00 it means.
+ */
+export function parseScheduleTime(
+  input: unknown,
+  nowMs: number,
+): { ok: true; iso: string } | { ok: false; error: string } {
+  if (typeof input !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i.test(input.trim())) {
+    return { ok: false, error: "scheduled_at needs a date, a time and a timezone, e.g. 2026-10-05T14:00:00+02:00." };
+  }
+  const when = new Date(input.trim());
+  if (Number.isNaN(when.getTime())) return { ok: false, error: "scheduled_at isn't a real date." };
+  if (when.getTime() < nowMs - PAST_GRACE_MS) return { ok: false, error: "That time has already passed. Pick a later one, or send now." };
+  return { ok: true, iso: when.toISOString() };
+}
