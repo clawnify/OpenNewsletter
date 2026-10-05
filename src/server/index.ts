@@ -396,6 +396,13 @@ app.delete("/api/templates/:slug", async (c) => {
   const t = await get<any>("SELECT builtin FROM templates WHERE slug = ?", [slug]);
   if (!t) return c.json({ error: "Not found" }, 404);
   if (t.builtin) return c.json({ error: "Cannot delete a built-in template" }, 400);
+  // A mail with no design of its own shows its template's. Give those mails a
+  // copy first, so deleting the template never changes how a mail looks.
+  // Mails with their own design already hold a full copy and are left alone.
+  await run(
+    `UPDATE mails SET design = (SELECT design FROM templates WHERE slug = ?) WHERE template_slug = ? AND design IS NULL`,
+    [slug, slug],
+  );
   await run("DELETE FROM templates WHERE slug = ?", [slug]);
   return c.json({ ok: true });
 });
@@ -468,13 +475,24 @@ app.put("/api/mails/:id", async (c) => {
     // Decided inside the UPDATE, not from the row read above, so a send that
     // starts between the two can't be overwritten. Content edits still save;
     // the send delivers its own snapshot.
-    `UPDATE mails SET eyebrow=?, title=?, preheader=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?, design=?, design_mobile=?, template_slug=?, audience_id=?,
+    // The design columns are only written when this request sets them: a save
+    // carrying none must not put back a value read before a template delete
+    // copied its design into the mail.
+    `UPDATE mails SET eyebrow=?, title=?, preheader=?, subtitle=?, byline_name=?, byline_date=?, feature_image=?, blocks=?,
+       design = CASE WHEN ? THEN ? ELSE design END,
+       design_mobile = CASE WHEN ? THEN ? ELSE design_mobile END,
+       template_slug = CASE WHEN ? THEN ? ELSE template_slug END,
+       audience_id=?,
        status = CASE WHEN status IN ('sending', 'sent', 'failed') THEN status ELSE ? END,
        scheduled_at = CASE WHEN status IN ('sending', 'sent', 'failed') THEN scheduled_at ELSE ? END,
        updated_at=datetime('now') WHERE id=?`,
     [
       fields.eyebrow, fields.title, fields.preheader, fields.subtitle, fields.byline_name, fields.byline_date,
-      fields.feature_image, fields.blocks, fields.design, fields.design_mobile, fields.template_slug, fields.audience_id,
+      fields.feature_image, fields.blocks,
+      b.design !== undefined ? 1 : 0, fields.design,
+      b.design_mobile !== undefined ? 1 : 0, fields.design_mobile,
+      b.template_slug != null ? 1 : 0, fields.template_slug,
+      fields.audience_id,
       fields.status, fields.scheduled_at, id,
     ],
   );
