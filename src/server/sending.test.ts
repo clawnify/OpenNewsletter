@@ -95,8 +95,8 @@ async function seed(subscribers: number, extra: { email: string; status: string 
 const snapshot = (): SendSnapshot => ({
   mail: {
     id: 1, eyebrow: "", title: "Issue 1", preheader: "", subtitle: "", byline_name: "", byline_date: "", feature_image: "",
-    blocks: [], design: null, design_mobile: null, template_slug: null, audience_id: AUD, status: "draft",
-    broadcast_id: null, scheduled_at: null, sent_at: null, created_at: "", updated_at: "",
+    blocks: [], design: null, design_mobile: null, template_slug: null, audience_id: AUD,
+    broadcast_id: null, created_at: "",
   },
   design: DEFAULT_DESIGN,
   settings: { publication_name: "Pub", logo: "", from_name: "", from_email: "a@b.co", senders: [], default_audience_id: AUD, footer_text: "", crm_app_id: null },
