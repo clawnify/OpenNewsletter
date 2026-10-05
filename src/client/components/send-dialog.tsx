@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../api";
 import { useStore } from "../store";
 import type { Mail } from "../../shared/types";
@@ -7,18 +7,27 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { toLocalInput } from "../lib/status";
+
+const TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () => void; onSent: (i: Mail) => void }) {
-  const { status, settings, saveMail } = useStore();
+  const { status, settings, saveMail, refreshStatus } = useStore();
   const [audienceId, setAudienceId] = useState(mail.audience_id || settings?.default_audience_id || "");
   const [testTo, setTestTo] = useState("");
-  const [when, setWhen] = useState("");
+  // Rescheduling starts from the time already set.
+  const [when, setWhen] = useState(mail.status === "scheduled" && mail.scheduled_at ? toLocalInput(mail.scheduled_at) : "");
   const [busy, setBusy] = useState<"" | "test" | "send">("");
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   const connected = status?.resend_connected;
   const audiences = status?.audiences || [];
+  // Counts as of now, not as of when the app loaded.
+  useEffect(() => { refreshStatus().catch(() => {}); }, [refreshStatus]);
+  const audience = audiences.find((a) => a.id === audienceId);
+  const confirmed = audience?.subscribed_count ?? 0;
+  const pending = audience?.pending_count ?? 0;
 
   // From-addresses: the primary settings sender + any saved senders.
   const senders: { label: string; value: string }[] = [];
@@ -51,7 +60,10 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
     setBusy("send");
     try {
       if (mail.audience_id !== audienceId) await saveMail(mail.id, { audience_id: audienceId });
-      const res = await api<{ mail: Mail }>("POST", `/api/mails/${mail.id}/send`, { scheduled_at: when || undefined, from });
+      // The input is wall-clock time in this browser's timezone; the server needs
+      // the instant, so the offset goes with it.
+      const scheduled_at = when ? new Date(when).toISOString() : undefined;
+      const res = await api<{ mail: Mail }>("POST", `/api/mails/${mail.id}/send`, { scheduled_at, from });
       onSent(res.mail);
     } catch (e) {
       setErr((e as Error).message);
@@ -94,6 +106,18 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
                   {audiences.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}
                 </SelectContent>
               </Select>
+              {audience ? (
+                confirmed > 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    Goes to {confirmed.toLocaleString()} confirmed {confirmed === 1 ? "subscriber" : "subscribers"}.
+                    {pending > 0 ? ` ${pending.toLocaleString()} still waiting to confirm won't get it.` : ""}
+                  </p>
+                ) : (
+                  <p className="rounded-sm bg-warning-tint p-2 text-xs text-warning">
+                    Nobody on this audience has confirmed yet{pending > 0 ? ` (${pending.toLocaleString()} waiting)` : ""}, so there is no one to send to.
+                  </p>
+                )
+              ) : null}
             </div>
 
             <div className="rounded-md p-3 shadow-edge">
@@ -107,8 +131,9 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
             </div>
 
             <div className="space-y-1.5">
-              <Label>Schedule (optional)</Label>
-              <Input type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} />
+              <Label htmlFor="send-when">Schedule (optional)</Label>
+              <Input id="send-when" type="datetime-local" value={when} min={toLocalInput(new Date().toISOString())} onChange={(e) => setWhen(e.target.value)} />
+              <p className="text-xs text-muted-foreground">Your time ({TIMEZONE.replace(/_/g, " ")}).</p>
             </div>
           </div>
         )}
@@ -119,7 +144,7 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
           {connected ? (
-            <Button disabled={!audienceId || !fromReady || busy === "send"} onClick={send}>
+            <Button disabled={!audienceId || !fromReady || busy === "send" || (!!audience && confirmed === 0 && mail.status !== "failed")} onClick={send}>
               {busy === "send" ? "Sending…" : when ? "Schedule" : "Send now"}
             </Button>
           ) : null}

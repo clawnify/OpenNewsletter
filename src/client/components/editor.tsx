@@ -15,7 +15,7 @@ import { SendDialog } from "./send-dialog";
 import { Chat, type ChatContext, type ApplyTool } from "./chat";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { statusTone } from "../lib/status";
+import { statusTone, whenLabel } from "../lib/status";
 import { DeliveryStats } from "./delivery-stats";
 
 export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void }) {
@@ -78,9 +78,15 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
     queueSave(next, p);
   };
 
+  // Undo and redo move content only. Whether the issue is scheduled, sending
+  // or sent is what happened since, and an older copy must not put it back.
   const restore = (snap: Mail) => {
-    setMail(snap);
-    queueSave(snap, snap);
+    const cur = live.current.mail;
+    const next = cur
+      ? { ...snap, status: cur.status, scheduled_at: cur.scheduled_at, sent_at: cur.sent_at, send_error: cur.send_error }
+      : snap;
+    setMail(next);
+    queueSave(next, next);
   };
   const undo = useCallback(() => {
     const { mail, history } = live.current;
@@ -265,6 +271,15 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
 
   // Naming happens in a dialog with the input first and focused, never window.prompt.
   const [templateName, setTemplateName] = useState<string | null>(null);
+  const unschedule = async () => {
+    try {
+      const res = await api<{ mail: Mail }>("POST", `/api/mails/${mailId}/unschedule`);
+      setMail((m) => (m ? { ...m, status: res.mail.status, scheduled_at: res.mail.scheduled_at } : m));
+      store.refreshMails();
+    } catch (e) {
+      store.setError((e as Error).message);
+    }
+  };
   const saveAsTemplate = () => { if (mail) setTemplateName(mail.title?.slice(0, 40) || "My template"); };
   const confirmSaveAsTemplate = async () => {
     const name = templateName?.trim();
@@ -295,7 +310,14 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
           <Badge variant="secondary">Mail</Badge>
           <span className="max-w-[260px] truncate font-medium">{mail.title || "Untitled"}</span>
           <span className="text-xs text-muted-foreground">{saved ? "Saved" : "Saving…"}</span>
-          {mail.status === "scheduled" ? <Badge className={`capitalize ${statusTone(mail.status)}`}>{mail.status}</Badge> : sent ? <DeliveryStats mail={mail} /> : null}
+          {mail.status === "scheduled" ? (
+            <>
+              <Badge className={statusTone(mail.status)}>Scheduled{mail.scheduled_at ? ` · ${whenLabel(mail.scheduled_at)}` : ""}</Badge>
+              <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={unschedule}>Cancel schedule</Button>
+            </>
+          ) : sent ? <DeliveryStats mail={mail} /> : mail.send_error ? (
+            <Badge className="max-w-[320px] truncate bg-warning-tint text-warning" title={mail.send_error}>{mail.send_error}</Badge>
+          ) : null}
         </div>
         <div className="ml-auto flex items-center gap-2">
           <div className="flex items-center">

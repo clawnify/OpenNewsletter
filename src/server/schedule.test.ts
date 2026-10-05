@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sendVerdict } from "./schedule";
+import { parseScheduleTime, sendVerdict } from "./schedule";
 
 const AT = "2026-08-01T09:00:00.000Z";
 const LATER = "2026-08-01T17:00:00.000Z";
@@ -67,5 +67,31 @@ describe("sendVerdict", () => {
     // exact compare is correct. Pinned as a test because loosening this to a
     // parsed comparison would let a stale job match a rescheduled mail.
     expect(sendVerdict({ status: "scheduled", scheduled_at: "2026-08-01T09:00:00Z" }, AT).send).toBe(false);
+  });
+});
+
+describe("parseScheduleTime", () => {
+  const NOW = Date.parse("2026-10-05T10:00:00Z");
+
+  // The send dialog used to post the bare datetime-local value. A Worker
+  // parses that as UTC, so 14:00 picked in Amsterdam went out at 16:00 there.
+  it("refuses a time without a timezone", () => {
+    expect(parseScheduleTime("2026-10-05T14:00", NOW).ok).toBe(false);
+    expect(parseScheduleTime("2026-10-05 14:00", NOW).ok).toBe(false);
+    expect(parseScheduleTime(undefined, NOW).ok).toBe(false);
+  });
+
+  it("reads the offset it is given", () => {
+    expect(parseScheduleTime("2026-10-05T14:00+02:00", NOW)).toEqual({ ok: true, iso: "2026-10-05T12:00:00.000Z" });
+    expect(parseScheduleTime("2026-10-05T12:00:00.000Z", NOW)).toEqual({ ok: true, iso: "2026-10-05T12:00:00.000Z" });
+  });
+
+  it("refuses a time that has passed, allowing a minute for a slow click", () => {
+    expect(parseScheduleTime("2026-10-05T09:58:00Z", NOW).ok).toBe(false);
+    expect(parseScheduleTime("2026-10-05T09:59:30Z", NOW).ok).toBe(true);
+  });
+
+  it("refuses a date that does not exist", () => {
+    expect(parseScheduleTime("2026-02-30T10:00:00Z", NOW).ok).toBe(false);
   });
 });

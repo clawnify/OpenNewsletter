@@ -160,15 +160,27 @@ const token = () => crypto.randomUUID().replace(/-/g, "");
  *   something the operator was meant to fix (the key, the sender). Delivered
  *   rows stay delivered; only unresolved rows go out.
  * - sent: refused.
+ *
+ * `scheduledFor` is set by a queued job: the claim then also requires the mail
+ * to still be scheduled for that job's time (null: any time). The job checked
+ * this already, but an operator can cancel or move the schedule between that
+ * read and this claim, and the plain claim would take a draft.
  */
-export async function beginSend(mailId: number, audienceId: string, snapshot: SendSnapshot): Promise<BeginResult> {
+export async function beginSend(
+  mailId: number,
+  audienceId: string,
+  snapshot: SendSnapshot,
+  scheduledFor?: string | null,
+): Promise<BeginResult> {
   const sendId = crypto.randomUUID();
+  const queued = scheduledFor !== undefined;
   const claimed = await query<{ id: number }>(
     `UPDATE mails SET status = 'sending', send_id = ?, send_snapshot = ?, send_error = NULL,
             updated_at = datetime('now')
-      WHERE id = ? AND status IN ('draft', 'scheduled')
+      WHERE id = ? AND (CASE WHEN ? THEN status = 'scheduled' AND (? IS NULL OR scheduled_at = ?)
+                             ELSE status IN ('draft', 'scheduled') END)
       RETURNING id`,
-    [sendId, JSON.stringify(snapshot), mailId],
+    [sendId, JSON.stringify(snapshot), mailId, queued ? 1 : 0, scheduledFor ?? null, scheduledFor ?? null],
   );
   if (claimed.length > 0) {
     await writeRecipients(mailId, audienceId);

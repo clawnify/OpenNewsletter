@@ -10,7 +10,7 @@ import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
 import { SAMPLE_VALUES, fillSubject, type MergeValues } from "../shared/merge";
-import { sendVerdict } from "./schedule";
+import { parseScheduleTime, sendVerdict } from "./schedule";
 import * as sending from "./sending";
 import * as flows from "./flows";
 import { applyDeliveryEvent } from "./events";
@@ -461,8 +461,6 @@ app.put("/api/mails/:id", async (c) => {
     design_mobile: b.design_mobile !== undefined ? storedTokens(b.design_mobile) : existing.design_mobile,
     template_slug: b.template_slug ?? existing.template_slug,
     audience_id: b.audience_id !== undefined ? b.audience_id : existing.audience_id,
-    status: b.status ?? existing.status,
-    scheduled_at: b.scheduled_at !== undefined ? b.scheduled_at : existing.scheduled_at,
   };
 
 
@@ -471,11 +469,12 @@ app.put("/api/mails/:id", async (c) => {
   if (b.blocks !== undefined) fields.title = deriveTitle(b.blocks);
 
   await run(
-    // Once a send has started, only the send engine moves the status: a client
-    // carrying an old status must not pull a running send back to draft.
-    // Decided inside the UPDATE, not from the row read above, so a send that
-    // starts between the two can't be overwritten. Content edits still save;
-    // the send delivers its own snapshot.
+    // Content only. `status` and `scheduled_at` belong to the send and schedule
+    // routes, and a body carrying them is ignored: the editor's undo restores a
+    // whole earlier copy of the mail, and writing its status back cancelled a
+    // schedule (undo after scheduling) or left an issue reading "scheduled"
+    // with no job for that time (undo across a reschedule). Content edits to a
+    // scheduled or running send still save; a send delivers its own snapshot.
     // The design columns are only written when this request sets them: a save
     // carrying none must not put back a value read before a template delete
     // copied its design into the mail.
@@ -484,8 +483,6 @@ app.put("/api/mails/:id", async (c) => {
        design_mobile = CASE WHEN ? THEN ? ELSE design_mobile END,
        template_slug = CASE WHEN ? THEN ? ELSE template_slug END,
        audience_id=?,
-       status = CASE WHEN status IN ('sending', 'sent', 'failed') THEN status ELSE ? END,
-       scheduled_at = CASE WHEN status IN ('sending', 'sent', 'failed') THEN scheduled_at ELSE ? END,
        updated_at=datetime('now') WHERE id=?`,
     [
       fields.eyebrow, fields.title, fields.preheader, fields.subtitle, fields.byline_name, fields.byline_date,
@@ -493,8 +490,7 @@ app.put("/api/mails/:id", async (c) => {
       b.design !== undefined ? 1 : 0, fields.design,
       b.design_mobile !== undefined ? 1 : 0, fields.design_mobile,
       b.template_slug != null ? 1 : 0, fields.template_slug,
-      fields.audience_id,
-      fields.status, fields.scheduled_at, id,
+      fields.audience_id, id,
     ],
   );
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
@@ -1506,7 +1502,7 @@ async function sendMailNow(
     from,
     origin: new URL(c.req.url).origin,
     renderer: 2,
-  });
+  }, scheduledFor);
   if (!begun.ok) {
     return begun.reason === "already-sent"
       ? { status: 409, body: { error: "This issue has already been sent." } }
@@ -1526,10 +1522,9 @@ app.post("/api/mails/:id/send", async (c) => {
     .catch(() => ({}) as { scheduled_at?: string; from?: string });
 
   if (scheduled_at) {
-    const when = new Date(scheduled_at);
-    if (Number.isNaN(when.getTime())) {
-      return c.json({ error: "Invalid scheduled_at — expected an ISO-8601 timestamp." }, 400);
-    }
+    const parsed = parseScheduleTime(scheduled_at, Date.now());
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    const when = new Date(parsed.iso);
     const current = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
     if (!current) return c.json({ error: "Not found" }, 404);
     if (current.status !== "draft" && current.status !== "scheduled") {
@@ -1547,8 +1542,11 @@ app.post("/api/mails/:id/send", async (c) => {
       // when nothing exists to fire it.
       return c.json({ error: e?.message || "Could not schedule this send." }, 502);
     }
+    // Guarded like the status check above, which ran before the enqueue: a
+    // send that started in between keeps its status.
     await run(
-      `UPDATE mails SET status='scheduled', scheduled_at=?, sent_at=NULL, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE mails SET status='scheduled', scheduled_at=?, sent_at=NULL, send_error=NULL, updated_at=datetime('now')
+        WHERE id=? AND status IN ('draft', 'scheduled')`,
       [when.toISOString(), id],
     );
     const updated = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
@@ -1557,6 +1555,21 @@ app.post("/api/mails/:id/send", async (c) => {
 
   const r = await sendMailNow(c, id, fromOverride);
   return c.json(r.body, r.status);
+});
+
+// Back to draft. The queued job still fires at its time and stops itself
+// (sendVerdict: not-scheduled); the platform has no way to delete it.
+app.post("/api/mails/:id/unschedule", async (c) => {
+  const id = Number(c.req.param("id"));
+  const rows = await query<any>(
+    `UPDATE mails SET status='draft', scheduled_at=NULL, updated_at=datetime('now')
+      WHERE id=? AND status='scheduled' RETURNING *`,
+    [id],
+  );
+  if (rows.length) return c.json({ ok: true, mail: parseMail(rows[0]) });
+  const row = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json({ error: row.status === "draft" ? "This issue isn't scheduled." : `Too late: this issue is ${row.status}.` }, 409);
 });
 
 // Queue delivery target for scheduled sends. Public (the queue calls it from
@@ -1604,7 +1617,23 @@ app.post("/api/jobs/send-mail", async (c) => {
   // Jobs enqueued before the payload carried scheduled_for are still in flight
   // across this deploy. null keeps their status guards and skips only the
   // timestamp compare they cannot answer — see sendVerdict.
-  const r = await sendMailNow(c, id, body.from, body.scheduled_for ?? null);
+  const scheduledFor = body.scheduled_for ?? null;
+  const r = await sendMailNow(c, id, body.from, scheduledFor);
+  // Every answer below is final, so each is a 200: a non-2xx makes the queue
+  // retry with backoff, and no retry changes the outcome.
+  if (r.status === 404) return c.json({ ok: true, skipped: "not-found" });
+  if (r.status === 400) {
+    // Stopped before anything went out (no sender, unverified domain, nobody
+    // confirmed). The operator fixes that, so the issue goes back to draft and
+    // says why, instead of reading "scheduled" forever.
+    const error = `Scheduled send didn't go out: ${String(r.body.error ?? "it couldn't start")}`;
+    await run(
+      `UPDATE mails SET status='draft', scheduled_at=NULL, send_error=?, updated_at=datetime('now')
+        WHERE id=? AND status='scheduled' AND (? IS NULL OR scheduled_at = ?)`,
+      [error, id, scheduledFor, scheduledFor],
+    );
+    return c.json({ ok: true, skipped: "precheck", error });
+  }
   return c.json(r.body, r.status);
 });
 

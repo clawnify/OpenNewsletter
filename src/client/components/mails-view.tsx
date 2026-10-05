@@ -4,7 +4,7 @@ import { useStore } from "../store";
 import type { Mail } from "../../shared/types";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { statusTone } from "../lib/status";
+import { statusTone, whenLabel } from "../lib/status";
 
 export function MailsView({ openMail }: { openMail: (id: number) => void }) {
   const { mails, templates, createMail, deleteMail, setError } = useStore();
@@ -85,7 +85,9 @@ function MailRow({ mail, onOpen, onDelete }: { mail: Mail; onOpen: () => void; o
         <div className="truncate font-medium">{mail.title || "Untitled"}</div>
         <div className="truncate text-xs text-muted-foreground">{mail.subtitle || mail.eyebrow}</div>
       </button>
-      <span className={`rounded-full px-2.5 py-1 text-xs font-medium capitalize ${badge}`}>{mail.status}</span>
+      <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${mail.status === "scheduled" ? "" : "capitalize"} ${badge}`}>
+        {mail.status === "scheduled" && mail.scheduled_at ? `Scheduled · ${whenLabel(mail.scheduled_at)}` : mail.status}
+      </span>
       <button className="inline-flex size-7 items-center justify-center rounded-[0.5rem] text-muted-foreground hover:bg-destructive-tint hover:text-destructive" onClick={onDelete} aria-label="Delete">
         <Trash2 size={16} />
       </button>
