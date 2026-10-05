@@ -15,7 +15,7 @@ import { SendDialog } from "./send-dialog";
 import { Chat, type ChatContext, type ApplyTool } from "./chat";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { statusTone, whenLabel } from "../lib/status";
+import { isLate, statusTone, whenLabel } from "../lib/status";
 import { DeliveryStats } from "./delivery-stats";
 
 export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void }) {
@@ -315,7 +315,13 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
           <span className="text-xs text-muted-foreground">{saved ? "Saved" : "Saving…"}</span>
           {mail.status === "scheduled" ? (
             <>
-              <Badge className={statusTone(mail.status)}>Scheduled{mail.scheduled_at ? ` · ${whenLabel(mail.scheduled_at)}` : ""}</Badge>
+              {isLate(mail) ? (
+                <Badge className="bg-warning-tint text-warning" title="Its time has passed and it hasn't gone out. Send it now, or cancel and schedule again.">
+                  Late: was due {whenLabel(mail.scheduled_at!)}
+                </Badge>
+              ) : (
+                <Badge className={statusTone(mail.status)}>Scheduled{mail.scheduled_at ? ` · ${whenLabel(mail.scheduled_at)}` : ""}</Badge>
+              )}
               <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={unschedule}>Cancel schedule</Button>
             </>
           ) : sent ? <DeliveryStats mail={mail} /> : mail.send_error ? (

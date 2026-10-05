@@ -25,3 +25,11 @@ export function toLocalInput(iso: string): string {
   const d = new Date(iso);
   return new Date(d.getTime() - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
 }
+
+/**
+ * A scheduled issue whose time is well past has not gone out: its job kept
+ * failing (an outage longer than the queue's retries) or never arrived.
+ */
+export function isLate(mail: { status: string; scheduled_at: string | null }, nowMs = Date.now()): boolean {
+  return mail.status === "scheduled" && !!mail.scheduled_at && Date.parse(mail.scheduled_at) < nowMs - 15 * 60_000;
+}

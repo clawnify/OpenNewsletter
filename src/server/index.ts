@@ -1345,6 +1345,11 @@ async function enqueueSend(c: any, mailId: number, runAt: string, from: string):
     //
     // The old job still exists and still fires; sendVerdict() is what stops it.
     idempotencyKey: `send-mail-${mailId}@${runAt}`,
+    // The platform's maximum. A 503 (the backend couldn't be resolved) is
+    // retried at 2, 4, 8, 16, 32 and then every 60 minutes: about 5 hours,
+    // where the default 5 attempts gave up after about 30 minutes and left the
+    // issue reading "scheduled". Past that, the editor flags it as late.
+    maxAttempts: 10,
   });
 }
 
@@ -1561,7 +1566,10 @@ app.post("/api/mails/:id/send", async (c) => {
 });
 
 // Back to draft. The queued job still fires at its time and stops itself
-// (sendVerdict: not-scheduled); the platform has no way to delete it.
+// (sendVerdict: not-scheduled). It is deliberately NOT cancelled: enqueueing a
+// key that exists returns the existing row whatever its status, so cancelling,
+// then scheduling the same minute again, would get back a cancelled job and
+// the issue would never go out.
 app.post("/api/mails/:id/unschedule", async (c) => {
   const id = Number(c.req.param("id"));
   const rows = await query<any>(

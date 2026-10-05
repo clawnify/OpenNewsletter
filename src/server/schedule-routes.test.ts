@@ -81,6 +81,8 @@ describe("scheduling a send", () => {
     expect(res.status).toBe(200);
     expect(mailRow(id)).toMatchObject({ status: "scheduled", scheduled_at: "2099-12-01T13:00:00.000Z" });
     expect(jobs[0].runAt).toBe("2099-12-01T13:00:00.000Z");
+    // The default 5 attempts gave up on an outage after about 30 minutes.
+    expect((jobs[0] as any).maxAttempts).toBe(10);
   });
 });
 
