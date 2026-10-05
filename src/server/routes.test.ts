@@ -137,3 +137,28 @@ describe("boot migration", () => {
     expect(cols).toEqual(expect.arrayContaining(["first_name", "last_name"]));
   });
 });
+
+describe("design tokens on the way in", () => {
+  it("stores only usable values for a mail's design and mobile override, and never renders the rest", async () => {
+    const { id } = await (await call("POST", "/api/mails", {})).json();
+    const saved = await (
+      await call("PUT", `/api/mails/${id}`, {
+        design: { ...DEFAULT_DESIGN, colors: { ...DEFAULT_DESIGN.colors, primary: "#0F766E", link: "x;}</style><b>" }, typography: { ...DEFAULT_DESIGN.typography, titleSize: 4840 } },
+        design_mobile: { colors: { background: "red}</style><script>alert(1)</script>" } },
+      })
+    ).json();
+    expect(saved.design.colors).toMatchObject({ primary: "#0F766E" });
+    expect(saved.design.colors.link).toBeUndefined();
+    expect(saved.design.typography.titleSize).toBe(72);
+    expect(saved.design_mobile).toBeNull();
+    const html = await (await app.request(`/api/mails/${id}/preview`, {}, env)).text();
+    expect(html).not.toContain("</style><b>");
+    expect(html).not.toContain("<script>");
+  });
+
+  it("stores a saved template's design cleaned and complete", async () => {
+    const t = await (await call("POST", "/api/templates", { name: "Bad", slug: "bad", design: { colors: { primary: "url(javascript:x)" }, layout: { contentWidth: 9000 } } })).json();
+    expect(t.design.colors.primary).toBe(DEFAULT_DESIGN.colors.primary);
+    expect(t.design.layout.contentWidth).toBe(720);
+  });
+});

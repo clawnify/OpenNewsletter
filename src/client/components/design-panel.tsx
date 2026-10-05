@@ -75,20 +75,50 @@ function Control({ field, value, onChange }: { field: Field; value: unknown; onC
         </Select>
       );
     case "number":
-      return (
-        <Input
-          type="number"
-          className="h-8 w-20 text-right"
-          value={Number(value)}
-          min={field.min}
-          max={field.max}
-          step={field.step}
-          onChange={(e) => onChange(Number(e.target.value))}
-        />
-      );
+      return <NumberControl field={field} value={Number(value)} onChange={onChange} />;
     case "toggle":
       return <Switch checked={!!value} onCheckedChange={(v) => onChange(v)} />;
   }
+}
+
+/**
+ * Typing passes through values on the way to the one you mean ("4" before
+ * "48"), so only an in-range number is applied while typing, and leaving the
+ * field clamps whatever is there to the range.
+ */
+function NumberControl({ field, value, onChange }: { field: Field; value: number; onChange: (v: number) => void }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const min = field.min ?? -Infinity;
+  const max = field.max ?? Infinity;
+  const commit = () => {
+    if (draft === null) return;
+    const n = Number(draft);
+    if (draft.trim() !== "" && Number.isFinite(n)) {
+      const clamped = Math.min(max, Math.max(min, n));
+      if (clamped !== value) onChange(clamped);
+    }
+    setDraft(null);
+  };
+  return (
+    <Input
+      type="number"
+      className="h-8 w-20 text-right"
+      value={draft ?? String(value)}
+      min={field.min}
+      max={field.max}
+      step={field.step}
+      aria-label={field.label}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        const n = Number(e.target.value);
+        if (e.target.value.trim() !== "" && Number.isFinite(n) && n >= min && n <= max) onChange(n);
+      }}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+      }}
+    />
+  );
 }
 
 function ColorControl({ value, onChange }: { value: string; onChange: (v: string) => void }) {

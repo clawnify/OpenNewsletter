@@ -13,6 +13,7 @@
  * "Save as.." exports the current tokens; `serializeDesign` renders
  * them back to a DESIGN.md file for portability.
  */
+import chroma from "chroma-js";
 
 // ── Token shape ──────────────────────────────────────────────────────
 
@@ -282,8 +283,9 @@ export function setPath<T>(obj: T, path: string, value: unknown): T {
 }
 
 /** Layer a partial mobile override on top of a fully-resolved base. */
-export function applyMobile(base: DesignTokens, mobile?: Partial<DesignTokens> | null): DesignTokens {
-  if (!mobile) return base;
+export function applyMobile(base: DesignTokens, stored?: Partial<DesignTokens> | null): DesignTokens {
+  if (!stored) return base;
+  const mobile = cleanTokens(stored);
   return {
     colors: { ...base.colors, ...(mobile.colors || {}) },
     typography: { ...base.typography, ...(mobile.typography || {}) },
@@ -305,9 +307,65 @@ export function diffTokens(base: DesignTokens, over: DesignTokens): Partial<Desi
   return out;
 }
 
-/** Merge partial (possibly stored) tokens onto the defaults. */
-export function withDefaults(partial?: Partial<DesignTokens> | null): DesignTokens {
-  if (!partial) return DEFAULT_DESIGN;
+/** The panel's range for each number token: the one place those bounds live. */
+const NUMBER_RANGES: Record<string, { min: number; max: number }> = Object.fromEntries(
+  DESIGN_PANEL.flatMap((g) => g.fields)
+    .filter((f) => f.type === "number" && f.min !== undefined && f.max !== undefined)
+    .map((f) => [f.path, { min: f.min!, max: f.max! }]),
+);
+const LEGACY_OPTIONS = ["showFeatureImage", "showByline", "showDivider"];
+
+/**
+ * Keep only tokens with a usable value. Tokens are written by the panel, the
+ * assistant, agents over the API and imported DESIGN.md files, and they end up
+ * inside style attributes and a <style> block, so a value is checked, not
+ * trusted: a colour must parse as a colour, a font must be one of FONTS, a
+ * number is clamped to the panel's range, an option must be a boolean.
+ * Anything else is dropped, so the default (or the layer below) shows instead.
+ */
+export function cleanTokens(input: unknown): Partial<DesignTokens> {
+  const out: Record<string, Record<string, unknown>> = {};
+  if (!input || typeof input !== "object") return out;
+  const src = input as Record<string, unknown>;
+  const put = (group: string, key: string, value: unknown) => ((out[group] ??= {})[key] = value);
+  const group = (name: string) => {
+    const g = src[name];
+    return g && typeof g === "object" && !Array.isArray(g) ? (g as Record<string, unknown>) : {};
+  };
+
+  for (const [k, v] of Object.entries(group("colors"))) {
+    if (k in DEFAULT_DESIGN.colors && typeof v === "string" && v.length <= 64 && chroma.valid(v)) put("colors", k, v);
+  }
+  for (const [k, v] of Object.entries(group("typography"))) {
+    if (k === "headingFont" || k === "bodyFont") {
+      if (typeof v === "string" && v in FONTS) put("typography", k, v);
+    } else if (k in DEFAULT_DESIGN.typography) {
+      const n = clampToken(`typography.${k}`, v);
+      if (n !== null) put("typography", k, n);
+    }
+  }
+  for (const [k, v] of Object.entries(group("layout"))) {
+    if (!(k in DEFAULT_DESIGN.layout)) continue;
+    const n = clampToken(`layout.${k}`, v);
+    if (n !== null) put("layout", k, n);
+  }
+  for (const [k, v] of Object.entries(group("options"))) {
+    if ((k in DEFAULT_DESIGN.options || LEGACY_OPTIONS.includes(k)) && typeof v === "boolean") put("options", k, v);
+  }
+  return out as Partial<DesignTokens>;
+}
+
+function clampToken(path: string, v: unknown): number | null {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  if (!Number.isFinite(n)) return null;
+  const r = NUMBER_RANGES[path];
+  return r ? Math.min(r.max, Math.max(r.min, n)) : n;
+}
+
+/** Merge partial (possibly stored) tokens onto the defaults, keeping only usable values. */
+export function withDefaults(stored?: Partial<DesignTokens> | null): DesignTokens {
+  if (!stored) return DEFAULT_DESIGN;
+  const partial = cleanTokens(stored);
   return {
     colors: { ...DEFAULT_DESIGN.colors, ...(partial.colors || {}) },
     typography: { ...DEFAULT_DESIGN.typography, ...(partial.typography || {}) },
