@@ -17,7 +17,7 @@ import { applyDeliveryEvent } from "./events";
 import { parseResendEvent, verifyResendWebhook, RESEND_EVENTS } from "./providers/resend-webhook";
 import { WebhookSetupError } from "./providers/types";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
-import { DEFAULT_DESIGN, withDefaults, type DesignTokens } from "../shared/design";
+import { DEFAULT_DESIGN, cleanTokens, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle, mailFromSkeleton } from "../shared/blocks";
 import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
 import type { Block, Mail, Settings, Template } from "../shared/types";
@@ -221,6 +221,11 @@ async function templateDesign(slug: string | null): Promise<DesignTokens> {
   }
 }
 
+function storedTokens(input: unknown): string | null {
+  const t = cleanTokens(input);
+  return Object.keys(t).length ? JSON.stringify(t) : null;
+}
+
 /** Effective tokens: mail override → template → default. */
 async function resolveDesign(mail: Mail): Promise<DesignTokens> {
   if (mail.design) return withDefaults(mail.design);
@@ -370,7 +375,7 @@ app.post("/api/templates", async (c) => {
   const inserted = await query<{ slug: string }>(
     `INSERT INTO templates (slug, name, description, design, skeleton, builtin) VALUES (?, ?, ?, ?, ?, 0)
      ON CONFLICT(slug) DO NOTHING RETURNING slug`,
-    [slug, b.name.trim(), b.description || "", JSON.stringify(design), JSON.stringify(skeleton || {})],
+    [slug, b.name.trim(), b.description || "", JSON.stringify(withDefaults(design)), JSON.stringify(skeleton || {})],
   );
   if (inserted.length === 0) return c.json({ error: `A template with the slug "${slug}" already exists.` }, 409);
   const row = await get<any>("SELECT * FROM templates WHERE slug = ?", [slug]);
@@ -451,13 +456,9 @@ app.put("/api/mails/:id", async (c) => {
     byline_date: b.byline_date ?? existing.byline_date,
     feature_image: b.feature_image ?? existing.feature_image,
     blocks: b.blocks !== undefined ? JSON.stringify(b.blocks) : existing.blocks,
-    design: b.design !== undefined ? (b.design ? JSON.stringify(b.design) : null) : existing.design,
-    design_mobile:
-      b.design_mobile !== undefined
-        ? b.design_mobile && Object.keys(b.design_mobile).length
-          ? JSON.stringify(b.design_mobile)
-          : null
-        : existing.design_mobile,
+    // Only usable token values are stored (see cleanTokens); none left means none set.
+    design: b.design !== undefined ? storedTokens(b.design) : existing.design,
+    design_mobile: b.design_mobile !== undefined ? storedTokens(b.design_mobile) : existing.design_mobile,
     template_slug: b.template_slug ?? existing.template_slug,
     audience_id: b.audience_id !== undefined ? b.audience_id : existing.audience_id,
     status: b.status ?? existing.status,
