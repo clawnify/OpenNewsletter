@@ -209,7 +209,11 @@ export interface ResendContact {
   created_at?: string;
 }
 
-/** One deliverability preflight result (server/preflight.ts). Only "fail" stops a send, and the send route enforces it. */
+/**
+ * One deliverability preflight result (server/preflight.ts). Advice: "fail"
+ * means the mail won't arrive well. Only a domain that can't send stops a
+ * send, and the send route enforces that on its own.
+ */
 export interface Check {
   id: "domain" | "dmarc" | "size" | "images";
   level: "ok" | "warn" | "fail" | "unknown";

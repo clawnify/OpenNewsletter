@@ -43,14 +43,14 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
   const fromReady = senders.length > 0 && !!from;
 
   // Re-run for each sender picked: domain and DMARC belong to the From address.
-  const [checks, setChecks] = useState<Check[] | null>(null);
+  const [checks, setChecks] = useState<Check[] | "failed" | null>(null);
   useEffect(() => {
     if (!connected) return;
     let live = true;
     setChecks(null);
     api<{ checks: Check[] }>("GET", `/api/mails/${mail.id}/preflight${from ? `?from=${encodeURIComponent(from)}` : ""}`)
       .then((r) => live && setChecks(r.checks))
-      .catch(() => live && setChecks([]));
+      .catch(() => live && setChecks("failed"));
     return () => { live = false; };
   }, [mail.id, from, connected]);
 
@@ -174,14 +174,14 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
 const ICON = {
   ok: <CheckCircle2 className="size-4 shrink-0 text-success" aria-label="Fine" />,
   warn: <AlertTriangle className="size-4 shrink-0 text-warning" aria-label="Worth fixing" />,
-  fail: <XCircle className="size-4 shrink-0 text-destructive" aria-label="Blocks sending" />,
+  fail: <XCircle className="size-4 shrink-0 text-destructive" aria-label="Won't arrive" />,
   unknown: <HelpCircle className="size-4 shrink-0 text-muted-foreground" aria-label="Couldn't check" />,
 };
 
 /** Deliverability advice. Never blocks the button: the send route refuses what can't go out. */
-function Preflight({ checks }: { checks: Check[] | null }) {
+function Preflight({ checks }: { checks: Check[] | "failed" | null }) {
   if (checks === null) return <p className="text-xs text-muted-foreground">Checking deliverability…</p>;
-  if (!checks.length) return null;
+  if (checks === "failed") return <p className="text-xs text-muted-foreground">Couldn't run the deliverability checks. You can still send.</p>;
   const issues = checks.filter((c) => c.level !== "ok").length;
   return (
     <div className="space-y-1.5">

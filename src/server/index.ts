@@ -681,8 +681,8 @@ app.get("/api/mails/:id/preflight", async (c) => {
   const checks: Check[] = [];
 
   let clickTracking = false;
-  if (from) {
-    const fromDomain = domainOf(from);
+  const fromDomain = from ? domainOf(from) : "";
+  if (fromDomain) {
     // DNS runs while Resend answers.
     const dmarc = findDmarc(fromDomain, dohTxt).catch(() => "error" as const);
     const p = await provider(c);
@@ -691,7 +691,10 @@ app.get("/api/mails/:id/preflight", async (c) => {
     if (!p) checks.push(unknown("No sending backend is connected."));
     else {
       try {
-        domain = signingDomain(fromDomain, await p.listDomains());
+        // The domain the send route will sign with: the closest one that can
+        // send, else the closest at all, to say why it can't.
+        const all = await p.listDomains();
+        domain = signingDomain(fromDomain, all.filter((d) => sendableStatus(d.status))) ?? signingDomain(fromDomain, all);
         const records = domain?.id && p.domainRecords && sendableStatus(domain.status)
           ? await p.domainRecords(domain.id).catch(() => null)
           : null;
@@ -1538,7 +1541,7 @@ async function sendMailNow(
   }
 
   const resuming = row.status === "sending" || row.status === "failed";
-  if (!resuming && (await contacts.subscribedRecipients(mail.audience_id)).length === 0) {
+  if (!resuming && !(await contacts.hasSubscribers(mail.audience_id))) {
     return { status: 400, body: { error: "No confirmed subscribers on this audience yet." } };
   }
 

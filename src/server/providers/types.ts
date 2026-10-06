@@ -9,7 +9,7 @@
  * which is what makes the backend genuinely swappable.
  */
 
-import type { ProviderDomain } from "../preflight";
+import type { DomainRecord, ProviderDomain } from "../preflight";
 
 export interface SendResult {
   id: string;
@@ -73,7 +73,7 @@ export interface EmailProvider {
   /** Sending domains on the account (status: "verified", …). */
   listDomains(): Promise<ProviderDomain[]>;
   /** One domain's DNS records and whether each is verified. Optional: only for the preflight's detail. */
-  domainRecords?(id: string): Promise<{ record: string; status: string }[]>;
+  domainRecords?(id: string): Promise<DomainRecord[]>;
   /** Send a one-off email (test sends, confirmations, isolating a bad message). Throws on failure. */
   sendEmail(input: SendEmailInput): Promise<SendResult>;
   /** Send up to BATCH_SIZE messages in one call. Never throws; see BatchOutcome. */

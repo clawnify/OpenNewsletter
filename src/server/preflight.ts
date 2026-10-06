@@ -7,15 +7,16 @@
  * - Domain: Resend's statuses, see ../shared/sending-domain.ts.
  * - DMARC: Gmail requires it of anyone sending 5,000+ a day, and `p=none` is
  *   enough (https://support.google.com/a/answer/81126). The record is found
- *   by walking up from the From domain, as RFC 9989 does, at most 8 lookups.
+ *   the way RFC 9989 does (see findDmarc).
  * - Size: Gmail clips an email whose HTML passes about 102 KB. Google doesn't
- *   publish the number; every ESP measures the same one.
+ *   publish the number; every ESP measures the same one. Warned from 85 KB.
  * - Embedded images: Gmail shows no `data:` image on any platform
  *   (caniemail.com image-base64, retested 2024-05), and they count toward
  *   the clip size.
  *
- * Only the domain check blocks a send, and the send route enforces that on
- * its own (sendableStatus). Everything here is advice.
+ * Only a domain that can't send blocks a send, and the send route enforces
+ * that on its own (sendableStatus). Everything else here is advice, a "fail"
+ * included: it says the mail won't arrive well, not that it can't go out.
  */
 import { sendableStatus } from "../shared/sending-domain";
 import type { Check } from "../shared/types";
@@ -27,10 +28,18 @@ export interface ProviderDomain {
   clickTracking?: boolean;
 }
 
+/** One DNS record of a provider domain: `record` is what it is for (SPF, DKIM, Receiving, Tracking). */
+export interface DomainRecord {
+  record: string;
+  type: string;
+  status: string;
+}
+
 export function domainCheck(
   fromDomain: string,
   domain: ProviderDomain | null,
-  records: { record: string; status: string }[] | null,
+  /** Null when the provider couldn't say. */
+  records: DomainRecord[] | null,
 ): Check {
   const title = "Sending domain";
   if (!domain) {
@@ -39,13 +48,22 @@ export function domainCheck(
   if (!sendableStatus(domain.status)) {
     return { id: "domain", level: "fail", title, detail: `${domain.name} isn't verified on Resend yet (${domain.status.replace(/_/g, " ")}).` };
   }
-  // Per record when the provider can say: the domain's own status also
-  // covers receiving, which has nothing to do with this send. A kind counts
-  // as working when any of its records is verified: with two sending
-  // records, one is a fallback and Resend sends on either.
+  const verified = domain.status.toLowerCase() === "verified";
+  if (!records) {
+    // "verified" covers every record. Anything short of it, unread, is no pass.
+    return verified
+      ? { id: "domain", level: "ok", title, detail: `${domain.name} is verified: SPF and DKIM pass.` }
+      : { id: "domain", level: "unknown", title, detail: `Resend reports ${domain.name} as ${domain.status.replace(/_/g, " ")}, and its records couldn't be read to say which part.` };
+  }
+  // Per record: the domain's own status also covers receiving, which has
+  // nothing to do with this send. Resend's older SPF is a TXT and an MX, and
+  // both must verify; newer domains get two CNAMEs, and one verified is
+  // enough to send (the other is a fallback).
   const missing = ["SPF", "DKIM"].filter((kind) => {
-    const of = (records || []).filter((r) => r.record === kind);
-    return of.length > 0 && !of.some((r) => r.status === "verified");
+    const of = records.filter((r) => r.record === kind);
+    if (!of.length) return false;
+    const ok = (r: DomainRecord) => r.status === "verified";
+    return of.every((r) => r.type === "CNAME") ? !of.some(ok) : !of.every(ok);
   });
   if (missing.length) {
     return { id: "domain", level: "warn", title, detail: `${domain.name}: ${missing.join(" and ")} not verified on Resend yet. Mail may be refused or land in spam until it is.` };
@@ -73,8 +91,15 @@ export const dohTxt: ResolveTxt = async (name) => {
   // A TXT value arrives as one or more quoted strings that join into one record.
   return (json.Answer || [])
     .filter((a) => a.type === 16)
-    .map((a) => (a.data.match(/"((?:[^"\\]|\\.)*)"/g) || [a.data]).map((s) => s.replace(/^"|"$/g, "").replace(/\\(.)/g, "$1")).join(""));
+    .map((a) => (a.data.match(/"((?:[^"\\]|\\.)*)"/g) || [a.data]).map(unquote).join(""));
 };
+
+/** One quoted DNS character-string: `\DDD` is a decimal byte, `\X` is X. */
+function unquote(s: string): string {
+  return s
+    .replace(/^"|"$/g, "")
+    .replace(/\\(\d{3}|.)/g, (_, e: string) => (e.length === 3 ? String.fromCharCode(Number(e)) : e));
+}
 
 export interface DmarcRecord {
   /** Where it was found: the From domain itself or a parent. */
@@ -83,14 +108,18 @@ export interface DmarcRecord {
 }
 
 /**
- * The DMARC record that governs `domain`: its own `_dmarc` record, else the
- * nearest parent's. Several records at one name are discarded, as RFC 9989
- * says. Stops before the top-level label, and after 8 lookups.
+ * The DMARC record that governs `domain`, found as RFC 9989 does: its own
+ * `_dmarc` record first, then a walk up the tree to the top-level label,
+ * taking the nearest record. A name with more than 8 labels jumps to its last
+ * 7 after the first query, so the walk never makes more than 8 lookups.
+ * Several DMARC records at one name are discarded.
  */
 export async function findDmarc(domain: string, resolve: ResolveTxt): Promise<DmarcRecord | null> {
-  const labels = domain.toLowerCase().replace(/\.$/, "").split(".");
-  for (let i = 0; i < labels.length - 1 && i < 8; i++) {
-    const at = labels.slice(i).join(".");
+  const labels = domain.toLowerCase().replace(/\.$/, "").split(".").filter(Boolean);
+  if (!labels.length) return null;
+  const names = [labels.join(".")];
+  for (let i = labels.length > 8 ? labels.length - 7 : 1; i < labels.length; i++) names.push(labels.slice(i).join("."));
+  for (const at of names) {
     const found = (await resolve(`_dmarc.${at}`)).filter((t) => /^v\s*=\s*DMARC1\s*(;|$)/i.test(t.trim()));
     if (found.length === 1) return { at, tags: parseTags(found[0]) };
   }
@@ -122,17 +151,19 @@ export function dmarcCheck(fromDomain: string, signing: string | null, found: Dm
   }
   const own = found.at === fromDomain.toLowerCase();
   const policy = ((own ? found.tags.p : found.tags.sp || found.tags.p) || "none").toLowerCase();
-  // Resend signs with d=<the verified domain> and returns mail through
-  // send.<domain>, so only relaxed alignment passes when the From address
-  // is on a subdomain. Under strict DKIM alignment the message fails DMARC,
-  // and an enforcing policy then quarantines or rejects it.
-  const strictBreaks = found.tags.adkim?.toLowerCase() === "s" && !!signing && signing.toLowerCase() !== fromDomain.toLowerCase();
+  // DMARC passes when either DKIM or SPF aligns with the From domain. Resend
+  // signs d=<the verified domain> and bounces through send.<that domain>.
+  // Strict DKIM fails when the From address is on a subdomain of it; strict
+  // SPF always fails (send.x is never the From domain). Relaxed, both pass.
+  // Only both strict breaks it, and an enforcing policy then acts on that.
+  const strict = (tag: string) => found.tags[tag]?.toLowerCase() === "s";
+  const strictBreaks = strict("adkim") && strict("aspf") && !!signing && signing.toLowerCase() !== fromDomain.toLowerCase();
   if (strictBreaks && policy !== "none") {
     return {
       id: "dmarc",
       level: "fail",
       title,
-      detail: `${found.at}'s DMARC record asks for strict alignment (adkim=s) with p=${policy}, and mail from ${fromDomain} is signed as ${signing}. It will fail DMARC. Send from @${signing}, or relax the record to adkim=r.`,
+      detail: `${found.at}'s DMARC record asks for strict alignment (adkim=s, aspf=s) with p=${policy}, and mail from ${fromDomain} is signed as ${signing}. It will fail DMARC. Send from @${signing}, or relax the record to adkim=r.`,
     };
   }
   const where = own ? "" : ` (from ${found.at})`;
@@ -146,22 +177,32 @@ export function dmarcCheck(fromDomain: string, signing: string | null, found: Dm
 
 // ── content ──────────────────────────────────────────────────────────
 
-/** Where Gmail clips. Decimal, the lower reading of "102 KB", so the warning comes early rather than late. */
+/** Where Gmail clips. Decimal, the lower reading of "102 KB". */
 export const GMAIL_CLIP_BYTES = 102_000;
+/**
+ * Where to start warning. Klaviyo's editor calls under 85 KB safe (its
+ * "Email Size" check, help.klaviyo.com/hc/en-us/articles/115000591251), and
+ * what is measured here is before the provider adds tracking.
+ */
+export const CLIP_MARGIN_BYTES = 85_000;
 
 export function sizeCheck(html: string, clickTracking: boolean): Check {
   const bytes = new TextEncoder().encode(html).length;
   const kb = (n: number) => `${Math.round(n / 1000)} KB`;
   const tracking = clickTracking ? " Resend's click tracking makes every link longer when it sends, so leave some room." : "";
+  const title = "Email size";
   if (bytes >= GMAIL_CLIP_BYTES) {
     return {
       id: "size",
       level: "warn",
-      title: "Email size",
+      title,
       detail: `${kb(bytes)}. Gmail cuts emails over about ${kb(GMAIL_CLIP_BYTES)}: readers see "[Message clipped]" and the rest, unsubscribe link included, sits behind a click. Shorten it or split it.${tracking}`,
     };
   }
-  return { id: "size", level: "ok", title: "Email size", detail: `${kb(bytes)} of the ~${kb(GMAIL_CLIP_BYTES)} Gmail shows before clipping.${tracking}` };
+  if (bytes >= CLIP_MARGIN_BYTES) {
+    return { id: "size", level: "warn", title, detail: `${kb(bytes)}, close to the ~${kb(GMAIL_CLIP_BYTES)} where Gmail clips. Links and personal details added at send can push it over.${tracking}` };
+  }
+  return { id: "size", level: "ok", title, detail: `${kb(bytes)} of the ~${kb(GMAIL_CLIP_BYTES)} Gmail shows before clipping.${tracking}` };
 }
 
 export function imagesCheck(html: string): Check {

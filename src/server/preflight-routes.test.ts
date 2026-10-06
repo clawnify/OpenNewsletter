@@ -13,14 +13,14 @@ const { readFileSync } = process.getBuiltinModule("node:fs");
 let db: any;
 let env: Record<string, unknown>;
 let domains: { id: string; name: string; status: string; click_tracking?: boolean }[];
-let records: { record: string; status: string }[];
+let records: { record: string; type: string; status: string }[];
 let dmarc: Record<string, string[]>;
 let dnsDown: boolean;
 beforeEach(async () => {
   vi.resetModules();
   app = (await import("./index")).default;
   domains = [{ id: "dom_1", name: "example.com", status: "verified" }];
-  records = [{ record: "SPF", status: "verified" }, { record: "DKIM", status: "verified" }];
+  records = [{ record: "SPF", type: "TXT", status: "verified" }, { record: "DKIM", type: "TXT", status: "verified" }];
   dmarc = {};
   dnsDown = false;
   db = new DatabaseSync(":memory:");
@@ -104,6 +104,27 @@ describe("GET /api/mails/:id/preflight", () => {
     expect((await preflight(id, "Ann <ann@elsewhere.org>")).domain.level).toBe("fail");
   });
 
+  // Same choice as the send route, so the dialog never says "can't" about a send that goes out.
+  it("judges the domain the send will be signed with", async () => {
+    domains = [{ id: "dom_1", name: "example.com", status: "verified" }, { id: "dom_2", name: "news.example.com", status: "pending" }];
+    const id = await readyMail();
+    expect((await preflight(id, "x@news.example.com")).domain.level).toBe("ok");
+    domains = [{ id: "dom_2", name: "news.example.com", status: "pending" }];
+    expect((await preflight(id, "x@news.example.com")).domain).toMatchObject({ level: "fail", detail: expect.stringContaining("pending") });
+  });
+
+  it("reports unknown, not a pass, when Resend won't show a partly verified domain's records", async () => {
+    domains[0].status = "partially_failed";
+    records = null as any;
+    vi.stubGlobal("fetch", async (input: string) => {
+      const url = new URL(String(input));
+      if (url.hostname === "cloudflare-dns.com") return Response.json({ Status: 3 });
+      if (url.pathname === "/domains") return Response.json({ data: domains });
+      return new Response("down", { status: 500 });
+    });
+    expect((await preflight(await readyMail())).domain.level).toBe("unknown");
+  });
+
   it("gives the DMARC record to add when there is none", async () => {
     const c = await preflight(await readyMail(), "news@mail.example.com");
     expect(c.dmarc.level).toBe("warn");
@@ -112,7 +133,7 @@ describe("GET /api/mails/:id/preflight", () => {
 
   it("warns on a DKIM record Resend hasn't verified", async () => {
     domains[0].status = "partially_verified";
-    records = [{ record: "SPF", status: "verified" }, { record: "DKIM", status: "failed" }];
+    records = [{ record: "SPF", type: "TXT", status: "verified" }, { record: "DKIM", type: "TXT", status: "failed" }];
     expect((await preflight(await readyMail())).domain.level).toBe("warn");
   });
 
