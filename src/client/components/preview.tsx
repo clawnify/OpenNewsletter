@@ -86,7 +86,11 @@ export function Preview({ mail, design, settings, edit }: { mail: Mail; design: 
             <div style={{ marginTop: 4 }}>{settings.footer_text || `You're receiving this because you subscribed to ${settings.publication_name || "our newsletter"}.`}</div>
             <div style={{ marginTop: 4 }}><a href="#" style={{ color: design.colors.secondary, fontWeight: 600 }}>Unsubscribe</a></div>
           </div>
-        ) : null}
+        ) : (
+          <div style={{ marginTop: design.layout.spacing + 8, fontFamily: fontStack(design.typography.bodyFont), fontSize: 12, lineHeight: 1.5 }}>
+            <a href="#" style={{ color: design.colors.secondary }}>Unsubscribe</a>
+          </div>
+        )}
       </div>
     </div>
   );

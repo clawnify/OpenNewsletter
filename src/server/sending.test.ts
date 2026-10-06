@@ -475,6 +475,23 @@ describe("merge tags in a send", () => {
     expect(p.calls[0].messages.every((m) => m.subject === undefined)).toBe(true);
   });
 
+  it("keeps the unsubscribe link with the footer off, except in a send begun before that", async () => {
+    const noFooter = (renderer?: 2 | 3): SendSnapshot => {
+      const snap = { ...greeting(true), renderer };
+      snap.design = { ...snap.design, options: { ...snap.design.options, showFooter: false } };
+      return snap;
+    };
+    await beginSend(1, AUD, noFooter(3));
+    await drainSend(1, p);
+    expect(htmlFor("ada@example.com")[0]).toContain("/api/unsubscribe?c=con_a");
+
+    await run(`INSERT INTO mails (id, title, audience_id, status) VALUES (2, 'Issue 2', ?, 'draft')`, [AUD]);
+    p.calls.length = 0;
+    await beginSend(2, AUD, noFooter(2));
+    await drainSend(2, p);
+    expect(htmlFor("ada@example.com")[0]).not.toContain("/api/unsubscribe");
+  });
+
   it("personalizes the subject per reader, on one line", async () => {
     await run(`UPDATE contacts SET first_name = 'Ada\r\nBcc: x@evil.example' WHERE id = 'con_a'`);
     const snap = greeting(true);

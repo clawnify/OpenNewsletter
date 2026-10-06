@@ -165,3 +165,19 @@ describe("block styling", () => {
     expect(full).toContain("display:block");
   });
 });
+
+describe("unsubscribe link", () => {
+  const noFooter = { ...DEFAULT_DESIGN, options: { ...DEFAULT_DESIGN.options, showFooter: false } };
+  const url = "https://pub.example/api/unsubscribe?c=abc";
+
+  it("stays in the email when the footer is switched off", () => {
+    const html = renderEmailHtml(mail([text("Hi")]), noFooter, settings, { unsubscribeUrl: url });
+    expect(html).toContain(`<a href="${url}"`);
+    expect(html).not.toContain("You're receiving this");
+  });
+
+  it("is left out only for a send begun before it was added", () => {
+    const html = renderEmailHtml(mail([text("Hi")]), noFooter, settings, { unsubscribeUrl: url, legacyFooter: true });
+    expect(html).not.toContain(url);
+  });
+});
