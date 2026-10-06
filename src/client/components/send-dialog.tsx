@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
+import { CheckCircle2, AlertTriangle, XCircle, HelpCircle, Copy } from "lucide-react";
 import { api } from "../api";
 import { useStore } from "../store";
-import type { Mail } from "../../shared/types";
+import type { Check, Mail } from "../../shared/types";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -40,6 +41,18 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
   }
   const [from, setFrom] = useState(senders[0]?.value || "");
   const fromReady = senders.length > 0 && !!from;
+
+  // Re-run for each sender picked: domain and DMARC belong to the From address.
+  const [checks, setChecks] = useState<Check[] | null>(null);
+  useEffect(() => {
+    if (!connected) return;
+    let live = true;
+    setChecks(null);
+    api<{ checks: Check[] }>("GET", `/api/mails/${mail.id}/preflight${from ? `?from=${encodeURIComponent(from)}` : ""}`)
+      .then((r) => live && setChecks(r.checks))
+      .catch(() => live && setChecks([]));
+    return () => { live = false; };
+  }, [mail.id, from, connected]);
 
   const sendTest = async () => {
     setErr(null); setMsg(null); setBusy("test");
@@ -119,6 +132,8 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
               ) : null}
             </div>
 
+            <Preflight checks={checks} />
+
             <div className="rounded-md p-3 shadow-edge">
               <Label className="mb-1.5 block">Send a test</Label>
               <div className="flex gap-2">
@@ -153,5 +168,59 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+const ICON = {
+  ok: <CheckCircle2 className="size-4 shrink-0 text-success" aria-label="Fine" />,
+  warn: <AlertTriangle className="size-4 shrink-0 text-warning" aria-label="Worth fixing" />,
+  fail: <XCircle className="size-4 shrink-0 text-destructive" aria-label="Blocks sending" />,
+  unknown: <HelpCircle className="size-4 shrink-0 text-muted-foreground" aria-label="Couldn't check" />,
+};
+
+/** Deliverability advice. Never blocks the button: the send route refuses what can't go out. */
+function Preflight({ checks }: { checks: Check[] | null }) {
+  if (checks === null) return <p className="text-xs text-muted-foreground">Checking deliverability…</p>;
+  if (!checks.length) return null;
+  const issues = checks.filter((c) => c.level !== "ok").length;
+  return (
+    <div className="space-y-1.5">
+      <Label>{issues ? `Before you send: ${issues} to look at` : "Before you send: all clear"}</Label>
+      <ul className="space-y-2">
+        {checks.map((c) => (
+          <li key={c.id} className="flex gap-2 text-xs">
+            <span className="mt-px">{ICON[c.level]}</span>
+            <div className="min-w-0 flex-1">
+              <span className="font-medium text-foreground">{c.title}.</span>{" "}
+              <span className="text-muted-foreground">{c.detail}</span>
+              {c.record ? <DnsRecord {...c.record} /> : null}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function DnsRecord({ name, type, value }: { name: string; type: string; value: string }) {
+  const [copied, setCopied] = useState("");
+  const copy = (what: string, text: string) => {
+    navigator.clipboard?.writeText(text).then(() => setCopied(what)).catch(() => {});
+  };
+  const row = (label: string, text: string) => (
+    <div className="flex items-center gap-2">
+      <span className="w-10 shrink-0 text-muted-foreground">{label}</span>
+      <code className="min-w-0 flex-1 truncate font-mono text-foreground">{text}</code>
+      <button type="button" className="shrink-0 rounded-sm p-1 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={`Copy ${label.toLowerCase()}`} onClick={() => copy(label, text)}>
+        {copied === label ? <CheckCircle2 className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
+      </button>
+    </div>
+  );
+  return (
+    <div className="mt-1.5 space-y-0.5 rounded-sm bg-muted p-2">
+      {row("Name", name)}
+      {row("Type", type)}
+      {row("Value", value)}
+    </div>
   );
 }

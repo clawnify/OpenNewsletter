@@ -11,6 +11,7 @@
  * REST (fetch) rather than the `resend` SDK: no dependency, and the raw API is
  * a better fit for a Worker.
  */
+import type { ProviderDomain } from "../preflight";
 import type {
   BatchOutcome,
   EmailProvider,
@@ -56,12 +57,18 @@ export class ResendProvider implements EmailProvider {
     return json as T;
   }
 
-  async listDomains(): Promise<{ name: string; status: string }[]> {
-    const data = await this.req<{ data?: Array<{ name: string; status: string }> }>(
+  async listDomains(): Promise<ProviderDomain[]> {
+    const data = await this.req<{ data?: Array<{ id: string; name: string; status: string; click_tracking?: boolean }> }>(
       "GET",
       "/domains",
     );
-    return (data.data || []).map((d) => ({ name: d.name, status: d.status }));
+    return (data.data || []).map((d) => ({ id: d.id, name: d.name, status: d.status, clickTracking: d.click_tracking }));
+  }
+
+  /** GET /domains/:id. Records are tagged SPF, DKIM, Receiving or Tracking. */
+  async domainRecords(id: string): Promise<{ record: string; status: string }[]> {
+    const d = await this.req<{ records?: { record: string; status: string }[] }>("GET", `/domains/${encodeURIComponent(id)}`);
+    return (d.records || []).map((r) => ({ record: r.record, status: r.status }));
   }
 
   async sendEmail(input: SendEmailInput): Promise<SendResult> {

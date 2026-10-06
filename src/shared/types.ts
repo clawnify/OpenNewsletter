@@ -208,3 +208,13 @@ export interface ResendContact {
   confirm_error?: string | null;
   created_at?: string;
 }
+
+/** One deliverability preflight result (server/preflight.ts). Only "fail" stops a send, and the send route enforces it. */
+export interface Check {
+  id: "domain" | "dmarc" | "size" | "images";
+  level: "ok" | "warn" | "fail" | "unknown";
+  title: string;
+  detail: string;
+  /** A DNS record to add, shown so it can be copied. */
+  record?: { name: string; type: "TXT"; value: string };
+}

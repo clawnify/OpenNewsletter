@@ -3,6 +3,7 @@ import { CheckCircle2, XCircle, Trash2, AppWindow } from "lucide-react";
 import { useStore } from "../store";
 import { api } from "../api";
 import type { Settings, Sender, ConnectedApp } from "../../shared/types";
+import { sendableStatus } from "../../shared/sending-domain";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -182,7 +183,7 @@ export function SettingsView() {
 }
 
 function AddSender({ domains, onAdd }: { domains: { name: string; status: string }[]; onAdd: (s: Sender) => void }) {
-  const verified = domains.filter((d) => d.status === "verified");
+  const verified = domains.filter((d) => sendableStatus(d.status));
   const [name, setName] = useState("");
   const [local, setLocal] = useState("");
   const [domain, setDomain] = useState("");

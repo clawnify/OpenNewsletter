@@ -11,6 +11,8 @@ import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
 import { SAMPLE_VALUES, fillSubject, type MergeValues } from "../shared/merge";
 import { parseScheduleTime, sendVerdict } from "./schedule";
+import { domainCheck, dmarcCheck, dohTxt, findDmarc, imagesCheck, sizeCheck, type ProviderDomain } from "./preflight";
+import { sendableStatus, signingDomain } from "../shared/sending-domain";
 import * as sending from "./sending";
 import * as flows from "./flows";
 import { applyDeliveryEvent } from "./events";
@@ -20,7 +22,7 @@ import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, cleanTokens, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle, mailFromSkeleton } from "../shared/blocks";
 import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
-import type { Block, Mail, Settings, Template } from "../shared/types";
+import type { Block, Check, Mail, Settings, Template } from "../shared/types";
 
 type Env = {
   Bindings: {
@@ -657,6 +659,60 @@ app.get("/api/mails/:id/preview", async (c) => {
   // runs here, whatever a block contains.
   c.header("Content-Security-Policy", "script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
   return c.html(html);
+});
+
+// ── deliverability preflight ─────────────────────────────────────────
+//
+// Advice for the send dialog, from the issue exactly as it would render and
+// the sender picked there. See preflight.ts for where each rule comes from.
+// Every lookup is best-effort: a check that can't run reports "unknown".
+
+function domainOf(from: string): string {
+  return from.slice(from.lastIndexOf("@") + 1).replace(/>$/, "").trim().toLowerCase();
+}
+
+app.get("/api/mails/:id/preflight", async (c) => {
+  const row = await get<any>("SELECT * FROM mails WHERE id = ?", [Number(c.req.param("id"))]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  const mail = parseMail(row);
+  const s = await getSettings();
+  const fromParam = c.req.query("from") || "";
+  const from = fromParam.includes("@") ? fromParam : fromAddress(s);
+  const checks: Check[] = [];
+
+  let clickTracking = false;
+  if (from) {
+    const fromDomain = domainOf(from);
+    // DNS runs while Resend answers.
+    const dmarc = findDmarc(fromDomain, dohTxt).catch(() => "error" as const);
+    const p = await provider(c);
+    let domain: ProviderDomain | null = null;
+    const unknown = (detail: string): Check => ({ id: "domain", level: "unknown", title: "Sending domain", detail });
+    if (!p) checks.push(unknown("No sending backend is connected."));
+    else {
+      try {
+        domain = signingDomain(fromDomain, await p.listDomains());
+        const records = domain?.id && p.domainRecords && sendableStatus(domain.status)
+          ? await p.domainRecords(domain.id).catch(() => null)
+          : null;
+        checks.push(domainCheck(fromDomain, domain, records));
+      } catch {
+        checks.push(unknown("Couldn't reach Resend to check the domain."));
+      }
+    }
+    clickTracking = !!domain?.clickTracking;
+    checks.push(dmarcCheck(fromDomain, domain?.name ?? null, await dmarc));
+  }
+
+  // One reader's copy, with a real-length unsubscribe link: the size each
+  // recipient gets differs only by their name.
+  const html = renderEmailHtml(mail, await resolveDesign(mail), s, {
+    mobile: mail.design_mobile,
+    merge: SAMPLE_VALUES,
+    unsubscribeUrl: `${new URL(c.req.url).origin}/api/unsubscribe?c=${crypto.randomUUID()}`,
+  });
+  checks.push(sizeCheck(html, clickTracking), imagesCheck(html));
+  return c.json({ from, checks });
 });
 
 // ── image uploads (R2) ───────────────────────────────────────────────
@@ -1465,11 +1521,8 @@ async function sendMailNow(
   const fromDomain = from.slice(from.lastIndexOf("@") + 1).replace(/>$/, "").toLowerCase();
   try {
     const domains = await p.listDomains();
-    const verified = domains.filter((d) => d.status === "verified" || d.status === "Verified");
-    const covered = verified.some(
-      (d) => fromDomain === d.name.toLowerCase() || fromDomain.endsWith(`.${d.name.toLowerCase()}`),
-    );
-    if (!covered) {
+    const verified = domains.filter((d) => sendableStatus(d.status));
+    if (!signingDomain(fromDomain, verified)) {
       return {
         status: 400,
         body: {
