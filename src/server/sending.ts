@@ -116,7 +116,7 @@ export interface SendSnapshot {
    * send renders with its own version even after the app is upgraded. Bump it
    * whenever the same mail would render to different HTML.
    */
-  renderer?: 2;
+  renderer?: 2 | 3;
 }
 
 export type BeginResult =
@@ -485,7 +485,8 @@ function renderFor(snap: SendSnapshot, r: ClaimedRow): BatchMessage {
   const unsubscribeUrl = `${snap.origin}/api/unsubscribe?c=${r.contact_id}`;
   // From the row, not the contact: a name edited mid-send must not change a
   // payload that may be retried under the same key.
-  const v2 = snap.renderer === 2;
+  const version = snap.renderer ?? 1;
+  const v2 = version >= 2;
   const merge: MergeValues | undefined = v2
     ? { first_name: r.first_name ?? "", last_name: r.last_name ?? "", email: r.email }
     : undefined;
@@ -494,6 +495,7 @@ function renderFor(snap: SendSnapshot, r: ClaimedRow): BatchMessage {
     mobile: snap.mail.design_mobile,
     merge,
     legacyColumns: !v2,
+    legacyFooter: version < 3,
   });
   const subject = fillSubject(snap.mail.title, merge);
   return { to: r.email, html, unsubscribeUrl, deliveryId: r.id, ...(subject !== snap.mail.title ? { subject } : {}) };

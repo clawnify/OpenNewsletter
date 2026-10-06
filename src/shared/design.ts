@@ -255,7 +255,7 @@ export const DESIGN_PANEL: FieldGroup[] = [
     tab: "advanced",
     fields: [
       { path: "options.showHeader", label: "Show logo", type: "toggle" },
-      { path: "options.showFooter", label: "Footer + unsubscribe", type: "toggle" },
+      { path: "options.showFooter", label: "Footer", type: "toggle", hint: "The unsubscribe link stays either way" },
     ],
   },
 ];
