@@ -280,16 +280,16 @@ export async function removeContact(audienceId: string, contactId: string): Prom
 }
 
 /**
- * The recipients of a send. Deliberately the only way to get an address list:
- * `pending` (never confirmed), `unsubscribed` and `bounced` are all excluded,
- * so no caller can accidentally mail them by writing its own query.
+ * Whether a send would reach anyone. One row at most: the send precheck runs
+ * inside the request (and every scheduled job), so it must not load the list.
+ * `pending` (never confirmed), `unsubscribed` and `bounced` don't count.
  */
-export async function subscribedRecipients(audienceId: string): Promise<Contact[]> {
-  return (await query(
-    `SELECT ${CONTACT_COLS} FROM contacts
-      WHERE audience_id = ? AND status = 'subscribed' ORDER BY created_at`,
+export async function hasSubscribers(audienceId: string): Promise<boolean> {
+  const rows = await query(
+    `SELECT 1 FROM contacts WHERE audience_id = ? AND status = 'subscribed' LIMIT 1`,
     [audienceId],
-  )) as unknown as Contact[];
+  );
+  return rows.length > 0;
 }
 
 // ── Consent transitions ─────────────────────────────────────────────────────
