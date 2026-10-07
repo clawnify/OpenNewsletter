@@ -159,6 +159,22 @@ describe("asking and letting go", () => {
     expect(await finishSunsets(NOW)).toBe(0);
   });
 
+  it("closes an ask stopped by a fatal error (no sent_at) from its last edit, removing only copies that went out", async () => {
+    const ask = await issue(GRACE_DAYS + 3, ["a", "b"], { segment: "inactive" });
+    await run(`UPDATE deliveries SET status = 'pending', sent_at = NULL WHERE id = ?`, [`d${ask}_b`]);
+    await run(`UPDATE mails SET status = 'failed', sent_at = NULL, updated_at = ? WHERE id = ?`, [sqliteAgo(GRACE_DAYS + 1), ask]);
+    expect(await finishSunsets(NOW)).toBe(1);
+    expect((await status("b")).status).toBe("subscribed");
+    // Closed: b can be asked again by a later ask.
+    expect(await inactiveIds()).toEqual(["b", "c"]);
+  });
+
+  it("leaves a failed ask edited recently open", async () => {
+    const ask = await issue(GRACE_DAYS + 3, ["a"], { segment: "inactive" });
+    await run(`UPDATE mails SET status = 'failed', sent_at = NULL, updated_at = ? WHERE id = ?`, [sqliteAgo(1), ask]);
+    expect(await finishSunsets(NOW)).toBe(0);
+  });
+
   it("waits out the grace period", async () => {
     await issue(GRACE_DAYS - 1, ["a"], { segment: "inactive" });
     expect(await finishSunsets(NOW)).toBe(0);
@@ -196,8 +212,10 @@ describe("asking and letting go", () => {
 });
 
 describe("summary and guards", () => {
-  it("refuses with no tracking, and with no open or click recorded in the window", async () => {
+  it("refuses with no tracking, with past engagement not yet backfilled, and with no open or click recorded in the window", async () => {
     await contact("a");
+    expect((await inactiveSummary("aud", true, 90, NOW)).blocked).toMatch(/past opens and clicks/);
+    await backfillEngagement();
     expect((await inactiveSummary("aud", false, 90, NOW)).blocked).toMatch(/delivery tracking/);
     await issue(10, ["a"]);
     expect((await inactiveSummary("aud", true, 90, NOW)).blocked).toMatch(/No open or click/);

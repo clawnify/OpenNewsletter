@@ -114,6 +114,41 @@ describe("asking inactive subscribers", () => {
   });
 });
 
+describe("removal before every send", () => {
+  it("an ordinary issue skips whoever an ask let go, even right after the once-a-minute check ran", async () => {
+    const aud = await audienceWithHistory();
+    // The ask went out 11 days ago, but this request's check ran while it wasn't due yet.
+    db.prepare(`INSERT INTO mails (id, title, audience_id, status, sent_at, segment) VALUES (500, 'Ask', ?, 'sent', ?, 'inactive')`).run(aud, ago(1));
+    db.prepare(`INSERT INTO deliveries (id, mail_id, contact_id, email, batch, status, sent_at) VALUES ('ask_q', 500, 'quiet', 'quiet@example.com', 0, 'sent', ?)`).run(ago(11));
+    await call("GET", "/api/audiences");
+    db.prepare(`UPDATE mails SET sent_at = ? WHERE id = 500`).run(ago(11));
+
+    const m: any = await (await call("POST", "/api/mails", {})).json();
+    await call("PUT", `/api/mails/${m.id}`, { audience_id: aud });
+    expect((await call("POST", `/api/mails/${m.id}/send`, {})).status).toBe(200);
+    expect(sent.map((x) => x.to)).toEqual(["reader@example.com"]);
+    expect(db.prepare(`SELECT status, unsubscribe_reason FROM contacts WHERE id = 'quiet'`).get()).toEqual({ status: "unsubscribed", unsubscribe_reason: "inactive" });
+  });
+});
+
+describe("the one-time engagement backfill", () => {
+  it("failing never takes the app down, and keeps the ask refused until it succeeds", async () => {
+    const aud = await audienceWithHistory();
+    db.prepare(`UPDATE settings SET engagement_backfilled_at = NULL`).run();
+    const real = (env.STORAGE as any).query;
+    (env.STORAGE as any).query = async (sql: string, p: unknown[]) => {
+      if (/GROUP BY contact_id/.test(sql)) throw new Error("D1_ERROR: query timed out");
+      return real(sql, p);
+    };
+    vi.resetModules();
+    app = (await import("./index")).default;
+    expect((await call("GET", "/api/audiences")).status).toBe(200);
+    const sum: any = await (await call("GET", `/api/audiences/${aud}/inactive`)).json();
+    expect(sum.blocked).toMatch(/past opens and clicks/);
+    expect((await call("POST", `/api/audiences/${aud}/ask-inactive`, {})).status).toBe(400);
+  });
+});
+
 describe("GET /api/keep", () => {
   it("keeps the reader and says so; an unknown id is refused", async () => {
     const aud = await audienceWithHistory();

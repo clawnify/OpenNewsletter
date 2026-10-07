@@ -114,7 +114,15 @@ async function ensureSeed() {
   ]) await run(sql);
   await contacts.dropDuplicateDefaultAudiences();
   // After the columns: needs contacts.last_engaged_at and the settings flag.
-  if (columnsOk) await sunset.backfillEngagement();
+  // Never fatal: until it succeeds the sunset is refused (blockedReason), and
+  // the app keeps working. The next cold start tries again.
+  if (columnsOk) {
+    try {
+      await sunset.backfillEngagement();
+    } catch (e) {
+      console.error("[sunset backfill]", e);
+    }
+  }
   seeded = columnsOk && deliveryColumnsOk;
 }
 
@@ -1563,11 +1571,12 @@ async function sendMailNow(
   }
 
   const resuming = row.status === "sending" || row.status === "failed";
+  // Due removals first, unthrottled: whoever an ask let go must not get the
+  // next issue because the middleware's once-a-minute check hasn't run yet.
+  if (!resuming) await sunset.finishSunsets();
   if (!resuming && mail.segment === "inactive") {
-    // Due removals first, so nobody past their grace period is asked twice. Then
-    // the data the cohort rests on is checked again: it may have changed since
+    // The data the cohort rests on is checked again: it may have changed since
     // the ask was written.
-    await sunset.finishSunsets();
     const sum = await sunset.inactiveSummary(mail.audience_id, !!(await webhookSecret(c)).secret, mail.segment_days || sunset.INACTIVE_DAYS);
     if (sum.blocked) return { status: 400, body: { error: sum.blocked } };
     if (sum.inactive === 0) return { status: 400, body: { error: "Nobody on this audience is inactive right now." } };

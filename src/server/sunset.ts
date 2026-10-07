@@ -89,7 +89,7 @@ export interface InactiveSummary {
   inactive: number;
   /** Asked already and inside the grace period. */
   asked: number;
-  /** When the earliest of those is removed if they stay silent. */
+  /** When the earliest finished ask removes whoever stayed silent; null while it is still sending. */
   removes_from: string | null;
   last_engagement_at: string | null;
   /** Why asking isn't allowed now; null when it is. */
@@ -104,6 +104,9 @@ export async function blockedReason(trackingOn: boolean, days: number, nowMs = D
   if (!trackingOn) {
     return "Turn on delivery tracking in Settings first. Without opens and clicks every subscriber would look inactive.";
   }
+  // Until past opens and clicks are on the contacts, past readers look inactive.
+  const s = await get<{ engagement_backfilled_at: string | null }>(`SELECT engagement_backfilled_at FROM settings WHERE id = 1`);
+  if (!s?.engagement_backfilled_at) return "Reading past opens and clicks didn't finish. Reload in a minute and try again.";
   const cutoff = iso(nowMs - days * DAY);
   const recent = await query(
     `SELECT 1 FROM deliveries
@@ -129,7 +132,7 @@ export async function inactiveSummary(
     ? await get<{ n: number }>(`SELECT COUNT(*) AS n FROM (${INACTIVE_IDS})`, [since, audienceId, iso(nowMs - days * DAY), MIN_RECEIVED])
     : null;
   const asked = await get<{ n: number; first: string | null }>(
-    `SELECT COUNT(*) AS n, MIN(d.sent_at) AS first
+    `SELECT COUNT(*) AS n, MIN(m.sent_at) AS first
        FROM deliveries d JOIN mails m ON m.id = d.mail_id JOIN contacts c ON c.id = d.contact_id
       WHERE m.segment = 'inactive' AND m.sunset_done_at IS NULL AND m.audience_id = ?
         AND d.status = 'sent' AND c.status = 'subscribed'
@@ -161,15 +164,23 @@ export async function noteEngagement(email: string, at: string): Promise<void> {
 
 /**
  * Stop mailing everyone an ask reached who stayed silent through the grace
- * period. Idempotent: run as often as you like. An ask is closed once its send
- * finished and its last copy is past the grace period.
+ * period, once per ask. An ask is due GRACE_DAYS after its send ended
+ * (`sent_at`; a send stopped by a fatal error has none, so its last edit
+ * counts). Waiting for the end, not each copy's own time, delays removal by
+ * at most the send's length and keeps the per-minute check to one indexed
+ * lookup instead of a pass over the ask's deliveries.
+ *
+ * Idempotent: a person who engaged after their copy, or isn't subscribed any
+ * more, is left alone, and a closed ask is never read again.
  */
 export async function finishSunsets(nowMs = Date.now()): Promise<number> {
-  const asks = await query<{ id: number; status: string; sent_at: string | null }>(
-    `SELECT id, status, sent_at FROM mails
-      WHERE segment = 'inactive' AND sunset_done_at IS NULL AND status IN ('sending', 'sent', 'failed')`,
-  );
   const due = iso(nowMs - GRACE_DAYS * DAY);
+  const asks = await query<{ id: number }>(
+    `SELECT id FROM mails
+      WHERE segment = 'inactive' AND sunset_done_at IS NULL AND status IN ('sent', 'failed')
+        AND COALESCE(sent_at, strftime('%Y-%m-%dT%H:%M:%fZ', updated_at)) <= ?`,
+    [due],
+  );
   let removed = 0;
   for (const ask of asks) {
     const rows = await query<{ id: string }>(
@@ -182,9 +193,7 @@ export async function finishSunsets(nowMs = Date.now()): Promise<number> {
       [iso(nowMs), ask.id, due],
     );
     removed += rows.length;
-    if (ask.status === "sent" && ask.sent_at && ask.sent_at <= due) {
-      await run(`UPDATE mails SET sunset_done_at = ? WHERE id = ? AND sunset_done_at IS NULL`, [iso(nowMs), ask.id]);
-    }
+    await run(`UPDATE mails SET sunset_done_at = ? WHERE id = ? AND sunset_done_at IS NULL`, [iso(nowMs), ask.id]);
   }
   return removed;
 }
