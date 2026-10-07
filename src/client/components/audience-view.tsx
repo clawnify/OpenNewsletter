@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, RefreshCw, Database, Send, FileUp, Download, Search } from "lucide-react";
+import { Plus, Trash2, RefreshCw, Database, Send, FileUp, Download, Search, MailQuestion } from "lucide-react";
 import { api } from "../api";
 import { useStore } from "../store";
-import type { ResendAudience, ResendContact } from "../../shared/types";
+import type { InactiveSummary, Mail, ResendAudience, ResendContact } from "../../shared/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -11,7 +11,7 @@ import { CsvImportDialog } from "./csv-import-dialog";
 
 const PAGE = 50;
 
-export function AudienceView() {
+export function AudienceView({ openMail }: { openMail: (id: number) => void }) {
   const { status, setError, refreshStatus } = useStore();
   const audiences = status?.audiences || [];
   const [selected, setSelected] = useState<string>("");
@@ -164,6 +164,7 @@ export function AudienceView() {
       </div>
 
       {current ? <PendingSummary audience={current} busy={sendingConfirmations} onSend={sendConfirmations} message={confirmMsg} /> : null}
+      {current ? <InactiveCard audienceId={current.id} openMail={openMail} /> : null}
 
       <div className="mb-4 flex gap-2 rounded-md bg-card p-3 shadow-edge">
         <Input placeholder="email@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
@@ -236,7 +237,9 @@ export function AudienceView() {
                         ? pendingHint(c)
                         : c.status === "bounced"
                           ? "Delivery failed permanently"
-                          : "Unsubscribed"
+                          : c.unsubscribe_reason === "inactive"
+                            ? "Stopped after not answering a “still want this?” email. Signing up again, or the button in that email, brings them back."
+                            : "Unsubscribed"
                     }
                   >
                     {c.status === "pending"
@@ -247,7 +250,9 @@ export function AudienceView() {
                           : "Not emailed"
                       : c.status === "bounced"
                         ? "Bounced"
-                        : "Unsub"}
+                        : c.unsubscribe_reason === "inactive"
+                          ? "Inactive"
+                          : "Unsub"}
                   </span>
                 ) : null}
                 <button className="rounded-lg p-2 text-muted-foreground hover:text-destructive" onClick={() => remove(c.id)} aria-label="Remove contact">
@@ -266,6 +271,84 @@ export function AudienceView() {
         </div>
       ) : null}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Subscribers who stopped reading, and the one action for them: ask whether
+ * they want to stay. The ask opens as a draft issue; nothing is removed until
+ * it has been sent and they've had the grace period to answer.
+ */
+function InactiveCard({ audienceId, openMail }: { audienceId: string; openMail: (id: number) => void }) {
+  const { setError, refreshMails } = useStore();
+  const [days, setDays] = useState("90");
+  const [sum, setSum] = useState<InactiveSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    api<InactiveSummary>("GET", `/api/audiences/${audienceId}/inactive?days=${days}`)
+      .then((r) => live && setSum(r))
+      .catch(() => live && setSum(null));
+    return () => { live = false; };
+  }, [audienceId, days]);
+
+  if (!sum || (sum.inactive === 0 && sum.asked === 0)) return null;
+
+  const ask = async () => {
+    setBusy(true);
+    try {
+      const mail = await api<Mail>("POST", `/api/audiences/${audienceId}/ask-inactive`, { days: Number(days) });
+      await refreshMails();
+      openMail(mail.id);
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  };
+
+  const people = (n: number) => `${n.toLocaleString()} ${n === 1 ? "subscriber" : "subscribers"}`;
+  return (
+    <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md bg-card p-3 text-sm shadow-edge">
+      <MailQuestion size={18} className="shrink-0 text-muted-foreground" aria-hidden />
+      <div className="min-w-0 flex-1">
+        {sum.inactive > 0 ? (
+          <>
+            <p className="font-medium">
+              {people(sum.inactive)} haven't opened or clicked in {sum.days} days
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Each got at least {sum.min_received} issues since. Ask if they still want it: whoever doesn't answer within {sum.grace_days} days
+              stops getting your newsletter, which keeps your sender reputation healthy.
+            </p>
+          </>
+        ) : null}
+        {sum.asked > 0 ? (
+          <p className={sum.inactive > 0 ? "mt-1 text-xs" : "font-medium"}>
+            {people(sum.asked)} asked and not answered yet.
+            {sum.removes_from ? ` The first stop getting it ${new Date(sum.removes_from).toLocaleDateString()} unless they open, click or press “keep me”.` : ""}
+          </p>
+        ) : null}
+        {sum.inactive > 0 && sum.blocked ? <p className="mt-1 text-xs text-warning">{sum.blocked}</p> : null}
+      </div>
+      {sum.inactive > 0 ? (
+        <div className="flex items-center gap-2">
+          <Select value={days} onValueChange={setDays}>
+            <SelectTrigger className="h-8 w-28" aria-label="Inactive for">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="90">90 days</SelectItem>
+              <SelectItem value="180">180 days</SelectItem>
+              <SelectItem value="365">1 year</SelectItem>
+            </SelectContent>
+          </Select>
+          <Button size="sm" variant="outline" disabled={busy || !!sum.blocked} onClick={ask}>
+            {busy ? "Writing…" : "Ask them"}
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }

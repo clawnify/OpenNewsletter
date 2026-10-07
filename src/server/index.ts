@@ -15,6 +15,7 @@ import { domainCheck, dmarcCheck, dohTxt, findDmarc, imagesCheck, sizeCheck, typ
 import { sendableStatus, signingDomain } from "../shared/sending-domain";
 import * as sending from "./sending";
 import * as flows from "./flows";
+import * as sunset from "./sunset";
 import { applyDeliveryEvent } from "./events";
 import { parseResendEvent, verifyResendWebhook, RESEND_EVENTS } from "./providers/resend-webhook";
 import { WebhookSetupError } from "./providers/types";
@@ -88,6 +89,13 @@ async function ensureSeed() {
     `ALTER TABLE mails ADD COLUMN preheader TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN crm_enabled INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE settings ADD COLUMN crm_app_id TEXT`,
+    `ALTER TABLE settings ADD COLUMN tracking_since TEXT`,
+    `ALTER TABLE contacts ADD COLUMN last_engaged_at TEXT`,
+    `ALTER TABLE contacts ADD COLUMN unsubscribe_reason TEXT`,
+    `ALTER TABLE mails ADD COLUMN segment TEXT`,
+    `ALTER TABLE mails ADD COLUMN segment_days INTEGER`,
+    `ALTER TABLE mails ADD COLUMN sunset_done_at TEXT`,
+    `ALTER TABLE settings ADD COLUMN engagement_backfilled_at TEXT`,
   ]);
   // Idempotent, and outside the try: a mistake here must surface, not be read
   // as "already exists".
@@ -99,17 +107,31 @@ async function ensureSeed() {
   ]);
   for (const sql of flows.FLOWS_DDL) await run(sql);
   for (const sql of [
+    `CREATE INDEX IF NOT EXISTS idx_mails_sunset ON mails(segment) WHERE sunset_done_at IS NULL`,
     `CREATE TABLE IF NOT EXISTS signup_attempts (ip_hash TEXT NOT NULL, at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts ON signup_attempts(ip_hash, at)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at)`,
   ]) await run(sql);
   await contacts.dropDuplicateDefaultAudiences();
+  // After the columns: needs contacts.last_engaged_at and the settings flag.
+  if (columnsOk) await sunset.backfillEngagement();
   seeded = columnsOk && deliveryColumnsOk;
 }
 
+// Sunset removals fall due with no job to run them (src/server/sunset.ts), so
+// requests do it, at most once a minute per isolate. A send runs it itself.
+let sunsetCheckedAt = 0;
 app.use("*", async (c, next) => {
   initDB(c.env);
   await ensureSeed();
+  if (Date.now() - sunsetCheckedAt > 60_000) {
+    sunsetCheckedAt = Date.now();
+    try {
+      await sunset.finishSunsets();
+    } catch (e) {
+      console.error("[sunset]", e);
+    }
+  }
   await next();
 });
 
@@ -1541,7 +1563,15 @@ async function sendMailNow(
   }
 
   const resuming = row.status === "sending" || row.status === "failed";
-  if (!resuming && !(await contacts.hasSubscribers(mail.audience_id))) {
+  if (!resuming && mail.segment === "inactive") {
+    // Due removals first, so nobody past their grace period is asked twice. Then
+    // the data the cohort rests on is checked again: it may have changed since
+    // the ask was written.
+    await sunset.finishSunsets();
+    const sum = await sunset.inactiveSummary(mail.audience_id, !!(await webhookSecret(c)).secret, mail.segment_days || sunset.INACTIVE_DAYS);
+    if (sum.blocked) return { status: 400, body: { error: sum.blocked } };
+    if (sum.inactive === 0) return { status: 400, body: { error: "Nobody on this audience is inactive right now." } };
+  } else if (!resuming && !(await contacts.hasSubscribers(mail.audience_id))) {
     return { status: 400, body: { error: "No confirmed subscribers on this audience yet." } };
   }
 
@@ -1886,6 +1916,7 @@ app.post("/api/tracking", async (c) => {
   try {
     const w = await p.ensureWebhook(manual.endpoint);
     await run("UPDATE settings SET resend_webhook_id = ?, resend_webhook_secret = ? WHERE id = 1", [w.id, w.secret]);
+    await sunset.markTrackingOn();
     return c.json({ ok: true, tracking: await trackingState(c) });
   } catch (e) {
     if (e instanceof WebhookSetupError) return c.json({ error: e.message, manual }, 400);
@@ -1898,6 +1929,7 @@ app.put("/api/tracking/secret", async (c) => {
   const { secret } = await c.req.json<{ secret?: string }>().catch(() => ({}) as { secret?: string });
   if (!secret?.trim().startsWith("whsec_")) return c.json({ error: "Paste the webhook's signing secret (it starts with whsec_)." }, 400);
   await run("UPDATE settings SET resend_webhook_id = NULL, resend_webhook_secret = ? WHERE id = 1", [secret.trim()]);
+  await sunset.markTrackingOn();
   return c.json({ ok: true, tracking: await trackingState(c) });
 });
 
@@ -1925,6 +1957,68 @@ app.get("/api/mails/:id/stats", async (c) => {
   );
   const stats = Object.fromEntries(Object.entries(r ?? {}).map(([k, v]) => [k, Number(v ?? 0)]));
   return c.json({ ...stats, tracking: (await trackingState(c)).enabled });
+});
+
+// ── Sunset: ask inactive subscribers, then let them go ──────────────
+// See src/server/sunset.ts and ~/wiki/OpenNewsletter/sunset-inactive.md.
+
+function sunsetDays(raw: unknown): number {
+  const n = Math.round(Number(raw));
+  return Number.isFinite(n) && n >= 30 && n <= 365 ? n : sunset.INACTIVE_DAYS;
+}
+
+app.get("/api/audiences/:id/inactive", async (c) => {
+  const id = c.req.param("id");
+  if (!(await contacts.listAudiences()).some((a) => a.id === id)) return c.json({ error: "Audience not found" }, 404);
+  const trackingOn = !!(await webhookSecret(c)).secret;
+  const summary = await sunset.inactiveSummary(id, trackingOn, sunsetDays(c.req.query("days")));
+  return c.json({ ...summary, min_received: sunset.MIN_RECEIVED, grace_days: sunset.GRACE_DAYS });
+});
+
+/** Write the ask as a draft issue. It is edited, tested and sent like any other. */
+app.post("/api/audiences/:id/ask-inactive", async (c) => {
+  const id = c.req.param("id");
+  if (!(await contacts.listAudiences()).some((a) => a.id === id)) return c.json({ error: "Audience not found" }, 404);
+  const { days: rawDays } = await c.req.json<{ days?: number }>().catch(() => ({}) as { days?: number });
+  const days = sunsetDays(rawDays);
+  const blocked = await sunset.blockedReason(!!(await webhookSecret(c)).secret, days);
+  if (blocked) return c.json({ error: blocked }, 400);
+
+  const s = await getSettings();
+  const pub = s.publication_name || "this newsletter";
+  const slug = "classic-editorial";
+  const t = await get<any>("SELECT * FROM templates WHERE slug = ?", [slug]);
+  const title = `Do you still want ${pub}?`;
+  const blocks: Block[] = [
+    titleBlock(title),
+    ...markdownToBlocks(
+      `Hi {{first_name|there}},\n\n` +
+        `We'd rather write to people who read us than fill an inbox that doesn't want us. ` +
+        `If you'd like to keep getting ${pub}, press the button below.\n\n` +
+        `If you don't, there's nothing to do: we'll stop sending in ${sunset.GRACE_DAYS} days. ` +
+        `You can always sign up again.`,
+    ),
+  ];
+  const m = mailFromSkeleton({ blocks, title }, s.publication_name || "");
+  const row = await get<any>(
+    `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id,
+                        segment, segment_days)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'inactive', ?) RETURNING *`,
+    [m.eyebrow, title, m.subtitle, m.byline_name, m.byline_date, m.feature_image, JSON.stringify(m.blocks), t ? slug : null, id, days],
+  );
+  return c.json(parseMail(row), 201);
+});
+
+// The keep link in an ask. A GET that changes state, on purpose: a scanner
+// following it only keeps someone one more round, while a second click would
+// lose real readers. Keyed by contact id (a UUID), like unsubscribe.
+app.get("/api/keep", async (c) => {
+  const id = c.req.query("c") || "";
+  const kept = id ? await sunset.keepSubscribed(id) : null;
+  const s = await getSettings();
+  const name = escapeHtml(s.publication_name || "this newsletter");
+  if (!kept) return c.html(page(`<h1>Link expired</h1><p>This link is no longer valid.</p>`), 400);
+  return c.html(page(`<h1>You're still subscribed</h1><p>Thanks. ${name} keeps coming to ${escapeHtml(kept.email)}.</p>`));
 });
 
 // ── unsubscribe (public, branded) ────────────────────────────────────

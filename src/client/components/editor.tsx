@@ -311,6 +311,14 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
         <Button variant="ghost" size="icon" onClick={onBack} aria-label="Back"><ArrowLeft size={18} /></Button>
         <div className="flex items-center gap-2 text-sm">
           <Badge variant="secondary">Mail</Badge>
+          {mail.segment === "inactive" ? (
+            <Badge
+              className="bg-info-tint text-info"
+              title={`Goes only to subscribers with no open or click in ${mail.segment_days || 90} days. The email always ends with a “Yes, keep me subscribed” button; whoever doesn't answer stops getting your newsletter.`}
+            >
+              To inactive subscribers
+            </Badge>
+          ) : null}
           <span className="max-w-[260px] truncate font-medium">{mail.title || "Untitled"}</span>
           <span className="text-xs text-muted-foreground">{saved ? "Saved" : "Saving…"}</span>
           {mail.status === "scheduled" ? (
