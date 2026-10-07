@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { CheckCircle2, AlertTriangle, XCircle, HelpCircle, Copy } from "lucide-react";
 import { api } from "../api";
 import { useStore } from "../store";
-import type { Check, Mail } from "../../shared/types";
+import type { Check, InactiveSummary, Mail } from "../../shared/types";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -26,8 +26,19 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
   // Counts as of now, not as of when the app loaded.
   useEffect(() => { refreshStatus().catch(() => {}); }, [refreshStatus]);
   const audience = audiences.find((a) => a.id === audienceId);
-  const confirmed = audience?.subscribed_count ?? 0;
   const pending = audience?.pending_count ?? 0;
+  // An ask to inactive subscribers goes to the inactive ones only, decided when it starts.
+  const ask = mail.segment === "inactive";
+  const [inactive, setInactive] = useState<InactiveSummary | null>(null);
+  useEffect(() => {
+    if (!ask || !audienceId) return;
+    let live = true;
+    api<InactiveSummary>("GET", `/api/audiences/${audienceId}/inactive?days=${mail.segment_days || 90}`)
+      .then((r) => live && setInactive(r))
+      .catch(() => live && setInactive(null));
+    return () => { live = false; };
+  }, [ask, audienceId, mail.segment_days]);
+  const confirmed = ask ? inactive?.inactive ?? 0 : audience?.subscribed_count ?? 0;
 
   // From-addresses: the primary settings sender + any saved senders.
   const senders: { label: string; value: string }[] = [];
@@ -118,7 +129,16 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
                   {audiences.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}
                 </SelectContent>
               </Select>
-              {audience ? (
+              {audience && ask ? (
+                inactive?.blocked ? (
+                  <p className="rounded-sm bg-warning-tint p-2 text-xs text-warning">{inactive.blocked}</p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Goes to the {confirmed.toLocaleString()} inactive {confirmed === 1 ? "subscriber" : "subscribers"} (no open or click in{" "}
+                    {mail.segment_days || 90} days), counted again when it sends. Whoever doesn't answer within {inactive?.grace_days ?? 10} days stops getting your newsletter.
+                  </p>
+                )
+              ) : audience ? (
                 confirmed > 0 ? (
                   <p className="text-xs text-muted-foreground">
                     Goes to {confirmed.toLocaleString()} confirmed {confirmed === 1 ? "subscriber" : "subscribers"}.
@@ -161,7 +181,7 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
           {connected ? (
-            <Button disabled={!audienceId || !fromReady || busy === "send" || (!when && !!audience && confirmed === 0 && (mail.status === "draft" || mail.status === "scheduled"))} onClick={send}>
+            <Button disabled={!audienceId || !fromReady || busy === "send" || (ask && !!inactive?.blocked) || (!when && !!audience && confirmed === 0 && (mail.status === "draft" || mail.status === "scheduled"))} onClick={send}>
               {busy === "send" ? "Sending…" : when ? "Schedule" : "Send now"}
             </Button>
           ) : null}

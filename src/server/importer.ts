@@ -131,8 +131,11 @@ export async function importChunk(audienceId: string, rows: Clean[], nowIso = ne
     const emails = optOut.filter((r) => r.s === status).map((r) => r.e);
     if (!emails.length) continue;
     await run(
-      `UPDATE contacts SET status = ?, unsubscribed_at = CASE WHEN ? = 'unsubscribed' THEN ? ELSE unsubscribed_at END
-        WHERE audience_id = ? AND status IN ('pending', 'subscribed')
+      // A row the sunset removed (unsubscribe_reason set) takes the recorded
+      // opt-out too, so the keep link can't bring that person back.
+      `UPDATE contacts SET status = ?, unsubscribe_reason = NULL,
+              unsubscribed_at = CASE WHEN ? = 'unsubscribed' THEN ? ELSE unsubscribed_at END
+        WHERE audience_id = ? AND (status IN ('pending', 'subscribed') OR unsubscribe_reason IS NOT NULL)
           AND email IN (SELECT value FROM json_each(?))`,
       [status, status, nowIso, audienceId, JSON.stringify(emails)],
     );

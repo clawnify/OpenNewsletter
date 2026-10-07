@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS mails (
   send_id TEXT,
   send_snapshot TEXT,
   send_error TEXT,
+  -- 'inactive': an ask to subscribers who stopped reading (src/server/sunset.ts).
+  -- Recipients are the audience's inactive subscribers when the send starts, and
+  -- the ones who stay silent are removed GRACE_DAYS later (sunset_done_at then set).
+  segment TEXT,
+  segment_days INTEGER,
+  sunset_done_at TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -60,7 +66,12 @@ CREATE TABLE IF NOT EXISTS settings (
   -- contacts source, NULL = none. This IS the opt-in: a CRM being reachable never
   -- activates anything on its own; the operator chooses one in Settings before
   -- any CRM read happens. Falls back to the CRM_APP_ID env var (bundle installs).
-  crm_app_id TEXT
+  crm_app_id TEXT,
+  -- When delivery tracking was turned on: engagement data starts here, so
+  -- nobody can look inactive for longer than tracking has been watching.
+  tracking_since TEXT,
+  -- Set once past opens and clicks were copied onto contacts.last_engaged_at.
+  engagement_backfilled_at TEXT
 );
 
 -- Audiences (lists). Previously Resend segments; now local, so the list is the
@@ -110,6 +121,11 @@ CREATE TABLE IF NOT EXISTS contacts (
   confirm_sent_at TEXT,
   confirm_attempts INTEGER NOT NULL DEFAULT 0,
   confirm_error TEXT,
+  -- Last open, click or keep-link click from this address (src/server/sunset.ts).
+  last_engaged_at TEXT,
+  -- Why an unsubscribed row is unsubscribed when it wasn't the person's own
+  -- choice: 'inactive' (sunset). NULL = they unsubscribed or complained.
+  unsubscribe_reason TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -168,6 +184,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_recipient ON deliveries(mail_id
 CREATE INDEX IF NOT EXISTS idx_deliveries_batch ON deliveries(mail_id, status, batch);
 CREATE INDEX IF NOT EXISTS idx_deliveries_provider ON deliveries(provider_message_id)
   WHERE provider_message_id IS NOT NULL;
+-- What one person received, for "5 issues since they last engaged".
+CREATE INDEX IF NOT EXISTS idx_deliveries_contact ON deliveries(contact_id, sent_at);
 
 -- ── Automations (flows) ──────────────────────────────────────────────────────
 -- A flow is a small chain of steps a contact walks once: send an email, wait,
@@ -256,6 +274,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_step_sent_once
 
 CREATE INDEX IF NOT EXISTS idx_mails_status ON mails(status);
 CREATE INDEX IF NOT EXISTS idx_mails_updated ON mails(updated_at);
+CREATE INDEX IF NOT EXISTS idx_mails_sunset ON mails(segment) WHERE sunset_done_at IS NULL;
 -- One row per address per list; re-subscribing updates rather than duplicates.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_email ON contacts(audience_id, email);
 -- Drives "who gets this send" — the only hot query on this table.

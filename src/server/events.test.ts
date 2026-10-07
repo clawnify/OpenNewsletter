@@ -108,8 +108,8 @@ describe("applyDeliveryEvent", () => {
   });
 
   it("maps by provider id when the tag is missing, keeps the first timestamp, and ignores mail it didn't send", async () => {
-    await applyDeliveryEvent({ kind: "clicked", deliveryId: null, messageId: "e1", at });
-    await applyDeliveryEvent({ kind: "clicked", deliveryId: "d1", messageId: "e1", at: "2026-10-01T00:00:00Z" });
+    await applyDeliveryEvent({ kind: "clicked", deliveryId: null, messageId: "e1", at, to: null });
+    await applyDeliveryEvent({ kind: "clicked", deliveryId: "d1", messageId: "e1", at: "2026-10-01T00:00:00Z", to: null });
     const [d] = await query<{ clicked_at: string }>(`SELECT clicked_at FROM deliveries WHERE id = 'd1'`);
     expect(d.clicked_at).toBe(at);
     expect(await applyDeliveryEvent({ kind: "delivered", deliveryId: null, messageId: "confirmation-email", at })).toBe("unknown-delivery");

@@ -83,7 +83,10 @@ function MailRow({ mail, onOpen, onDelete }: { mail: Mail; onOpen: () => void; o
     <li className="flex items-center gap-3 px-4 py-3 hover:bg-muted">
       <button className="min-w-0 flex-1 text-left" onClick={onOpen}>
         <div className="truncate font-medium">{mail.title || "Untitled"}</div>
-        <div className="truncate text-xs text-muted-foreground">{mail.subtitle || mail.eyebrow}</div>
+        <div className="truncate text-xs text-muted-foreground">
+          {mail.segment === "inactive" ? "To inactive subscribers · " : ""}
+          {mail.subtitle || mail.eyebrow}
+        </div>
       </button>
       <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${mail.status === "scheduled" ? "" : "capitalize"} ${isLate(mail) ? "bg-warning-tint text-warning" : badge}`}>
         {mail.status === "scheduled" && mail.scheduled_at ? `${isLate(mail) ? "Late: was due" : "Scheduled ·"} ${whenLabel(mail.scheduled_at)}` : mail.status}

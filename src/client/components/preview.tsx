@@ -80,6 +80,12 @@ export function Preview({ mail, design, settings, edit }: { mail: Mail; design: 
         ))}
         {edit && !edit.selectMode ? <AddBar onAdd={(t) => edit.onAdd(mail.blocks.length, t)} /> : null}
 
+        {mail.segment === "inactive" ? (
+          // Added to every copy by the renderer (src/server/render.ts), with each reader's own link. Not editable.
+          <div style={{ marginTop: design.layout.spacing * 2 }} title="Every copy ends with this button, linked to that reader. It can't be removed.">
+            <BlockView block={{ id: "keep", type: "button", text: "Yes, keep me subscribed", href: "#", align: "center", fullWidth: true }} design={design} />
+          </div>
+        ) : null}
         {design.options.showFooter ? (
           <div style={{ marginTop: design.layout.spacing * 1.5, borderTop: `1px solid ${design.colors.border}`, paddingTop: design.layout.spacing, fontFamily: fontStack(design.typography.bodyFont), fontSize: 12, lineHeight: 1.5, color: design.colors.secondary }}>
             <div>{settings.publication_name}</div>
