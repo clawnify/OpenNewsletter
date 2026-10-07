@@ -65,8 +65,8 @@ async function audienceWithHistory() {
   [200, 170, 140, 110, 95, 7].forEach((d, i) => {
     db.prepare(`INSERT INTO mails (id, title, audience_id, status, sent_at) VALUES (?, 'Issue', ?, 'sent', ?)`).run(100 + i, aud, ago(d));
     for (const c of ["quiet", "reader"]) {
-      db.prepare(`INSERT INTO deliveries (id, mail_id, contact_id, email, batch, status, sent_at, clicked_at) VALUES (?, ?, ?, ?, 0, 'sent', ?, ?)`).run(
-        `d${i}${c}`, 100 + i, c, `${c}@example.com`, ago(d), d === 7 && c === "reader" ? ago(d) : null,
+      db.prepare(`INSERT INTO deliveries (id, mail_id, contact_id, email, batch, status, sent_at, delivered_at, clicked_at) VALUES (?, ?, ?, ?, 0, 'sent', ?, ?, ?)`).run(
+        `d${i}${c}`, 100 + i, c, `${c}@example.com`, ago(d), ago(d), d === 7 && c === "reader" ? ago(d) : null,
       );
     }
   });
@@ -89,7 +89,9 @@ describe("asking inactive subscribers", () => {
     expect(sent.map((m) => m.to)).toEqual(["quiet@example.com"]);
     expect(sent[0].html).toContain(`${ORIGIN}/api/keep?c=quiet`);
 
-    // While the ask runs, nobody is counted twice.
+    // While the ask runs, nobody is counted twice; "asked" counts copies that were delivered.
+    expect(((await (await call("GET", `/api/audiences/${aud}/inactive`)).json()) as any)).toMatchObject({ inactive: 0, asked: 0 });
+    db.prepare(`UPDATE deliveries SET delivered_at = sent_at WHERE mail_id = ?`).run(mail.id);
     expect(((await (await call("GET", `/api/audiences/${aud}/inactive`)).json()) as any)).toMatchObject({ inactive: 0, asked: 1 });
   });
 
@@ -119,7 +121,9 @@ describe("removal before every send", () => {
     const aud = await audienceWithHistory();
     // The ask went out 11 days ago, but this request's check ran while it wasn't due yet.
     db.prepare(`INSERT INTO mails (id, title, audience_id, status, sent_at, segment) VALUES (500, 'Ask', ?, 'sent', ?, 'inactive')`).run(aud, ago(1));
-    db.prepare(`INSERT INTO deliveries (id, mail_id, contact_id, email, batch, status, sent_at) VALUES ('ask_q', 500, 'quiet', 'quiet@example.com', 0, 'sent', ?)`).run(ago(11));
+    db.prepare(`INSERT INTO deliveries (id, mail_id, contact_id, email, batch, status, sent_at, delivered_at, created_at) VALUES ('ask_q', 500, 'quiet', 'quiet@example.com', 0, 'sent', ?, ?, ?)`).run(
+      ago(11), ago(11), ago(11).replace("T", " ").slice(0, 19),
+    );
     await call("GET", "/api/audiences");
     db.prepare(`UPDATE mails SET sent_at = ? WHERE id = 500`).run(ago(11));
 
@@ -137,7 +141,7 @@ describe("the one-time engagement backfill", () => {
     db.prepare(`UPDATE settings SET engagement_backfilled_at = NULL`).run();
     const real = (env.STORAGE as any).query;
     (env.STORAGE as any).query = async (sql: string, p: unknown[]) => {
-      if (/GROUP BY contact_id/.test(sql)) throw new Error("D1_ERROR: query timed out");
+      if (/GROUP BY email/.test(sql)) throw new Error("D1_ERROR: query timed out");
       return real(sql, p);
     };
     vi.resetModules();

@@ -286,6 +286,12 @@ function InactiveCard({ audienceId, openMail }: { audienceId: string; openMail: 
   const [sum, setSum] = useState<InactiveSummary | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // Another audience's count must never sit next to a live "Ask them".
+  useEffect(() => {
+    setSum(null);
+    setDays("90");
+  }, [audienceId]);
+
   useEffect(() => {
     let live = true;
     api<InactiveSummary>("GET", `/api/audiences/${audienceId}/inactive?days=${days}`)
@@ -294,7 +300,8 @@ function InactiveCard({ audienceId, openMail }: { audienceId: string; openMail: 
     return () => { live = false; };
   }, [audienceId, days]);
 
-  if (!sum || (sum.inactive === 0 && sum.asked === 0)) return null;
+  // Hidden only at the default window: after picking a longer one, the picker stays to switch back.
+  if (!sum || (sum.inactive === 0 && sum.asked === 0 && days === "90")) return null;
 
   const ask = async () => {
     setBusy(true);
@@ -324,6 +331,9 @@ function InactiveCard({ audienceId, openMail }: { audienceId: string; openMail: 
             </p>
           </>
         ) : null}
+        {sum.inactive === 0 && sum.asked === 0 ? (
+          <p className="text-muted-foreground">Nobody has gone {sum.days} days without opening or clicking.</p>
+        ) : null}
         {sum.asked > 0 ? (
           <p className={sum.inactive > 0 ? "mt-1 text-xs" : "font-medium"}>
             {people(sum.asked)} asked and not answered yet.
@@ -332,7 +342,7 @@ function InactiveCard({ audienceId, openMail }: { audienceId: string; openMail: 
         ) : null}
         {sum.inactive > 0 && sum.blocked ? <p className="mt-1 text-xs text-warning">{sum.blocked}</p> : null}
       </div>
-      {sum.inactive > 0 ? (
+      {sum.inactive > 0 || days !== "90" ? (
         <div className="flex items-center gap-2">
           <Select value={days} onValueChange={setDays}>
             <SelectTrigger className="h-8 w-28" aria-label="Inactive for">
@@ -344,7 +354,7 @@ function InactiveCard({ audienceId, openMail }: { audienceId: string; openMail: 
               <SelectItem value="365">1 year</SelectItem>
             </SelectContent>
           </Select>
-          <Button size="sm" variant="outline" disabled={busy || !!sum.blocked} onClick={ask}>
+          <Button size="sm" variant="outline" disabled={busy || !!sum.blocked || sum.inactive === 0} onClick={ask}>
             {busy ? "Writing…" : "Ask them"}
           </Button>
         </div>

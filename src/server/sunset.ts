@@ -7,10 +7,13 @@
  * inactive (~/wiki/OpenNewsletter/sunset-inactive.md). So every rule here errs
  * toward keeping someone:
  * - opens count as engagement although Apple Mail fakes them;
- * - nobody is inactive until 5 issues have been sent to them since they last
- *   engaged, joined, or since tracking was turned on;
+ * - nobody is inactive until 5 issues were DELIVERED to them (a delivered event
+ *   proves the webhook was recording that copy) since they last engaged,
+ *   joined, or since tracking was turned on;
  * - nobody is removed without an email with a keep link first, and only once
- *   their copy is `sent` and GRACE_DAYS have passed with no sign of life;
+ *   that copy was delivered without a bounce and GRACE_DAYS have passed with
+ *   no sign of life since the send began (not since the provider answered: a
+ *   retried copy can arrive minutes before its row says `sent`);
  * - the whole thing is refused when no open or click has been recorded lately.
  *
  * The ask is an ordinary issue with `segment = 'inactive'`. Removal needs no
@@ -41,10 +44,19 @@ export const INACTIVE_IDS = `
   ) q
   WHERE q.quiet <= ?
     AND (SELECT COUNT(*) FROM (SELECT 1 FROM deliveries d
-          WHERE d.contact_id = q.id AND d.status = 'sent' AND d.sent_at > q.quiet LIMIT ${MIN_RECEIVED})) >= ?
-    AND NOT EXISTS (SELECT 1 FROM deliveries d JOIN mails m ON m.id = d.mail_id
-                     WHERE d.contact_id = q.id AND d.status NOT IN ('failed', 'skipped')
-                       AND m.segment = 'inactive' AND m.sunset_done_at IS NULL)`;
+          WHERE d.contact_id = q.id AND d.status = 'sent' AND d.delivered_at IS NOT NULL AND d.sent_at > q.quiet
+          LIMIT ${MIN_RECEIVED})) >= ?
+    AND q.id NOT IN (SELECT d.contact_id FROM mails m JOIN deliveries d ON d.mail_id = m.id
+                      WHERE m.segment = 'inactive' AND m.sunset_done_at IS NULL AND d.status NOT IN ('failed', 'skipped'))`;
+
+/**
+ * An ask copy `d` reached contact `c`, who has shown no sign of life since:
+ * delivered without a bounce, and no engagement or new consent since the send
+ * began (`d.created_at`, written when recipients were frozen).
+ */
+const SILENT_SINCE_ASKED = `d.status = 'sent' AND d.delivered_at IS NOT NULL AND d.bounced_at IS NULL AND c.status = 'subscribed'
+  AND COALESCE(c.last_engaged_at, '') < strftime('%Y-%m-%dT%H:%M:%fZ', d.created_at)
+  AND COALESCE(c.consent_at, '') < strftime('%Y-%m-%dT%H:%M:%fZ', d.created_at)`;
 
 /**
  * When engagement data starts: the moment delivery tracking was turned on.
@@ -71,10 +83,11 @@ export async function backfillEngagement(): Promise<void> {
   const s = await get<{ engagement_backfilled_at: string | null }>(`SELECT engagement_backfilled_at FROM settings WHERE id = 1`);
   if (s?.engagement_backfilled_at) return;
   await run(
+    // Per address, like noteEngagement: reading list A counts on list B too.
     `UPDATE contacts SET last_engaged_at = e.at
-       FROM (SELECT contact_id, MAX(MAX(COALESCE(opened_at, ''), COALESCE(clicked_at, ''))) AS at
-               FROM deliveries WHERE opened_at IS NOT NULL OR clicked_at IS NOT NULL GROUP BY contact_id) e
-      WHERE contacts.id = e.contact_id AND COALESCE(contacts.last_engaged_at, '') < e.at`,
+       FROM (SELECT email, MAX(MAX(COALESCE(opened_at, ''), COALESCE(clicked_at, ''))) AS at
+               FROM deliveries WHERE opened_at IS NOT NULL OR clicked_at IS NOT NULL GROUP BY email) e
+      WHERE contacts.email = e.email AND COALESCE(contacts.last_engaged_at, '') < e.at`,
   );
   await run(`UPDATE settings SET engagement_backfilled_at = ? WHERE id = 1`, [new Date().toISOString()]);
 }
@@ -135,8 +148,7 @@ export async function inactiveSummary(
     `SELECT COUNT(*) AS n, MIN(m.sent_at) AS first
        FROM deliveries d JOIN mails m ON m.id = d.mail_id JOIN contacts c ON c.id = d.contact_id
       WHERE m.segment = 'inactive' AND m.sunset_done_at IS NULL AND m.audience_id = ?
-        AND d.status = 'sent' AND c.status = 'subscribed'
-        AND COALESCE(c.last_engaged_at, '') < d.sent_at AND COALESCE(c.consent_at, '') < d.sent_at`,
+        AND ${SILENT_SINCE_ASKED}`,
     [audienceId],
   );
   const last = await get<{ at: string | null }>(
@@ -157,7 +169,10 @@ export async function inactiveSummary(
 /** A sign of life from this address: an open, a click, the keep link. Engagement is per person, on every list. */
 export async function noteEngagement(email: string, at: string): Promise<void> {
   await run(
-    `UPDATE contacts SET last_engaged_at = ? WHERE email = ? AND COALESCE(last_engaged_at, '') < ?`,
+    // audience_id IN (...) lets SQLite use idx_contacts_email (audience_id, email)
+    // instead of scanning every contact on each open or click.
+    `UPDATE contacts SET last_engaged_at = ?
+      WHERE audience_id IN (SELECT id FROM audiences) AND email = ? AND COALESCE(last_engaged_at, '') < ?`,
     [at, email.trim().toLowerCase(), at],
   );
 }
@@ -187,8 +202,7 @@ export async function finishSunsets(nowMs = Date.now()): Promise<number> {
       `UPDATE contacts SET status = 'unsubscribed', unsubscribe_reason = 'inactive', unsubscribed_at = ?, confirm_token = NULL
         WHERE id IN (
           SELECT c.id FROM deliveries d JOIN contacts c ON c.id = d.contact_id
-           WHERE d.mail_id = ? AND d.status = 'sent' AND d.sent_at <= ? AND c.status = 'subscribed'
-             AND COALESCE(c.last_engaged_at, '') < d.sent_at AND COALESCE(c.consent_at, '') < d.sent_at)
+           WHERE d.mail_id = ? AND d.sent_at <= ? AND ${SILENT_SINCE_ASKED})
         RETURNING id`,
       [iso(nowMs), ask.id, due],
     );

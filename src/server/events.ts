@@ -21,7 +21,9 @@ export type EventOutcome = "applied" | "suppressed-no-delivery" | "engaged-no-de
 async function suppressByEmail(email: string, ev: DeliveryEvent): Promise<void> {
   if (ev.kind === "bounced" && ev.permanent) {
     await run(
-      `UPDATE contacts SET status = 'bounced', confirm_token = NULL WHERE email = ? AND status IN ('subscribed', 'pending')`,
+      // A row the sunset removed takes the bounce too, so its keep link can't revive a dead address.
+      `UPDATE contacts SET status = 'bounced', confirm_token = NULL, unsubscribe_reason = NULL
+        WHERE email = ? AND (status IN ('subscribed', 'pending') OR unsubscribe_reason IS NOT NULL)`,
       [email],
     );
   } else if (ev.kind === "complained") {

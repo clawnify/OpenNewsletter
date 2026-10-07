@@ -1571,6 +1571,10 @@ async function sendMailNow(
   }
 
   const resuming = row.status === "sending" || row.status === "failed";
+  // Its copies promise removal in GRACE_DAYS, which a closed ask no longer does.
+  if (mail.segment === "inactive" && row.sunset_done_at) {
+    return { status: 409, body: { error: "This ask is closed. Write a new one from Audience to ask again." } };
+  }
   // Due removals first, unthrottled: whoever an ask let go must not get the
   // next issue because the middleware's once-a-minute check hasn't run yet.
   if (!resuming) await sunset.finishSunsets();
@@ -1596,6 +1600,8 @@ async function sendMailNow(
     scheduled_at: _scheduledAt,
     sent_at: _sentAt,
     updated_at: _updatedAt,
+    // Written by the sunset, not the send: inside, it would change a retry's snapshot.
+    sunset_done_at: _sunsetDone,
     ...frozen
   } = mail as Mail & Record<string, unknown>;
   const begun = await sending.beginSend(id, mail.audience_id, {

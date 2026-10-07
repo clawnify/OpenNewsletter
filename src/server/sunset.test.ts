@@ -48,9 +48,9 @@ async function issue(days: number, to: string[], opts: { clicked?: string[]; ope
   ]);
   for (const c of to) {
     await run(
-      `INSERT INTO deliveries (id, mail_id, contact_id, email, batch, status, sent_at, opened_at, clicked_at)
-       VALUES (?, ?, ?, ?, 0, 'sent', ?, ?, ?)`,
-      [`d${id}_${c}`, id, c, `${c}@x.test`, ago(days), opts.opened?.includes(c) ? ago(days) : null, opts.clicked?.includes(c) ? ago(days) : null],
+      `INSERT INTO deliveries (id, mail_id, contact_id, email, batch, status, sent_at, delivered_at, opened_at, clicked_at, created_at)
+       VALUES (?, ?, ?, ?, 0, 'sent', ?, ?, ?, ?, ?)`,
+      [`d${id}_${c}`, id, c, `${c}@x.test`, ago(days), ago(days), opts.opened?.includes(c) ? ago(days) : null, opts.clicked?.includes(c) ? ago(days) : null, sqliteAgo(days)],
     );
   }
   return id;
