@@ -14,7 +14,9 @@ export function HomeView({
   openMail: (id: number) => void;
   onNavigate: (view: "mail" | "templates" | "audience" | "settings") => void;
 }) {
-  const { mails, templates, status, createMail, setError } = useStore();
+  const { mails: all, templates, status, createMail, setError } = useStore();
+  // Issues only: an automation's emails are counted on its canvas, not here.
+  const mails = all.filter((m) => !m.flow);
 
   const sent = mails.filter((m) => m.status === "sent");
   const scheduled = mails.filter((m) => m.status === "scheduled");
