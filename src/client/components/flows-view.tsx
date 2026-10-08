@@ -3,6 +3,7 @@ import {
   Zap, Mail, Clock, Plus, Play, Pause, Archive, Pencil, AlertTriangle,
   ChevronLeft, MoreVertical, Flag, Check, Trash2, Sparkles, Info,
 } from "lucide-react";
+import { reportLocation } from "@clawnify/app/client";
 import { api } from "../api";
 import { useStore } from "../store";
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,8 @@ interface FlowStep {
   id: string;
   kind: "email" | "delay" | "split" | "end";
   config: string;
+  /** Email steps: a draft is skipped, never sent. */
+  status: "draft" | "live";
   next_step_id: string | null;
 }
 interface StepStat { sent: number; skipped: number; waiting: number }
@@ -80,6 +83,7 @@ export function FlowsView({ openMail }: { openMail: (id: number) => void }) {
   const setSelected = (id: string | null) => {
     const href = id ? `/automations/${id}` : "/automations";
     if (window.location.pathname !== href) window.history.pushState(null, "", href);
+    reportLocation(href); // so a dashboard reload reopens this automation
     setSelectedState(id);
   };
   if (selected) return <FlowDetailView id={selected} onBack={() => setSelected(null)} openMail={openMail} />;
@@ -313,12 +317,21 @@ function FlowDetailView({ id, onBack, openMail }: { id: string; onBack: () => vo
     catch (e) { setError((e as Error).message); }
   };
 
+  const [adding, setAdding] = useState(false);
   const addStep = async (after: string | null, kind: "email" | "delay") => {
+    if (adding) return;
+    setAdding(true);
     try {
       await api("POST", `/api/flows/${id}/steps`, { after, kind });
       if (kind === "email") await refreshMails(); // the step made its email
-      await load();
     } catch (e) { setError((e as Error).message); }
+    await load(); // also after a refusal: someone else may have changed the chain
+    setAdding(false);
+  };
+
+  const setStepStatus = async (stepId: string, status: "draft" | "live") => {
+    try { await api("PATCH", `/api/flows/${id}/steps/${stepId}`, { status }); await load(); }
+    catch (e) { setError((e as Error).message); }
   };
 
   const removeStep = async (step: FlowStep) => {
@@ -399,7 +412,7 @@ function FlowDetailView({ id, onBack, openMail }: { id: string; onBack: () => vo
           {flow.status === "live" ? (
             <div className="mb-4 flex gap-2 rounded-md bg-card px-3 py-2.5 text-xs text-muted-foreground shadow-edge">
               <Info size={14} className="mt-px shrink-0" />
-              <span>Changes apply now. People already waiting keep their send time. A new email is skipped until it has a subject and content.</span>
+              <span>Changes apply now, and people already waiting keep their send time. A new email starts as a draft, skipped until you set it live.</span>
             </div>
           ) : null}
 
@@ -436,7 +449,7 @@ function FlowDetailView({ id, onBack, openMail }: { id: string; onBack: () => vo
             </div>
           </Card>
 
-          <AddStep disabled={!editable} onAdd={(k) => addStep(null, k)} />
+          <AddStep disabled={!editable || adding} onAdd={(k) => addStep(null, k)} />
 
           {ordered.map((step) => (
             <div key={step.id}>
@@ -450,8 +463,9 @@ function FlowDetailView({ id, onBack, openMail }: { id: string; onBack: () => vo
                 onEditEmail={(mid) => openMail(mid)}
                 onEditDelay={(secs) => editDelay(step.id, secs)}
                 onRemove={() => setRemoving(step)}
+                onSetStatus={(st) => setStepStatus(step.id, st)}
               />
-              <AddStep disabled={!editable} onAdd={(k) => addStep(step.id, k)} />
+              <AddStep disabled={!editable || adding} onAdd={(k) => addStep(step.id, k)} />
             </div>
           ))}
 
@@ -528,11 +542,13 @@ function RemoveStepDialog({ step, waiting, title, onCancel, onConfirm }: {
 }
 
 function StepBlock({
-  step, stat, issues, mailTitle, sendsAt, editable, onEditEmail, onEditDelay, onRemove,
+  step, stat, issues, mailTitle, sendsAt, editable, onEditEmail, onEditDelay, onRemove, onSetStatus,
 }: {
   step: FlowStep; stat?: StepStat; issues: string[]; mailTitle: string; sendsAt?: number; editable: boolean;
   onEditEmail: (mailId: number) => void; onEditDelay: (seconds: number) => void; onRemove: () => void;
+  onSetStatus: (status: "draft" | "live") => void;
 }) {
+  const draft = step.kind === "email" && step.status === "draft";
   const menu = editable ? (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -541,6 +557,9 @@ function StepBlock({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
+        {step.kind === "email" && !draft ? (
+          <DropdownMenuItem onClick={() => onSetStatus("draft")}><Pencil size={15} /> Set to draft</DropdownMenuItem>
+        ) : null}
         <DropdownMenuItem onClick={onRemove} className="text-destructive focus:text-destructive"><Trash2 size={15} /> Remove</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -565,10 +584,13 @@ function StepBlock({
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <div className="min-w-0 flex-1 truncate text-sm font-medium">{mailTitle}</div>
+              {draft ? <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[0.7rem] font-medium text-muted-foreground">Draft</span> : null}
               {menu}
             </div>
 
-            {issues.length > 0 ? (
+            {draft ? (
+              <div className="mt-1 text-xs text-muted-foreground">Skipped until you set it live.</div>
+            ) : issues.length > 0 ? (
               <div className="mt-2 flex items-center gap-1.5 rounded-[0.5rem] bg-warning-tint px-2.5 py-1.5 text-xs text-warning">
                 <AlertTriangle size={13} /> {issues[0]}
               </div>
@@ -588,6 +610,11 @@ function StepBlock({
               <Button variant="outline" size="sm" className="h-7 text-xs" disabled={!cfg.mail_id} onClick={() => cfg.mail_id && onEditEmail(cfg.mail_id)}>
                 <Pencil size={13} /> Edit email
               </Button>
+              {draft && editable ? (
+                <Button size="sm" className="ml-2 h-7 text-xs" onClick={() => onSetStatus("live")}>
+                  <Play size={13} /> Set live
+                </Button>
+              ) : null}
             </div>
           </div>
         </div>

@@ -1,8 +1,11 @@
 // Building automations over HTTP: the library and blank starts, adding and
 // removing steps, the trigger's list, and an automation's emails staying out
 // of the issue workflow (never broadcast, never deleted from under a flow).
-import { beforeEach, describe, expect, it } from "vitest";
-import app from "./index";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// The queued-send callback is signed; accept every delivery here.
+vi.mock("@clawnify/queue", () => ({ enqueueJob: vi.fn(), verifyDelivery: vi.fn(async () => true) }));
+const { default: app } = await import("./index");
 import { BUILTIN_TEMPLATES } from "../shared/templates";
 
 declare const process: { getBuiltinModule(id: string): any };
@@ -57,6 +60,8 @@ describe("creating an automation", () => {
     expect(JSON.parse(flow.trigger_config).audience_id).toBe("aud_b");
     const titles = await Promise.all(steps.filter((s) => s.kind === "email").map(async (s) => (await (await call("GET", `/api/mails/${s.config.mail_id}`)).json()).title));
     expect(titles).toEqual(["Welcome aboard", "Getting the most out of this", "One more thing"]);
+    // Born blank: no sample article can go out under a real subject.
+    expect(flow.issues.filter((i: any) => i.message === "This email is empty. Add some content.")).toHaveLength(3);
   });
 
   it("blank is the trigger and End, and can't be turned on until it has an email", async () => {
@@ -82,6 +87,10 @@ describe("adding and removing steps", () => {
     expect(mail.title).toBe("");
     expect(mail.audience_id).toBe("aud_b");
     expect(flow.issues.find((i: any) => i.step_id === step.id)?.message).toBe("This email has no subject.");
+    // A body with nothing to take a subject from saves as "Untitled": still no subject.
+    await call("PUT", `/api/mails/${mail.id}`, { blocks: [{ id: "b1", type: "image", src: "https://example.com/a.png" }] });
+    const again = await getFlow(id);
+    expect(again.issues.find((i: any) => i.step_id === step.id)?.message).toBe("This email has no subject.");
   });
 
   it("adds a wait after a step, one day unless told otherwise, and refuses one out of range", async () => {
@@ -92,6 +101,10 @@ describe("adding and removing steps", () => {
     expect(chain(await getFlow(id))[1].id).toBe(wait.id);
     expect((await call("POST", `/api/flows/${id}/steps`, { after: first.id, kind: "delay", seconds: 5 })).status).toBe(400);
     expect((await call("POST", `/api/flows/${id}/steps`, { after: first.id, kind: "split" })).status).toBe(400);
+    // A stale client adding after a step that's gone: refused, and no stray email left behind.
+    const before = (await (await call("GET", "/api/mails")).json()).length;
+    expect((await call("POST", `/api/flows/${id}/steps`, { after: "step_gone", kind: "email" })).status).toBe(409);
+    expect((await (await call("GET", "/api/mails")).json()).length).toBe(before);
     expect((await call("PATCH", `/api/flows/${id}/steps/${wait.id}`, { config: { seconds: 400 * 86400 } })).status).toBe(400);
     expect((await call("PATCH", `/api/flows/${id}/steps/${first.id}`, { config: { seconds: 60 } })).status).toBe(400);
   });
@@ -104,6 +117,20 @@ describe("adding and removing steps", () => {
     expect((await call("GET", `/api/mails/${email.config.mail_id}`)).status).toBe(404);
     expect(chain(await getFlow(id)).map((s) => s.kind)).toEqual(["delay", "email", "delay", "email", "end"]);
     expect((await call("DELETE", `/api/flows/${id}/steps/${steps.at(-1)!.id}`)).status).toBe(400);
+  });
+});
+
+describe("an email's draft / live status", () => {
+  it("going live needs a ready email; a wait has no status", async () => {
+    const { id } = await (await call("POST", "/api/flows", { prebuilt: "blank" })).json();
+    const step = await (await call("POST", `/api/flows/${id}/steps`, { after: null, kind: "email" })).json();
+    const r = await call("PATCH", `/api/flows/${id}/steps/${step.id}`, { status: "live" });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error).toBe("This email has no subject.");
+    expect((await call("PATCH", `/api/flows/${id}/steps/${step.id}`, { status: "draft" })).status).toBe(200);
+    expect(chain(await getFlow(id))[0].config).toBeTruthy();
+    const wait = await (await call("POST", `/api/flows/${id}/steps`, { after: step.id, kind: "delay" })).json();
+    expect((await call("PATCH", `/api/flows/${id}/steps/${wait.id}`, { status: "live" })).status).toBe(400);
   });
 });
 
@@ -141,6 +168,15 @@ describe("an automation's emails are not issues", () => {
     const { mailId } = await flowMail();
     expect((await call("POST", `/api/mails/${mailId}/send`, {})).status).toBe(409);
     expect((await call("POST", `/api/mails/${mailId}/send`, { scheduled_at: new Date(Date.now() + 3600e3).toISOString() })).status).toBe(409);
+  });
+
+  it("a queued send booked before this rule is skipped with 200, so the queue doesn't retry it", async () => {
+    const { mailId } = await flowMail();
+    db.prepare(`UPDATE mails SET status = 'scheduled', scheduled_at = ? WHERE id = ?`).run("2026-01-01T00:00:00.000Z", mailId);
+    const r = await call("POST", "/api/jobs/send-mail", { mail_id: mailId, from: "a@example.com", scheduled_for: "2026-01-01T00:00:00.000Z" });
+    expect(r.status).toBe(200);
+    expect((await r.json()).skipped).toBe("automation-email");
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM deliveries`).get().n).toBe(0);
   });
 
   it("can't be deleted from the mail list while the step uses it", async () => {

@@ -85,11 +85,15 @@ export interface Flow {
   updated_at: string;
 }
 
+export type StepStatus = "draft" | "live";
+
 export interface FlowStep {
   id: string;
   flow_id: string;
   kind: StepKind;
   config: string;
+  /** Email steps: a draft is skipped, never sent. */
+  status: StepStatus;
   next_step_id: string | null;
   deleted_at: string | null;
   forward_to_step_id: string | null;
@@ -216,7 +220,7 @@ export async function getFlow(id: string): Promise<Flow | null> {
 
 export async function stepsOf(flowId: string): Promise<FlowStep[]> {
   return (await query(
-    `SELECT id, flow_id, kind, config, next_step_id, deleted_at, forward_to_step_id
+    `SELECT id, flow_id, kind, config, status, next_step_id, deleted_at, forward_to_step_id
        FROM flow_steps WHERE flow_id = ?`,
     [flowId],
   )) as unknown as FlowStep[];
@@ -321,16 +325,17 @@ export async function createFlow(spec: {
   return (await getFlow(id))!;
 }
 
-export async function addStep(flowId: string, kind: StepKind, config: object = {}): Promise<FlowStep> {
+export async function addStep(flowId: string, kind: StepKind, config: object = {}, status: StepStatus = "live"): Promise<FlowStep> {
   const id = uid("step");
-  await run(`INSERT INTO flow_steps (id, flow_id, kind, config) VALUES (?, ?, ?, ?)`, [
+  await run(`INSERT INTO flow_steps (id, flow_id, kind, config, status) VALUES (?, ?, ?, ?, ?)`, [
     id,
     flowId,
     kind,
     JSON.stringify(config),
+    status,
   ]);
   return (await get(
-    `SELECT id, flow_id, kind, config, next_step_id, deleted_at, forward_to_step_id FROM flow_steps WHERE id = ?`,
+    `SELECT id, flow_id, kind, config, status, next_step_id, deleted_at, forward_to_step_id FROM flow_steps WHERE id = ?`,
     [id],
   )) as FlowStep;
 }
@@ -341,6 +346,11 @@ export async function setNext(stepId: string, nextStepId: string | null): Promis
 
 export async function setEntry(flowId: string, stepId: string): Promise<void> {
   await run(`UPDATE flows SET entry_step_id = ?, updated_at = ? WHERE id = ?`, [stepId, now(), flowId]);
+}
+
+/** Set an email step to draft (skipped) or live (sent). The caller checks the email is ready first. */
+export async function setStepStatus(stepId: string, status: StepStatus): Promise<void> {
+  await run(`UPDATE flow_steps SET status = ?, updated_at = ? WHERE id = ? AND kind = 'email'`, [status, now(), stepId]);
 }
 
 /** Edit a step's config. For a delay this changes only later arrivals; waiters keep their frozen `due_at`. */
@@ -387,6 +397,16 @@ export async function deleteStep(flowId: string, stepId: string): Promise<void> 
  * already promised. Either way no wake is booked or bumped here, so this can't
  * strand anyone; a wake in progress that reads the row before this write just
  * carries on past the new step, which is the "already passed" case.
+ *
+ * An email added while the flow is live starts as a **draft**, which the engine
+ * skips: it is born blank, and being edited in place (autosaved as it's typed)
+ * it would otherwise go out half written to whoever reached it. The operator
+ * sets it live when it's done, as with Klaviyo's per-message status.
+ *
+ * The link is a compare-and-set read back with RETURNING (the storage binding
+ * reports no change counts): two inserts at the same point (a double click)
+ * would otherwise both point at the same next step, and the first new step
+ * would drop out of the chain. The loser's row is removed and it throws.
  */
 export async function insertStep(
   flowId: string,
@@ -407,10 +427,23 @@ export async function insertStep(
     next = resolveLiveStep(byId, after.next_step_id)?.id ?? null;
   }
 
-  const step = await addStep(flowId, kind, config);
+  const status: StepStatus = kind === "email" && flow.status === "live" ? "draft" : "live";
+  const step = await addStep(flowId, kind, config, status);
   await setNext(step.id, next);
-  if (afterStepId === null) await setEntry(flowId, step.id);
-  else await setNext(afterStepId, step.id);
+  const linked =
+    afterStepId === null
+      ? await get(
+          `UPDATE flows SET entry_step_id = ?, updated_at = ? WHERE id = ? AND entry_step_id IS ? RETURNING id`,
+          [step.id, now(), flowId, flow.entry_step_id],
+        )
+      : await get(
+          `UPDATE flow_steps SET next_step_id = ?, updated_at = ? WHERE id = ? AND next_step_id IS ? RETURNING id`,
+          [step.id, now(), afterStepId, byId.get(afterStepId)!.next_step_id],
+        );
+  if (!linked) {
+    await run(`DELETE FROM flow_steps WHERE id = ?`, [step.id]); // never linked, so nothing points at it
+    throw new Error("This automation changed while you were editing it. Try again.");
+  }
 
   if (kind === "email" && next) {
     const targets = [next, ...steps.filter((s) => s.deleted_at && resolveLiveStep(byId, s.id)?.id === next).map((s) => s.id)];
@@ -424,7 +457,7 @@ export async function insertStep(
     );
   }
   return (await get(
-    `SELECT id, flow_id, kind, config, next_step_id, deleted_at, forward_to_step_id FROM flow_steps WHERE id = ?`,
+    `SELECT id, flow_id, kind, config, status, next_step_id, deleted_at, forward_to_step_id FROM flow_steps WHERE id = ?`,
     [step.id],
   )) as FlowStep;
 }
@@ -471,12 +504,14 @@ export async function validateFlow(
   // strand waiters, so it's a turn-on error, never a silent exit.
   const seen = new Set<string>();
   let emails = 0;
+  let drafts = 0;
   const walk = async (startId: string | null) => {
     let s = resolveLiveStep(byId, startId);
     while (s && !seen.has(s.id)) {
       seen.add(s.id);
       if (s.kind === "end") return;
-      if (s.kind === "email") {
+      if (s.kind === "email" && s.status === "draft") drafts++;
+      if (s.kind === "email" && s.status !== "draft") {
         emails++;
         const cfg = parseConfig<EmailConfig>(s.config);
         const why = cfg?.mail_id ? await emailReady(cfg.mail_id) : "Email step has no newsletter attached.";
@@ -491,7 +526,9 @@ export async function validateFlow(
     }
   };
   if (entry) await walk(entry.id);
-  if (entry && emails === 0) issues.push({ message: "Add an email before turning this on." });
+  if (entry && emails === 0) {
+    issues.push({ message: drafts ? "Set an email live before turning this on." : "Add an email before turning this on." });
+  }
   return issues;
 }
 
@@ -695,7 +732,9 @@ export async function runWake(enrollmentId: string, wakeSeq: number, deps: FlowD
           return { acted: true, sent, state: "exited" };
         }
         const cfg = parseConfig<EmailConfig>(step.config);
-        if (cfg?.mail_id) {
+        if (step.status === "draft") {
+          await recordEvent(enr.id, step.id, "skipped", "Draft");
+        } else if (cfg?.mail_id) {
           // Prefer the contact's current name/email for the send; fall back to
           // the enrollment snapshot. Consent already confirmed above.
           const to: MergeSnapshot = { first_name: contact.first_name, last_name: contact.last_name, email: contact.email || merge.email };
@@ -852,6 +891,7 @@ export const FLOWS_DDL = [
     flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN ('email','delay','split','end')),
     config TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'live' CHECK (status IN ('draft','live')),
     next_step_id TEXT,
     deleted_at TEXT,
     forward_to_step_id TEXT,
@@ -875,6 +915,7 @@ export const FLOWS_DDL = [
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_enroll_active ON flow_enrollments(flow_id, contact_id) WHERE state = 'waiting'`,
   `CREATE INDEX IF NOT EXISTS idx_enroll_due ON flow_enrollments(state, due_at)`,
   `CREATE INDEX IF NOT EXISTS idx_enroll_step ON flow_enrollments(current_step_id, state)`,
+  `CREATE INDEX IF NOT EXISTS idx_enroll_flow ON flow_enrollments(flow_id, state)`,
   `CREATE TABLE IF NOT EXISTS flow_step_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     enrollment_id TEXT NOT NULL REFERENCES flow_enrollments(id) ON DELETE CASCADE,
@@ -884,4 +925,10 @@ export const FLOWS_DDL = [
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_step_sent_once ON flow_step_events(enrollment_id, step_id) WHERE outcome = 'sent'`,
+  `CREATE INDEX IF NOT EXISTS idx_step_events ON flow_step_events(enrollment_id, step_id)`,
+];
+
+/** Columns added after the tables first shipped; run through addColumns, after FLOWS_DDL. */
+export const FLOWS_COLUMNS = [
+  `ALTER TABLE flow_steps ADD COLUMN status TEXT NOT NULL DEFAULT 'live' CHECK (status IN ('draft','live'))`,
 ];

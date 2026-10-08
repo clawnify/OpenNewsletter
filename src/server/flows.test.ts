@@ -452,6 +452,8 @@ describe("building on a live flow (insertStep)", () => {
     const wakes = h.wakes.length;
     const m3 = await makeMail("Added later");
     const added = await flows.insertStep(flow.id, d.id, "email", { mail_id: m3 });
+    expect(added.status).toBe("draft"); // added to a live flow
+    await flows.setStepStatus(added.id, "live"); // the operator finishes it
 
     const after = await enr();
     expect(after.current_step_id).toBe(added.id);
@@ -494,9 +496,43 @@ describe("building on a live flow (insertStep)", () => {
     await flows.deleteStep(flow.id, e2.id); // e2 tombstoned, forwards to end
     const m4 = await makeMail("Fourth");
     const e4 = await flows.insertStep(flow.id, e3.id, "email", { mail_id: m4 }); // e3 -> e4 -> end
+    await flows.setStepStatus(e4.id, "live");
     expect((await enr()).current_step_id).toBe(e4.id);
     await h.fireLast();
     expect(h.sends.map((s) => s.mailId)).toEqual([m1, m4]);
+  });
+
+  it("an email added to a live flow is a draft until set live: reached meanwhile, it's skipped", async () => {
+    const { h, flow, d, m1, m2, enr } = await waitingAtDelay();
+    const added = await flows.insertStep(flow.id, d.id, "email", { mail_id: await makeMail("Half written") });
+    expect((await enr()).current_step_id).toBe(added.id);
+    await h.fireLast();
+    expect(h.sends.map((s) => s.mailId)).toEqual([m1, m2]);
+    const ev = (await get(`SELECT outcome, detail FROM flow_step_events WHERE step_id = ?`, [added.id])) as any;
+    expect(ev).toMatchObject({ outcome: "skipped", detail: "Draft" });
+  });
+
+  it("an email added to a draft flow is live (turning the flow on is the check)", async () => {
+    await run(`INSERT INTO audiences (id, name) VALUES ('aud1', 'A')`);
+    const { flow, d } = await welcomeFlow("aud1");
+    const added = await flows.insertStep(flow.id, d.id, "email", { mail_id: await makeMail("x") });
+    expect(added.status).toBe("live");
+  });
+
+  it("two inserts at the same point keep both in the chain or refuse the second", async () => {
+    await run(`INSERT INTO audiences (id, name) VALUES ('aud1', 'A')`);
+    const { flow, e1, d } = await welcomeFlow("aud1");
+    const results = await Promise.allSettled([
+      flows.insertStep(flow.id, e1.id, "delay", { seconds: 60 }),
+      flows.insertStep(flow.id, e1.id, "delay", { seconds: 120 }),
+    ]);
+    const live = (await flows.stepsOf(flow.id)).filter((s) => !s.deleted_at);
+    const byId = new Map(live.map((s) => [s.id, s]));
+    const chain: string[] = [];
+    for (let id: string | null = (await flows.getFlow(flow.id))!.entry_step_id; id; id = byId.get(id)?.next_step_id ?? null) chain.push(id);
+    expect(chain.length).toBe(live.length); // no orphaned step
+    expect(chain).toContain(d.id);
+    expect(results.some((r) => r.status === "fulfilled")).toBe(true);
   });
 
   it("an email added first becomes the entry", async () => {
@@ -541,5 +577,16 @@ describe("validation: an automation needs an email", () => {
     await flows.setEntry(flow.id, end.id);
     const issues = await flows.validateFlow(flow.id, async () => null);
     expect(issues.map((i) => i.message)).toContain("Add an email before turning this on.");
+  });
+
+  it("a flow whose only email is a draft says to set it live, and doesn't check the draft", async () => {
+    const flow = await flows.createFlow({ name: "D", trigger_type: "subscribed" });
+    const end = await flows.addStep(flow.id, "end");
+    await flows.setEntry(flow.id, end.id);
+    const e = await flows.addStep(flow.id, "email", { mail_id: 1 }, "draft");
+    await flows.setNext(e.id, end.id);
+    await flows.setEntry(flow.id, e.id);
+    const issues = await flows.validateFlow(flow.id, async () => "not ready");
+    expect(issues.map((i) => i.message)).toEqual(["Set an email live before turning this on."]);
   });
 });

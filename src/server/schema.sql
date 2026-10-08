@@ -212,6 +212,9 @@ CREATE TABLE IF NOT EXISTS flow_steps (
   -- delay: {seconds}        at_time / weekdays reserved for later; v1 is duration only
   -- split: {paths, else}    reserved; not yet instantiable
   config TEXT NOT NULL DEFAULT '{}',
+  -- email steps only: a draft is skipped (recorded, never sent). An email added
+  -- to a live automation starts as a draft, so nobody gets it half written.
+  status TEXT NOT NULL DEFAULT 'live' CHECK (status IN ('draft', 'live')),
   next_step_id TEXT,              -- email/delay point forward; end is terminal
   deleted_at TEXT,               -- tombstone
   forward_to_step_id TEXT,       -- where waiters go when this step was deleted
@@ -240,6 +243,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_enroll_active
   ON flow_enrollments(flow_id, contact_id) WHERE state = 'waiting';
 CREATE INDEX IF NOT EXISTS idx_enroll_due ON flow_enrollments(state, due_at);
 CREATE INDEX IF NOT EXISTS idx_enroll_step ON flow_enrollments(current_step_id, state);
+-- Per-flow counts and "has anyone entered" without scanning every journey.
+CREATE INDEX IF NOT EXISTS idx_enroll_flow ON flow_enrollments(flow_id, state);
 
 -- Append-only per-step outcomes: analytics, skip reasons, and send idempotency.
 CREATE TABLE IF NOT EXISTS flow_step_events (
@@ -253,6 +258,9 @@ CREATE TABLE IF NOT EXISTS flow_step_events (
 -- A step sends at most once per enrollment, whatever the queue redelivers.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_step_sent_once
   ON flow_step_events(enrollment_id, step_id) WHERE outcome = 'sent';
+-- Retry counts and "already attempted this step" lookups; the index above only
+-- covers 'sent', so without this each such lookup scans every event.
+CREATE INDEX IF NOT EXISTS idx_step_events ON flow_step_events(enrollment_id, step_id);
 
 CREATE INDEX IF NOT EXISTS idx_mails_status ON mails(status);
 CREATE INDEX IF NOT EXISTS idx_mails_updated ON mails(updated_at);

@@ -96,13 +96,14 @@ async function ensureSeed() {
     `ALTER TABLE deliveries ADD COLUMN last_name TEXT`,
   ]);
   for (const sql of flows.FLOWS_DDL) await run(sql);
+  const flowColumnsOk = await addColumns(flows.FLOWS_COLUMNS);
   for (const sql of [
     `CREATE TABLE IF NOT EXISTS signup_attempts (ip_hash TEXT NOT NULL, at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts ON signup_attempts(ip_hash, at)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at)`,
   ]) await run(sql);
   await contacts.dropDuplicateDefaultAudiences();
-  seeded = columnsOk && deliveryColumnsOk;
+  seeded = columnsOk && deliveryColumnsOk && flowColumnsOk;
 }
 
 app.use("*", async (c, next) => {
@@ -783,7 +784,10 @@ function flowDeps(c: any): flows.FlowDeps {
 
 /** What keeps a flow email's own content from sending, or null when it can. */
 function flowEmailContentIssue(row: { title: string; blocks: string }): string | null {
-  if (!row.title?.trim()) return "This email has no subject.";
+  // Every block save re-derives the subject from the body (deriveTitle), and
+  // "Untitled" is what it falls back to when nothing in the body can be one.
+  const subject = row.title?.trim();
+  if (!subject || subject === "Untitled") return "This email has no subject.";
   let blocks: Block[] = [];
   try { blocks = JSON.parse(row.blocks || "[]"); } catch { /* corrupt → empty */ }
   if (!blocks.length) return "This email is empty. Add some content.";
@@ -1463,6 +1467,15 @@ async function sendMailNow(
 
   if (row.status === "sent") return { status: 409, body: { error: "This issue has already been sent." } };
 
+  // An automation's email reached by a queued job (scheduled before automation
+  // emails were refused at the route): 200 so the queue doesn't retry it.
+  const flow = await flowOfMail(id);
+  if (flow) {
+    return scheduledFor !== undefined
+      ? { status: 200, body: { ok: true, skipped: "automation-email", sent: 0 } }
+      : { status: 409, body: { error: `This email is sent by the automation "${flow.name}", one person at a time.` } };
+  }
+
   const p = await provider(c);
   if (!p) return { status: 400, body: { error: "No sending backend is configured." } };
   if (!mail.audience_id) {
@@ -1695,10 +1708,24 @@ app.patch("/api/flows/:id", async (c) => {
   return c.json(await flows.getFlow(id));
 });
 
+// Edit one step: a wait's length, or an email's status (draft is skipped,
+// live sends; going live needs the email to be ready, as turning a flow on does).
 app.patch("/api/flows/:id/steps/:stepId", async (c) => {
-  const { config } = await c.req.json<{ config?: { seconds?: unknown } }>();
+  const { config, status } = await c.req.json<{ config?: { seconds?: unknown }; status?: string }>();
   const step = (await flows.stepsOf(c.req.param("id"))).find((s) => s.id === c.req.param("stepId") && !s.deleted_at);
   if (!step) return c.json({ error: "Not found" }, 404);
+  if (status !== undefined) {
+    if (step.kind !== "email") return c.json({ error: "Only an email can be a draft." }, 400);
+    if (status !== "draft" && status !== "live") return c.json({ error: "Status is draft or live." }, 400);
+    if (status === "live") {
+      let mailId: number | undefined;
+      try { mailId = (JSON.parse(step.config) as flows.EmailConfig).mail_id; } catch { /* none */ }
+      const why = mailId ? await flowEmailReady(await getSettings())(mailId) : "This step has no email.";
+      if (why) return c.json({ error: why }, 400);
+    }
+    await flows.setStepStatus(step.id, status);
+    return c.json({ ok: true });
+  }
   if (step.kind !== "delay") return c.json({ error: "Only a wait has settings here." }, 400);
   const seconds = delaySeconds(config?.seconds);
   if (seconds === null) return c.json({ error: "A wait is between 1 minute and 365 days." }, 400);
@@ -1714,12 +1741,13 @@ function delaySeconds(v: unknown): number | null {
   return Number.isFinite(n) && n >= 60 && n <= 365 * DAY ? n : null;
 }
 
-// Each email is its own mails row, copied from a template skeleton like any
-// newsletter, so editing it never touches a template or another flow.
+// Each email is its own mails row, so editing it never touches a template or
+// another flow. Born blank (the Mail view's "Blank" start): a template's
+// skeleton is a sample article, and an email whose body is sample text counts
+// as ready the moment it gets a subject.
 async function createFlowMail(title: string, audienceId: string): Promise<number> {
   const s = await getSettings();
-  const t = await get<any>("SELECT * FROM templates WHERE slug = ?", ["classic-editorial"]);
-  const m = mailFromSkeleton(t ? JSON.parse(t.skeleton) : {}, s.publication_name || "");
+  const m = mailFromSkeleton({}, s.publication_name || "");
   const row = await get<any>(
     `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
@@ -1779,6 +1807,7 @@ app.post("/api/flows/:id/steps", async (c) => {
   const b = await c.req.json<{ after?: string | null; kind?: string; seconds?: number }>().catch(() => ({}) as any);
   if (b.kind !== "email" && b.kind !== "delay") return c.json({ error: "A step is an email or a wait." }, 400);
   let config: object;
+  let mailId: number | null = null;
   if (b.kind === "delay") {
     const seconds = delaySeconds(b.seconds ?? DAY);
     if (seconds === null) return c.json({ error: "A wait is between 1 minute and 365 days." }, 400);
@@ -1786,13 +1815,17 @@ app.post("/api/flows/:id/steps", async (c) => {
   } else {
     const s = await getSettings();
     const audienceId = flowAudience(flow) || s.default_audience_id || (await contacts.defaultAudience()).id;
-    config = { mail_id: await createFlowMail("", audienceId) };
+    mailId = await createFlowMail("", audienceId);
+    config = { mail_id: mailId };
   }
   try {
     const step = await flows.insertStep(id, b.after ?? null, b.kind, config);
     return c.json(step, 201);
   } catch (e: any) {
-    return c.json({ error: e?.message || "Can't add a step there." }, 400);
+    // The email was made for a step that never joined the chain; left behind
+    // it would surface as a stray "Untitled" issue in the mail list.
+    if (mailId) await run("DELETE FROM mails WHERE id = ?", [mailId]);
+    return c.json({ error: e?.message || "Can't add a step there." }, 409);
   }
 });
 
