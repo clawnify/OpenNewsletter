@@ -8,6 +8,8 @@ import { statusTone } from "../lib/status";
 
 export function MailsView({ openMail }: { openMail: (id: number) => void }) {
   const { mails, templates, createMail, deleteMail, setError } = useStore();
+  // An automation's emails live on its canvas (Automations), not here.
+  const issues = mails.filter((m) => !m.flow);
   const [picking, setPicking] = useState(false);
 
   const start = async (slug?: string) => {
@@ -33,14 +35,14 @@ export function MailsView({ openMail }: { openMail: (id: number) => void }) {
       </header>
       <div className="mx-auto w-full max-w-4xl px-8 py-6">
 
-      {mails.length === 0 ? (
+      {issues.length === 0 ? (
         <div className="rounded-md border border-dashed border-border p-12 text-center">
           <p className="text-muted-foreground">No mail yet.</p>
           <Button className="mt-3" onClick={() => setPicking(true)}>Create your first newsletter</Button>
         </div>
       ) : (
         <ul className="divide-y divide-border overflow-hidden rounded-md bg-card shadow-edge">
-          {mails.map((i) => (
+          {issues.map((i) => (
             <MailRow key={i.id} mail={i} onOpen={() => openMail(i.id)} onDelete={() => deleteMail(i.id)} />
           ))}
         </ul>

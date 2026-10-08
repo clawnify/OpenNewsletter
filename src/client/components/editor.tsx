@@ -12,6 +12,7 @@ import { DesignPanel } from "./design-panel";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { SendDialog } from "./send-dialog";
+import { TestSendDialog } from "./test-send-dialog";
 import { Chat, type ChatContext, type ApplyTool } from "./chat";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -26,6 +27,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   const [selectedId, setSelected] = useState<string | null>(null);
   const [aiSelected, setAiSelected] = useState<Set<string>>(new Set());
   const [showSend, setShowSend] = useState(false);
+  const [showTest, setShowTest] = useState(false);
   const [saved, setSaved] = useState(true);
 
   // The assistant (and click-to-focus) target these blocks when set.
@@ -292,7 +294,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
       <header className="relative flex h-14 shrink-0 items-center gap-3 border-b border-border bg-background px-4">
         <Button variant="ghost" size="icon" onClick={onBack} aria-label="Back"><ArrowLeft size={18} /></Button>
         <div className="flex items-center gap-2 text-sm">
-          <Badge variant="secondary">Mail</Badge>
+          <Badge variant="secondary">{mail.flow ? "Automation email" : "Mail"}</Badge>
           <span className="max-w-[260px] truncate font-medium">{mail.title || "Untitled"}</span>
           <span className="text-xs text-muted-foreground">{saved ? "Saved" : "Saving…"}</span>
           {mail.status === "scheduled" ? <Badge className={`capitalize ${statusTone(mail.status)}`}>{mail.status}</Badge> : sent ? <DeliveryStats mail={mail} /> : null}
@@ -308,7 +310,11 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
             onChange={(v) => setDevice(v as "desktop" | "mobile")}
           />
           <Button variant="outline" size="sm" onClick={saveAsTemplate}><Save size={15} /> Save as…</Button>
-          <Button size="sm" onClick={() => setShowSend(true)}><Send size={15} /> Send</Button>
+          {mail.flow ? (
+            <Button size="sm" variant="outline" onClick={() => setShowTest(true)} title={`Sent by "${mail.flow.name}" to each new subscriber`}><Send size={15} /> Send test</Button>
+          ) : (
+            <Button size="sm" onClick={() => setShowSend(true)}><Send size={15} /> Send</Button>
+          )}
         </div>
 
         {/* Edit / Preview — centered in the nav, independent of the side groups */}
@@ -398,6 +404,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
           </DialogContent>
         </Dialog>
       )}
+      {showTest ? <TestSendDialog mail={mail} onClose={() => setShowTest(false)} /> : null}
       {showSend ? <SendDialog mail={mail} onClose={() => setShowSend(false)} onSent={(i) => { setMail(i); setShowSend(false); store.refreshMails(); }} /> : null}
     </div>
   );
