@@ -146,13 +146,20 @@ export interface FlowDeps {
    * throw (propagates out of runWake, the HTTP handler answers non-2xx, and the
    * at-least-once queue redelivers the job). Both are safe: the stable key keeps
    * a recovered attempt from double-sending.
+   *
+   * `{ ok: false, skip: true }` means the email itself isn't ready (no subject,
+   * no content): retrying can't fix that, so the step is recorded `skipped`
+   * with the reason and the contact moves on. This is what makes adding an
+   * email to a live automation safe: the new email is born empty, and people
+   * reaching it pass it until it's written (Klaviyo skips a draft message the
+   * same way).
    */
   send: (input: {
     mailId: number;
     contactId: string;
     contact: MergeSnapshot;
     idempotencyKey: string;
-  }) => Promise<{ ok: true; id: string } | { ok: false; error: string }>;
+  }) => Promise<{ ok: true; id: string } | { ok: false; error: string; skip?: boolean }>;
 }
 
 // ── Pure helpers (no DB) ────────────────────────────────────────────────────
@@ -268,6 +275,23 @@ export async function stepStats(flowId: string): Promise<Record<string, StepStat
   return out;
 }
 
+/** Whether anyone has ever entered this flow (the trigger's list is fixed from then on). */
+export async function hasEnrollments(flowId: string): Promise<boolean> {
+  return !!(await get(`SELECT 1 AS x FROM flow_enrollments WHERE flow_id = ? LIMIT 1`, [flowId]));
+}
+
+/** Point a `subscribed` flow at another list, keeping its other trigger settings. */
+export async function setTriggerAudience(flowId: string, audienceId: string): Promise<void> {
+  const flow = await getFlow(flowId);
+  if (!flow) return;
+  const trig = parseConfig<SubscribedTrigger>(flow.trigger_config) ?? {};
+  await run(`UPDATE flows SET trigger_config = ?, updated_at = ? WHERE id = ?`, [
+    JSON.stringify({ ...trig, audience_id: audienceId }),
+    now(),
+    flowId,
+  ]);
+}
+
 export async function renameFlow(flowId: string, name: string): Promise<void> {
   await run(`UPDATE flows SET name = ?, updated_at = ? WHERE id = ?`, [name, now(), flowId]);
 }
@@ -347,6 +371,76 @@ export async function deleteStep(flowId: string, stepId: string): Promise<void> 
   await run(`UPDATE flows SET entry_step_id = ? WHERE id = ? AND entry_step_id = ?`, [forward, flowId, stepId]);
 }
 
+/**
+ * Insert an email or a wait into the chain, after `afterStepId` (null = first,
+ * right after the trigger). Allowed on a live flow; the rule for people
+ * already in it is Klaviyo's (teardown §5): **nobody's send time moves, and a
+ * new email ahead of someone is one they get.**
+ *
+ * Because a delay is consumed on arrival, a waiter points at the step *after*
+ * its wait (`Q` below). An email inserted right before `Q` is ahead of them,
+ * so they are moved onto it, keeping `due_at` and `wake_seq`: their existing
+ * wake fires at the same moment and runs the new email, then `Q`. Waiters
+ * pointing at a deleted step that forwards to `Q` are the same people. Anyone
+ * who already attempted `Q` (a send retry parks on `Q` itself) has passed this
+ * point and stays put. A new *wait* moves nobody: it would push back a time
+ * already promised. Either way no wake is booked or bumped here, so this can't
+ * strand anyone; a wake in progress that reads the row before this write just
+ * carries on past the new step, which is the "already passed" case.
+ */
+export async function insertStep(
+  flowId: string,
+  afterStepId: string | null,
+  kind: "email" | "delay",
+  config: object,
+): Promise<FlowStep> {
+  const flow = await getFlow(flowId);
+  if (!flow) throw new Error("Flow not found.");
+  const steps = await stepsOf(flowId);
+  const byId = new Map(steps.map((s) => [s.id, s]));
+  let next: string | null;
+  if (afterStepId === null) {
+    next = resolveLiveStep(byId, flow.entry_step_id)?.id ?? null;
+  } else {
+    const after = byId.get(afterStepId);
+    if (!after || after.deleted_at || after.kind === "end") throw new Error("Can't add a step there.");
+    next = resolveLiveStep(byId, after.next_step_id)?.id ?? null;
+  }
+
+  const step = await addStep(flowId, kind, config);
+  await setNext(step.id, next);
+  if (afterStepId === null) await setEntry(flowId, step.id);
+  else await setNext(afterStepId, step.id);
+
+  if (kind === "email" && next) {
+    const targets = [next, ...steps.filter((s) => s.deleted_at && resolveLiveStep(byId, s.id)?.id === next).map((s) => s.id)];
+    await run(
+      `UPDATE flow_enrollments SET current_step_id = ?, updated_at = ?
+         WHERE flow_id = ? AND state = 'waiting'
+           AND current_step_id IN (SELECT value FROM json_each(?))
+           AND NOT EXISTS (SELECT 1 FROM flow_step_events ev
+                            WHERE ev.enrollment_id = flow_enrollments.id AND ev.step_id = ?)`,
+      [step.id, now(), flowId, JSON.stringify(targets), next],
+    );
+  }
+  return (await get(
+    `SELECT id, flow_id, kind, config, next_step_id, deleted_at, forward_to_step_id FROM flow_steps WHERE id = ?`,
+    [step.id],
+  )) as FlowStep;
+}
+
+/** Live email steps and the flow each belongs to, keyed by mail id. */
+export async function flowEmails(): Promise<Map<number, { id: string; name: string }>> {
+  const rows = (await query(
+    `SELECT json_extract(s.config, '$.mail_id') AS mail_id, f.id AS id, f.name AS name
+       FROM flow_steps s JOIN flows f ON f.id = s.flow_id
+      WHERE s.kind = 'email' AND s.deleted_at IS NULL`,
+  )) as unknown as { mail_id: number | null; id: string; name: string }[];
+  const out = new Map<number, { id: string; name: string }>();
+  for (const r of rows) if (r.mail_id != null) out.set(Number(r.mail_id), { id: r.id, name: r.name });
+  return out;
+}
+
 // ── Validation (what "turn on" refuses) ─────────────────────────────────────
 
 export interface FlowIssue {
@@ -376,12 +470,14 @@ export async function validateFlow(
   // must reach an End — a delay (or email) with nothing live after it would
   // strand waiters, so it's a turn-on error, never a silent exit.
   const seen = new Set<string>();
+  let emails = 0;
   const walk = async (startId: string | null) => {
     let s = resolveLiveStep(byId, startId);
     while (s && !seen.has(s.id)) {
       seen.add(s.id);
       if (s.kind === "end") return;
       if (s.kind === "email") {
+        emails++;
         const cfg = parseConfig<EmailConfig>(s.config);
         const why = cfg?.mail_id ? await emailReady(cfg.mail_id) : "Email step has no newsletter attached.";
         if (why) issues.push({ step_id: s.id, message: why });
@@ -395,6 +491,7 @@ export async function validateFlow(
     }
   };
   if (entry) await walk(entry.id);
+  if (entry && emails === 0) issues.push({ message: "Add an email before turning this on." });
   return issues;
 }
 
@@ -605,7 +702,9 @@ export async function runWake(enrollmentId: string, wakeSeq: number, deps: FlowD
           // One stable key across every attempt at this step, so a retry after
           // a lost response dedupes at the provider instead of mailing twice.
           const res = await deps.send({ mailId: cfg.mail_id, contactId: enr.contact_id, contact: to, idempotencyKey: `flow-${enr.id}-${step.id}` });
-          if (!res.ok) {
+          if (!res.ok && res.skip) {
+            await recordEvent(enr.id, step.id, "skipped", res.error.slice(0, 300));
+          } else if (!res.ok) {
             // A send that failed is not skipped forward (that silently loses an
             // email on a transient blip): re-park on THIS step and retry with
             // backoff, up to a cap, then give up and record 'failed'. The same

@@ -432,3 +432,114 @@ describe("validation (turn-on refusals)", () => {
     expect(msgs.some((m) => m.includes("nothing after it"))).toBe(true);
   });
 });
+
+describe("building on a live flow (insertStep)", () => {
+  async function waitingAtDelay() {
+    const h = new Harness();
+    await run(`INSERT INTO audiences (id, name) VALUES ('aud1', 'A')`);
+    const w = await welcomeFlow("aud1");
+    await flows.setFlowStatus(w.flow.id, "live", h.deps());
+    const con = await makeContact("aud1", "pat@example.com");
+    await flows.enrollOnSubscribed({ id: con, audience_id: "aud1", email: "pat@example.com", consent_source: "signup_form" }, h.deps());
+    await h.fireLast(); // email 1 sent, parked on e2 with due = +3d
+    const enr = () => get(`SELECT id, current_step_id, due_at, wake_seq FROM flow_enrollments WHERE flow_id = ?`, [w.flow.id]) as Promise<any>;
+    return { h, ...w, enr };
+  }
+
+  it("an email added ahead of a waiter is one they get, at their original time, then the next", async () => {
+    const { h, flow, d, m1, m2, enr } = await waitingAtDelay();
+    const before = await enr();
+    const wakes = h.wakes.length;
+    const m3 = await makeMail("Added later");
+    const added = await flows.insertStep(flow.id, d.id, "email", { mail_id: m3 });
+
+    const after = await enr();
+    expect(after.current_step_id).toBe(added.id);
+    expect(after.due_at).toBe(before.due_at); // nobody's time moves
+    expect(after.wake_seq).toBe(before.wake_seq); // their booked wake still matches
+    expect(h.wakes.length).toBe(wakes); // nothing booked by the edit
+
+    const r = await h.fireLast();
+    expect(r).toMatchObject({ acted: true, state: "completed" });
+    expect(h.sends.map((s) => s.mailId)).toEqual([m1, m3, m2]);
+  });
+
+  it("an added wait moves nobody: the waiter keeps the time already promised", async () => {
+    const { h, flow, d, e2, m2, enr } = await waitingAtDelay();
+    const before = await enr();
+    await flows.insertStep(flow.id, d.id, "delay", { seconds: 10 * 86400 });
+    const after = await enr();
+    expect(after.current_step_id).toBe(e2.id);
+    expect(after.due_at).toBe(before.due_at);
+    const r = await h.fireLast();
+    expect(r).toMatchObject({ acted: true, state: "completed" });
+    expect(h.sends.at(-1)?.mailId).toBe(m2);
+  });
+
+  it("someone already retrying the next email has passed the insert point and stays put", async () => {
+    const { flow, d, e2, enr } = await waitingAtDelay();
+    const e = await enr();
+    await run(`INSERT INTO flow_step_events (enrollment_id, step_id, outcome, detail) VALUES (?, ?, 'retry', 'transient')`, [e.id, e2.id]);
+    await flows.insertStep(flow.id, d.id, "email", { mail_id: await makeMail("Added") });
+    expect((await enr()).current_step_id).toBe(e2.id);
+  });
+
+  it("a waiter parked on a deleted step that forwards to the next email also gets the new one", async () => {
+    const { h, flow, d, e2, m1, enr } = await waitingAtDelay();
+    // Waiter is parked on e2; delete it, so they point at a tombstone forwarding to end.
+    // Add a third email after the delay: the tombstone now forwards through it.
+    const m3 = await makeMail("Third");
+    const e3 = await flows.insertStep(flow.id, d.id, "email", { mail_id: m3 }); // d -> e3 -> e2
+    await run(`UPDATE flow_enrollments SET current_step_id = ? WHERE flow_id = ?`, [e2.id, flow.id]); // as if parked before e3 existed
+    await flows.deleteStep(flow.id, e2.id); // e2 tombstoned, forwards to end
+    const m4 = await makeMail("Fourth");
+    const e4 = await flows.insertStep(flow.id, e3.id, "email", { mail_id: m4 }); // e3 -> e4 -> end
+    expect((await enr()).current_step_id).toBe(e4.id);
+    await h.fireLast();
+    expect(h.sends.map((s) => s.mailId)).toEqual([m1, m4]);
+  });
+
+  it("an email added first becomes the entry", async () => {
+    await run(`INSERT INTO audiences (id, name) VALUES ('aud1', 'A')`);
+    const { flow, e1 } = await welcomeFlow("aud1");
+    const first = await flows.insertStep(flow.id, null, "email", { mail_id: await makeMail("Zero") });
+    expect((await flows.getFlow(flow.id))?.entry_step_id).toBe(first.id);
+    expect(first.next_step_id).toBe(e1.id);
+  });
+
+  it("refuses to add after the End", async () => {
+    await run(`INSERT INTO audiences (id, name) VALUES ('aud1', 'A')`);
+    const { flow, end } = await welcomeFlow("aud1");
+    await expect(flows.insertStep(flow.id, end.id, "delay", { seconds: 60 })).rejects.toThrow();
+  });
+});
+
+describe("an unready email is skipped, never sent blank", () => {
+  it("records skipped with the reason and carries on", async () => {
+    const h = new Harness();
+    await run(`INSERT INTO audiences (id, name) VALUES ('aud1', 'A')`);
+    const { flow, d, e1, m2 } = await welcomeFlow("aud1");
+    await flows.deleteStep(flow.id, d.id);
+    await flows.setFlowStatus(flow.id, "live", h.deps());
+    const deps = h.deps();
+    const send = deps.send;
+    deps.send = async (input) => (input.mailId === m2 ? send(input) : { ok: false, skip: true, error: "Not ready: no subject" });
+    const con = await makeContact("aud1", "pat@example.com");
+    await flows.enrollOnSubscribed({ id: con, audience_id: "aud1", email: "pat@example.com", consent_source: "signup_form" }, deps);
+    const w = h.wakes[0];
+    expect(await flows.runWake(w.enrollmentId, w.wakeSeq, deps)).toMatchObject({ acted: true, state: "completed" });
+    expect(h.sends.map((s) => s.mailId)).toEqual([m2]);
+    const ev = (await get(`SELECT outcome, detail FROM flow_step_events WHERE step_id = ?`, [e1.id])) as any;
+    expect(ev).toMatchObject({ outcome: "skipped", detail: "Not ready: no subject" });
+  });
+});
+
+describe("validation: an automation needs an email", () => {
+  it("a trigger straight to End can't be turned on", async () => {
+    const flow = await flows.createFlow({ name: "Blank", trigger_type: "subscribed" });
+    const end = await flows.addStep(flow.id, "end");
+    await flows.setEntry(flow.id, end.id);
+    const issues = await flows.validateFlow(flow.id, async () => null);
+    expect(issues.map((i) => i.message)).toContain("Add an email before turning this on.");
+  });
+});

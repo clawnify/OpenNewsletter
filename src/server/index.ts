@@ -414,16 +414,27 @@ app.delete("/api/templates/:slug", async (c) => {
 
 // ── mails ───────────────────────────────────────────────────────────
 
+// A mail that an automation step sends is that automation's email, not an
+// issue: it carries `flow` so the client keeps it out of the issue list and
+// off the Send button, and the send and delete routes refuse it. The step's
+// config is the only record of the link; nothing is copied onto the mail.
 app.get("/api/mails", async (c) => {
   const rows = await query<any>("SELECT * FROM mails ORDER BY updated_at DESC");
-  return c.json(rows.map(parseMail));
+  const owned = await flows.flowEmails();
+  return c.json(rows.map((r) => ({ ...parseMail(r), flow: owned.get(Number(r.id)) ?? null })));
 });
 
 app.get("/api/mails/:id", async (c) => {
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [Number(c.req.param("id"))]);
   if (!row) return c.json({ error: "Not found" }, 404);
-  return c.json(parseMail(row));
+  const owned = await flows.flowEmails();
+  return c.json({ ...parseMail(row), flow: owned.get(Number(row.id)) ?? null });
 });
+
+/** The automation that sends this mail, if any. */
+async function flowOfMail(id: number): Promise<{ id: string; name: string } | null> {
+  return (await flows.flowEmails()).get(id) ?? null;
+}
 
 app.post("/api/mails", async (c) => {
   const b = await c.req.json<{ template_slug?: string }>().catch(() => ({}) as any);
@@ -498,13 +509,15 @@ app.put("/api/mails/:id", async (c) => {
     ],
   );
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
-  return c.json(parseMail(row));
+  return c.json({ ...parseMail(row), flow: await flowOfMail(id) });
 });
 
 app.delete("/api/mails/:id", async (c) => {
   const id = Number(c.req.param("id"));
   const row = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
   if (row?.status === "sending") return c.json({ error: "This issue is still sending." }, 409);
+  const flow = await flowOfMail(id);
+  if (flow) return c.json({ error: `This email belongs to the automation "${flow.name}". Remove it there.` }, 409);
   await run("DELETE FROM deliveries WHERE mail_id = ?", [id]);
   await run("DELETE FROM mails WHERE id = ?", [id]);
   return c.json({ ok: true });
@@ -733,6 +746,10 @@ function flowDeps(c: any): flows.FlowDeps {
       if (!p) return { ok: false, error: "No email provider connected." };
       const row = await get<any>("SELECT * FROM mails WHERE id = ?", [mailId]);
       if (!row) return { ok: false, error: "Flow email no longer exists." };
+      // Checked at send, not only at turn-on: an email added to a live flow
+      // starts empty, and an emptied one must not go out blank.
+      const unready = flowEmailContentIssue(row);
+      if (unready) return { ok: false, skip: true, error: `Not ready: ${unready}` };
       const s = await getSettings();
       const from = fromAddress(s);
       if (!from) return { ok: false, error: "No sender configured." };
@@ -764,15 +781,22 @@ function flowDeps(c: any): flows.FlowDeps {
   };
 }
 
+/** What keeps a flow email's own content from sending, or null when it can. */
+function flowEmailContentIssue(row: { title: string; blocks: string }): string | null {
+  if (!row.title?.trim()) return "This email has no subject.";
+  let blocks: Block[] = [];
+  try { blocks = JSON.parse(row.blocks || "[]"); } catch { /* corrupt → empty */ }
+  if (!blocks.length) return "This email is empty. Add some content.";
+  return null;
+}
+
 /** A mail is sendable in a flow when it has a subject, some body, and a sender. */
 function flowEmailReady(s: Settings): (mailId: number) => Promise<string | null> {
   return async (mailId: number) => {
     const row = await get<{ title: string; blocks: string }>("SELECT title, blocks FROM mails WHERE id = ?", [mailId]);
-    if (!row) return "This newsletter no longer exists.";
-    if (!row.title?.trim()) return "This newsletter has no subject.";
-    let blocks: Block[] = [];
-    try { blocks = JSON.parse(row.blocks || "[]"); } catch { /* corrupt → empty */ }
-    if (!blocks.length) return "This newsletter is empty — add some content before turning the automation on.";
+    if (!row) return "This email no longer exists.";
+    const why = flowEmailContentIssue(row);
+    if (why) return why;
     if (!fromAddress(s)) return "Set a sender (from name and email) in Settings before turning this on.";
     return null;
   };
@@ -1525,6 +1549,13 @@ app.post("/api/mails/:id/send", async (c) => {
     .json<{ scheduled_at?: string; from?: string }>()
     .catch(() => ({}) as { scheduled_at?: string; from?: string });
 
+  // An automation's email goes to each person when they reach its step. Sent
+  // as an issue it would greet the whole list with "Welcome aboard".
+  const flow = await flowOfMail(id);
+  if (flow) {
+    return c.json({ error: `This email is sent by the automation "${flow.name}", one person at a time. Send yourself a test instead.` }, 409);
+  }
+
   if (scheduled_at) {
     const when = new Date(scheduled_at);
     if (Number.isNaN(when.getTime())) {
@@ -1641,69 +1672,144 @@ app.get("/api/flows/:id", async (c) => {
   const steps = (await flows.stepsOf(flow.id)).filter((s) => !s.deleted_at);
   const stats = await flows.stepStats(flow.id);
   const issues = await flows.validateFlow(flow.id, flowEmailReady(await getSettings()));
-  return c.json({ ...flow, steps, stats, issues });
+  const entered = await flows.hasEnrollments(flow.id);
+  return c.json({ ...flow, steps, stats, issues, entered });
 });
 
-// Rename a flow, or edit one step's config (a delay's duration). Structural edits
-// (add / delete / reorder steps) are a later increment; the engine supports them.
+// Rename a flow, or point its trigger at another list. The list can change
+// only until the first person enters: after that, "who is in this" would mix
+// two lists' subscribers under one name (Klaviyo locks the trigger the same way).
 app.patch("/api/flows/:id", async (c) => {
-  const { name } = await c.req.json<{ name?: string }>();
-  if (name?.trim()) await flows.renameFlow(c.req.param("id"), name.trim());
-  return c.json(await flows.getFlow(c.req.param("id")));
+  const id = c.req.param("id");
+  const flow = await flows.getFlow(id);
+  if (!flow) return c.json({ error: "Not found" }, 404);
+  const { name, audience_id } = await c.req.json<{ name?: string; audience_id?: string }>();
+  if (audience_id !== undefined) {
+    if (await flows.hasEnrollments(id)) {
+      return c.json({ error: "People have already entered this automation, so its list can't change. Create a new one for another list." }, 409);
+    }
+    if (!(await get("SELECT 1 AS x FROM audiences WHERE id = ?", [audience_id]))) return c.json({ error: "That list doesn't exist." }, 400);
+    await flows.setTriggerAudience(id, audience_id);
+  }
+  if (name?.trim()) await flows.renameFlow(id, name.trim());
+  return c.json(await flows.getFlow(id));
 });
 
 app.patch("/api/flows/:id/steps/:stepId", async (c) => {
-  const { config } = await c.req.json<{ config?: object }>();
-  if (config) await flows.editStepConfig(c.req.param("stepId"), config);
+  const { config } = await c.req.json<{ config?: { seconds?: unknown } }>();
+  const step = (await flows.stepsOf(c.req.param("id"))).find((s) => s.id === c.req.param("stepId") && !s.deleted_at);
+  if (!step) return c.json({ error: "Not found" }, 404);
+  if (step.kind !== "delay") return c.json({ error: "Only a wait has settings here." }, 400);
+  const seconds = delaySeconds(config?.seconds);
+  if (seconds === null) return c.json({ error: "A wait is between 1 minute and 365 days." }, 400);
+  await flows.editStepConfig(step.id, { seconds });
   return c.json({ ok: true });
 });
 
-// Create an automation from a prebuilt. v1 ships one: the welcome series
-// (email now, +3 days, +4 days), the most-asked-for flow in the user research.
-// Lands in `draft` with three editable newsletters; the operator fills them in
-// and turns it on. Other prebuilts (winback, anniversary) are a later change.
+const DAY = 86400;
+
+/** A wait's length in whole seconds, or null when it's out of range. */
+function delaySeconds(v: unknown): number | null {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && n >= 60 && n <= 365 * DAY ? n : null;
+}
+
+// Each email is its own mails row, copied from a template skeleton like any
+// newsletter, so editing it never touches a template or another flow.
+async function createFlowMail(title: string, audienceId: string): Promise<number> {
+  const s = await getSettings();
+  const t = await get<any>("SELECT * FROM templates WHERE slug = ?", ["classic-editorial"]);
+  const m = mailFromSkeleton(t ? JSON.parse(t.skeleton) : {}, s.publication_name || "");
+  const row = await get<any>(
+    `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+    [m.eyebrow, title, m.subtitle, m.byline_name, m.byline_date, m.feature_image, JSON.stringify(m.blocks), "classic-editorial", audienceId],
+  );
+  return row.id as number;
+}
+
+/** The list a `subscribed` flow listens to (the mail's audience for its emails). */
+function flowAudience(flow: flows.Flow): string | null {
+  try { return (JSON.parse(flow.trigger_config) as flows.SubscribedTrigger).audience_id ?? null; } catch { return null; }
+}
+
+// Create an automation, from the library (the welcome series: email now,
+// +3 days, +4 days, the most-asked-for flow in the user research) or blank
+// (trigger and End; steps are added on the canvas). Lands in `draft`.
 app.post("/api/flows", async (c) => {
   const b = await c.req.json<{ prebuilt?: string; name?: string; audience_id?: string }>().catch(() => ({}) as any);
-  if (b.prebuilt && b.prebuilt !== "welcome") return c.json({ error: `Unknown prebuilt "${b.prebuilt}"` }, 400);
+  const prebuilt = b.prebuilt || "welcome";
+  if (prebuilt !== "welcome" && prebuilt !== "blank") return c.json({ error: `Unknown prebuilt "${prebuilt}"` }, 400);
   const s = await getSettings();
+  if (b.audience_id && !(await get("SELECT 1 AS x FROM audiences WHERE id = ?", [b.audience_id]))) {
+    return c.json({ error: "That list doesn't exist." }, 400);
+  }
   const audienceId = b.audience_id || s.default_audience_id || (await contacts.defaultAudience()).id;
 
   const flow = await flows.createFlow({
-    name: b.name || "Welcome series",
+    name: b.name?.trim() || (prebuilt === "blank" ? "New automation" : "Welcome series"),
     trigger_type: "subscribed",
     trigger_config: { audience_id: audienceId },
     reentry: "none",
   });
 
-  // Each email is its own mails row, copied from a template skeleton like any
-  // newsletter, so editing it never touches a template or another flow.
-  const t = await get<any>("SELECT * FROM templates WHERE slug = ?", ["classic-editorial"]);
-  const skeleton = t ? JSON.parse(t.skeleton) : {};
-  const makeMail = async (title: string): Promise<number> => {
-    const m = mailFromSkeleton(skeleton, s.publication_name || "");
-    const row = await get<any>(
-      `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-      [m.eyebrow, title, m.subtitle, m.byline_name, m.byline_date, m.feature_image, JSON.stringify(m.blocks), "classic-editorial", audienceId],
-    );
-    return row.id as number;
-  };
-
-  const DAY = 86400;
-  const e1 = await flows.addStep(flow.id, "email", { mail_id: await makeMail("Welcome aboard") });
-  const d1 = await flows.addStep(flow.id, "delay", { seconds: 3 * DAY });
-  const e2 = await flows.addStep(flow.id, "email", { mail_id: await makeMail("Getting the most out of this") });
-  const d2 = await flows.addStep(flow.id, "delay", { seconds: 4 * DAY });
-  const e3 = await flows.addStep(flow.id, "email", { mail_id: await makeMail("One more thing") });
   const end = await flows.addStep(flow.id, "end");
-  await flows.setNext(e1.id, d1.id);
-  await flows.setNext(d1.id, e2.id);
-  await flows.setNext(e2.id, d2.id);
-  await flows.setNext(d2.id, e3.id);
-  await flows.setNext(e3.id, end.id);
-  await flows.setEntry(flow.id, e1.id);
-
+  await flows.setEntry(flow.id, end.id);
+  if (prebuilt === "welcome") {
+    // Built back to front, each step inserted at the start, so the one insert
+    // path is the only way a chain is ever assembled.
+    const series: [string, number][] = [["Welcome aboard", 0], ["Getting the most out of this", 3 * DAY], ["One more thing", 4 * DAY]];
+    for (let i = series.length - 1; i >= 0; i--) {
+      await flows.insertStep(flow.id, null, "email", { mail_id: await createFlowMail(series[i][0], audienceId) });
+      if (series[i][1]) await flows.insertStep(flow.id, null, "delay", { seconds: series[i][1] });
+    }
+  }
   return c.json(await flows.getFlow(flow.id), 201);
+});
+
+// Add an email or a wait after a step (`after: null` puts it first). Works on
+// a live automation: see flows.insertStep for who gets the new step. A new
+// email starts without a subject, and the engine skips an unready email, so
+// nobody is sent a blank one while it's being written.
+app.post("/api/flows/:id/steps", async (c) => {
+  const id = c.req.param("id");
+  const flow = await flows.getFlow(id);
+  if (!flow) return c.json({ error: "Not found" }, 404);
+  if (flow.status === "archived") return c.json({ error: "Restore this automation before changing it." }, 409);
+  const b = await c.req.json<{ after?: string | null; kind?: string; seconds?: number }>().catch(() => ({}) as any);
+  if (b.kind !== "email" && b.kind !== "delay") return c.json({ error: "A step is an email or a wait." }, 400);
+  let config: object;
+  if (b.kind === "delay") {
+    const seconds = delaySeconds(b.seconds ?? DAY);
+    if (seconds === null) return c.json({ error: "A wait is between 1 minute and 365 days." }, 400);
+    config = { seconds };
+  } else {
+    const s = await getSettings();
+    const audienceId = flowAudience(flow) || s.default_audience_id || (await contacts.defaultAudience()).id;
+    config = { mail_id: await createFlowMail("", audienceId) };
+  }
+  try {
+    const step = await flows.insertStep(id, b.after ?? null, b.kind, config);
+    return c.json(step, 201);
+  } catch (e: any) {
+    return c.json({ error: e?.message || "Can't add a step there." }, 400);
+  }
+});
+
+// Remove a step. People waiting at it move to the next one (flows.deleteStep);
+// an email step takes its email with it, since nothing else can send it.
+app.delete("/api/flows/:id/steps/:stepId", async (c) => {
+  const id = c.req.param("id");
+  const step = (await flows.stepsOf(id)).find((s) => s.id === c.req.param("stepId") && !s.deleted_at);
+  if (!step) return c.json({ error: "Not found" }, 404);
+  if (step.kind === "end") return c.json({ error: "Every automation ends with End." }, 400);
+  await flows.deleteStep(id, step.id);
+  if (step.kind === "email") {
+    let mailId: number | undefined;
+    try { mailId = (JSON.parse(step.config) as flows.EmailConfig).mail_id; } catch { /* no mail */ }
+    if (mailId) await run("DELETE FROM mails WHERE id = ?", [mailId]);
+  }
+  return c.json({ ok: true });
 });
 
 // Turn an automation on / pause / resume / archive. Turning it live runs the
