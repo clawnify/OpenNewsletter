@@ -1,15 +1,19 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { CheckCircle2, AlertTriangle, XCircle, HelpCircle, Copy } from "lucide-react";
 import { api } from "../api";
 import { useStore } from "../store";
-import type { Mail } from "../../shared/types";
+import type { Check, InactiveSummary, Mail } from "../../shared/types";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { toLocalInput, whenLabel } from "../lib/status";
+
+const TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () => void; onSent: (i: Mail) => void }) {
-  const { status, settings, saveMail } = useStore();
+  const { status, settings, saveMail, refreshStatus } = useStore();
   const [audienceId, setAudienceId] = useState(mail.audience_id || settings?.default_audience_id || "");
   const [testTo, setTestTo] = useState("");
   const [when, setWhen] = useState("");
@@ -19,6 +23,22 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
 
   const connected = status?.resend_connected;
   const audiences = status?.audiences || [];
+  // Counts as of now, not as of when the app loaded.
+  useEffect(() => { refreshStatus().catch(() => {}); }, [refreshStatus]);
+  const audience = audiences.find((a) => a.id === audienceId);
+  const pending = audience?.pending_count ?? 0;
+  // An ask to inactive subscribers goes to the inactive ones only, decided when it starts.
+  const ask = mail.segment === "inactive";
+  const [inactive, setInactive] = useState<InactiveSummary | null>(null);
+  useEffect(() => {
+    if (!ask || !audienceId) return;
+    let live = true;
+    api<InactiveSummary>("GET", `/api/audiences/${audienceId}/inactive?days=${mail.segment_days || 90}`)
+      .then((r) => live && setInactive(r))
+      .catch(() => live && setInactive(null));
+    return () => { live = false; };
+  }, [ask, audienceId, mail.segment_days]);
+  const confirmed = ask ? inactive?.inactive ?? 0 : audience?.subscribed_count ?? 0;
 
   // From-addresses: the primary settings sender + any saved senders.
   const senders: { label: string; value: string }[] = [];
@@ -32,6 +52,18 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
   }
   const [from, setFrom] = useState(senders[0]?.value || "");
   const fromReady = senders.length > 0 && !!from;
+
+  // Re-run for each sender picked: domain and DMARC belong to the From address.
+  const [checks, setChecks] = useState<Check[] | "failed" | null>(null);
+  useEffect(() => {
+    if (!connected) return;
+    let live = true;
+    setChecks(null);
+    api<{ checks: Check[] }>("GET", `/api/mails/${mail.id}/preflight${from ? `?from=${encodeURIComponent(from)}` : ""}`)
+      .then((r) => live && setChecks(r.checks))
+      .catch(() => live && setChecks("failed"));
+    return () => { live = false; };
+  }, [mail.id, from, connected]);
 
   const sendTest = async () => {
     setErr(null); setMsg(null); setBusy("test");
@@ -51,7 +83,10 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
     setBusy("send");
     try {
       if (mail.audience_id !== audienceId) await saveMail(mail.id, { audience_id: audienceId });
-      const res = await api<{ mail: Mail }>("POST", `/api/mails/${mail.id}/send`, { scheduled_at: when || undefined, from });
+      // The input is wall-clock time in this browser's timezone; the server needs
+      // the instant, so the offset goes with it.
+      const scheduled_at = when ? new Date(when).toISOString() : undefined;
+      const res = await api<{ mail: Mail }>("POST", `/api/mails/${mail.id}/send`, { scheduled_at, from });
       onSent(res.mail);
     } catch (e) {
       setErr((e as Error).message);
@@ -94,7 +129,30 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
                   {audiences.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}
                 </SelectContent>
               </Select>
+              {audience && ask ? (
+                inactive?.blocked ? (
+                  <p className="rounded-sm bg-warning-tint p-2 text-xs text-warning">{inactive.blocked}</p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Goes to the {confirmed.toLocaleString()} inactive {confirmed === 1 ? "subscriber" : "subscribers"} (no open or click in{" "}
+                    {mail.segment_days || 90} days), counted again when it sends. Whoever doesn't answer within {inactive?.grace_days ?? 10} days stops getting your newsletter.
+                  </p>
+                )
+              ) : audience ? (
+                confirmed > 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    Goes to {confirmed.toLocaleString()} confirmed {confirmed === 1 ? "subscriber" : "subscribers"}.
+                    {pending > 0 ? ` ${pending.toLocaleString()} still waiting to confirm won't get it.` : ""}
+                  </p>
+                ) : (
+                  <p className="rounded-sm bg-warning-tint p-2 text-xs text-warning">
+                    Nobody on this audience has confirmed yet{pending > 0 ? ` (${pending.toLocaleString()} waiting)` : ""}. You can schedule it; it goes to whoever has confirmed by then.
+                  </p>
+                )
+              ) : null}
             </div>
+
+            <Preflight checks={checks} />
 
             <div className="rounded-md p-3 shadow-edge">
               <Label className="mb-1.5 block">Send a test</Label>
@@ -107,8 +165,12 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
             </div>
 
             <div className="space-y-1.5">
-              <Label>Schedule (optional)</Label>
-              <Input type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} />
+              <Label htmlFor="send-when">Schedule (optional)</Label>
+              <Input id="send-when" type="datetime-local" value={when} min={toLocalInput(new Date().toISOString())} onChange={(e) => setWhen(e.target.value)} />
+              <p className="text-xs text-muted-foreground">
+                Your time ({TIMEZONE.replace(/_/g, " ")}).
+                {mail.status === "scheduled" && mail.scheduled_at ? ` Now set for ${whenLabel(mail.scheduled_at)}: pick a new time, or send now.` : ""}
+              </p>
             </div>
           </div>
         )}
@@ -119,12 +181,66 @@ export function SendDialog({ mail, onClose, onSent }: { mail: Mail; onClose: () 
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
           {connected ? (
-            <Button disabled={!audienceId || !fromReady || busy === "send"} onClick={send}>
+            <Button disabled={!audienceId || !fromReady || busy === "send" || (ask && !!inactive?.blocked) || (!when && !!audience && confirmed === 0 && (mail.status === "draft" || mail.status === "scheduled"))} onClick={send}>
               {busy === "send" ? "Sending…" : when ? "Schedule" : "Send now"}
             </Button>
           ) : null}
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+const ICON = {
+  ok: <CheckCircle2 className="size-4 shrink-0 text-success" aria-label="Fine" />,
+  warn: <AlertTriangle className="size-4 shrink-0 text-warning" aria-label="Worth fixing" />,
+  fail: <XCircle className="size-4 shrink-0 text-destructive" aria-label="Won't arrive" />,
+  unknown: <HelpCircle className="size-4 shrink-0 text-muted-foreground" aria-label="Couldn't check" />,
+};
+
+/** Deliverability advice. Never blocks the button: the send route refuses what can't go out. */
+function Preflight({ checks }: { checks: Check[] | "failed" | null }) {
+  if (checks === null) return <p className="text-xs text-muted-foreground">Checking deliverability…</p>;
+  if (checks === "failed") return <p className="text-xs text-muted-foreground">Couldn't run the deliverability checks. You can still send.</p>;
+  const issues = checks.filter((c) => c.level !== "ok").length;
+  return (
+    <div className="space-y-1.5">
+      <Label>{issues ? `Before you send: ${issues} to look at` : "Before you send: all clear"}</Label>
+      <ul className="space-y-2">
+        {checks.map((c) => (
+          <li key={c.id} className="flex gap-2 text-xs">
+            <span className="mt-px">{ICON[c.level]}</span>
+            <div className="min-w-0 flex-1">
+              <span className="font-medium text-foreground">{c.title}.</span>{" "}
+              <span className="text-muted-foreground">{c.detail}</span>
+              {c.record ? <DnsRecord {...c.record} /> : null}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function DnsRecord({ name, type, value }: { name: string; type: string; value: string }) {
+  const [copied, setCopied] = useState("");
+  const copy = (what: string, text: string) => {
+    navigator.clipboard?.writeText(text).then(() => setCopied(what)).catch(() => {});
+  };
+  const row = (label: string, text: string) => (
+    <div className="flex items-center gap-2">
+      <span className="w-10 shrink-0 text-muted-foreground">{label}</span>
+      <code className="min-w-0 flex-1 truncate font-mono text-foreground">{text}</code>
+      <button type="button" className="shrink-0 rounded-sm p-1 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={`Copy ${label.toLowerCase()}`} onClick={() => copy(label, text)}>
+        {copied === label ? <CheckCircle2 className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
+      </button>
+    </div>
+  );
+  return (
+    <div className="mt-1.5 space-y-0.5 rounded-sm bg-muted p-2">
+      {row("Name", name)}
+      {row("Type", type)}
+      {row("Value", value)}
+    </div>
   );
 }

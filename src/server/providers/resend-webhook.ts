@@ -67,11 +67,11 @@ export type DeliveryEvent =
   | { kind: "delivered"; deliveryId: string | null; messageId: string; at: string }
   // `to` (the recipient the provider reports) lets a hard bounce or complaint
   // suppress the contact even when there is no delivery row — e.g. a flow email,
-  // which sends without one.
+  // which sends without one — and lets an open or click there count as engagement.
   | { kind: "bounced"; deliveryId: string | null; messageId: string; at: string; permanent: boolean; reason: string; to: string | null }
   | { kind: "complained"; deliveryId: string | null; messageId: string; at: string; to: string | null }
-  | { kind: "opened"; deliveryId: string | null; messageId: string; at: string }
-  | { kind: "clicked"; deliveryId: string | null; messageId: string; at: string };
+  | { kind: "opened"; deliveryId: string | null; messageId: string; at: string; to: string | null }
+  | { kind: "clicked"; deliveryId: string | null; messageId: string; at: string; to: string | null };
 
 /** Null for events this app doesn't act on (sent, delivery_delayed, …) and for anything malformed. */
 export function parseResendEvent(body: unknown): DeliveryEvent | null {
@@ -106,9 +106,9 @@ export function parseResendEvent(body: unknown): DeliveryEvent | null {
     case "email.complained":
       return { kind: "complained", deliveryId, messageId, at, to };
     case "email.opened":
-      return { kind: "opened", deliveryId, messageId, at };
+      return { kind: "opened", deliveryId, messageId, at, to };
     case "email.clicked":
-      return { kind: "clicked", deliveryId, messageId, at };
+      return { kind: "clicked", deliveryId, messageId, at, to };
     default:
       return null;
   }

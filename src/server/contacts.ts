@@ -49,11 +49,15 @@ export interface Contact {
   confirm_attempts: number;
   /** Why the last confirmation email couldn't be sent. */
   confirm_error: string | null;
+  /** Last open, click or keep-link click (src/server/sunset.ts). */
+  last_engaged_at: string | null;
+  /** 'inactive' when the sunset removed them; null when they chose to leave. */
+  unsubscribe_reason: string | null;
   created_at: string;
 }
 
 const CONTACT_COLS =
-  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, confirm_sent_at, confirm_attempts, confirm_error, created_at";
+  "id, audience_id, email, first_name, last_name, status, consent_source, consent_at, unsubscribed_at, crm_contact_id, confirm_sent_at, confirm_attempts, confirm_error, last_engaged_at, unsubscribe_reason, created_at";
 
 /** A confirmation link stops working this long after its email was sent. */
 export const CONFIRM_TTL_MS = 7 * 24 * 3600_000;
@@ -280,16 +284,16 @@ export async function removeContact(audienceId: string, contactId: string): Prom
 }
 
 /**
- * The recipients of a send. Deliberately the only way to get an address list:
- * `pending` (never confirmed), `unsubscribed` and `bounced` are all excluded,
- * so no caller can accidentally mail them by writing its own query.
+ * Whether a send would reach anyone. One row at most: the send precheck runs
+ * inside the request (and every scheduled job), so it must not load the list.
+ * `pending` (never confirmed), `unsubscribed` and `bounced` don't count.
  */
-export async function subscribedRecipients(audienceId: string): Promise<Contact[]> {
-  return (await query(
-    `SELECT ${CONTACT_COLS} FROM contacts
-      WHERE audience_id = ? AND status = 'subscribed' ORDER BY created_at`,
+export async function hasSubscribers(audienceId: string): Promise<boolean> {
+  const rows = await query(
+    `SELECT 1 FROM contacts WHERE audience_id = ? AND status = 'subscribed' LIMIT 1`,
     [audienceId],
-  )) as unknown as Contact[];
+  );
+  return rows.length > 0;
 }
 
 // ── Consent transitions ─────────────────────────────────────────────────────
@@ -399,7 +403,7 @@ export async function confirmSignup(token: string, evidence = "", nowMs: number 
 
   await run(
     `UPDATE contacts SET status = 'subscribed', consent_at = ?, consent_evidence = ?,
-            confirm_token = NULL, unsubscribed_at = NULL, confirm_error = NULL
+            confirm_token = NULL, unsubscribed_at = NULL, unsubscribe_reason = NULL, confirm_error = NULL
        WHERE id = ? AND confirm_token = ?`,
     [new Date(nowMs).toISOString(), evidence, contact.id, token],
   );
@@ -430,10 +434,13 @@ export async function allowSignup(ip: string, nowMs: number = Date.now()): Promi
   return true;
 }
 
+// The person's own choice replaces a sunset removal: the keep link brings back
+// only someone the sunset removed, never someone who asked to leave.
 export async function markUnsubscribed(audienceId: string, email: string): Promise<void> {
   await run(
-    `UPDATE contacts SET status = 'unsubscribed', unsubscribed_at = ?, confirm_token = NULL
-       WHERE audience_id = ? AND email = ? AND status <> 'unsubscribed'`,
+    `UPDATE contacts SET status = 'unsubscribed', unsubscribe_reason = NULL, confirm_token = NULL,
+            unsubscribed_at = CASE WHEN status = 'unsubscribed' THEN unsubscribed_at ELSE ? END
+       WHERE audience_id = ? AND email = ? AND (status <> 'unsubscribed' OR unsubscribe_reason IS NOT NULL)`,
     [now(), audienceId, normalize(email)],
   );
 }

@@ -117,6 +117,27 @@ describe("send engine", () => {
     p = new FakeProvider();
   });
 
+  // A queued job checks the schedule, then claims. An operator who cancels or
+  // moves the schedule between the two must win, or a cancelled issue goes out.
+  it("lets a queued job claim only a mail still scheduled for that job's time", async () => {
+    await seed(3);
+    const AT = "2026-10-05T12:00:00.000Z";
+    expect(await beginSend(1, AUD, snapshot(), AT)).toEqual({ ok: false, reason: "not-found" });
+    await run(`UPDATE mails SET status = 'scheduled', scheduled_at = ? WHERE id = 1`, ["2026-10-05T13:00:00.000Z"]);
+    expect((await beginSend(1, AUD, snapshot(), AT)).ok).toBe(false);
+    expect(await status()).toBe("scheduled");
+    await run(`UPDATE mails SET scheduled_at = ? WHERE id = 1`, [AT]);
+    expect((await beginSend(1, AUD, snapshot(), AT)).ok).toBe(true);
+    expect(await status()).toBe("sending");
+  });
+
+  it("lets a job from before scheduled_for existed claim any scheduled time, never a draft", async () => {
+    await seed(3);
+    expect((await beginSend(1, AUD, snapshot(), null)).ok).toBe(false);
+    await run(`UPDATE mails SET status = 'scheduled', scheduled_at = ? WHERE id = 1`, ["2026-10-05T13:00:00.000Z"]);
+    expect((await beginSend(1, AUD, snapshot(), null)).ok).toBe(true);
+  });
+
   it("sends every confirmed subscriber once, in fixed batches, each under its own key", async () => {
     await seed(250, [{ email: "pending@example.com", status: "pending" }, { email: "gone@example.com", status: "unsubscribed" }]);
     expect((await beginSend(1, AUD, snapshot())).ok).toBe(true);

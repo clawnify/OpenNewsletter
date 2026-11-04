@@ -7,9 +7,10 @@
  * non-2xx.
  */
 import { get, run } from "./db";
+import { noteEngagement } from "./sunset";
 import type { DeliveryEvent } from "./providers/resend-webhook";
 
-export type EventOutcome = "applied" | "suppressed-no-delivery" | "unknown-delivery";
+export type EventOutcome = "applied" | "suppressed-no-delivery" | "engaged-no-delivery" | "unknown-delivery";
 
 /**
  * Suppress a contact by address, the same way on every list this publication
@@ -20,13 +21,16 @@ export type EventOutcome = "applied" | "suppressed-no-delivery" | "unknown-deliv
 async function suppressByEmail(email: string, ev: DeliveryEvent): Promise<void> {
   if (ev.kind === "bounced" && ev.permanent) {
     await run(
-      `UPDATE contacts SET status = 'bounced', confirm_token = NULL WHERE email = ? AND status IN ('subscribed', 'pending')`,
+      // A row the sunset removed takes the bounce too, so its keep link can't revive a dead address.
+      `UPDATE contacts SET status = 'bounced', confirm_token = NULL, unsubscribe_reason = NULL
+        WHERE email = ? AND (status IN ('subscribed', 'pending') OR unsubscribe_reason IS NOT NULL)`,
       [email],
     );
   } else if (ev.kind === "complained") {
     await run(
-      `UPDATE contacts SET status = 'unsubscribed', unsubscribed_at = COALESCE(unsubscribed_at, ?), confirm_token = NULL
-        WHERE email = ? AND status <> 'unsubscribed'`,
+      `UPDATE contacts SET status = 'unsubscribed', unsubscribed_at = COALESCE(unsubscribed_at, ?), confirm_token = NULL,
+              unsubscribe_reason = NULL
+        WHERE email = ? AND (status <> 'unsubscribed' OR unsubscribe_reason IS NOT NULL)`,
       [ev.at, email],
     );
   }
@@ -52,6 +56,11 @@ export async function applyDeliveryEvent(ev: DeliveryEvent): Promise<EventOutcom
       await suppressByEmail(to, ev);
       return "suppressed-no-delivery";
     }
+    // A welcome-flow email read is a reader, for the sunset as for any issue.
+    if ((ev.kind === "opened" || ev.kind === "clicked") && ev.to) {
+      await noteEngagement(ev.to, ev.at);
+      return "engaged-no-delivery";
+    }
     return "unknown-delivery";
   }
 
@@ -61,9 +70,11 @@ export async function applyDeliveryEvent(ev: DeliveryEvent): Promise<EventOutcom
       break;
     case "opened":
       await run(`UPDATE deliveries SET opened_at = COALESCE(opened_at, ?) WHERE id = ?`, [ev.at, d.id]);
+      await noteEngagement(d.email, ev.at);
       break;
     case "clicked":
       await run(`UPDATE deliveries SET clicked_at = COALESCE(clicked_at, ?) WHERE id = ?`, [ev.at, d.id]);
+      await noteEngagement(d.email, ev.at);
       break;
     case "bounced":
       await run(
