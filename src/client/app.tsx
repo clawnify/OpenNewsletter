@@ -109,7 +109,7 @@ function Shell() {
         ) : view === "templates" ? (
           <TemplatesView openMail={setEditing} />
         ) : view === "audience" ? (
-          <AudienceView />
+          <AudienceView openMail={setEditing} />
         ) : (
           <SettingsView />
         )}

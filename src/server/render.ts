@@ -11,7 +11,7 @@
 import { fontStack, applyMobile, type DesignTokens } from "../shared/design";
 import { fillTags, type MergeValues } from "../shared/merge";
 import { esc, renderBlock } from "../shared/email-blocks";
-import type { Mail, Settings } from "../shared/types";
+import type { Block, Mail, Settings } from "../shared/types";
 
 export interface RenderOpts {
   forEmail?: boolean;
@@ -24,6 +24,13 @@ export interface RenderOpts {
    */
   unsubscribeUrl?: string;
   /**
+   * This subscriber's keep link, for an ask to inactive subscribers
+   * (`mail.segment === 'inactive'`, src/server/sunset.ts). Such a mail always
+   * shows the button, like the unsubscribe link: nobody may be removed without
+   * a way to stay. Previews and test sends get a dead link.
+   */
+  keepUrl?: string;
+  /**
    * This subscriber's merge-tag values. Omitted, tags render as written:
    * a send whose snapshot predates merge tags must render byte for byte as it
    * did, since its retries reuse idempotency keys.
@@ -31,6 +38,8 @@ export interface RenderOpts {
   merge?: MergeValues;
   /** The pre-v2 column padding, for sends begun before it changed. */
   legacyColumns?: boolean;
+  /** No unsubscribe link when the footer is off, as before v3. Only for sends begun before it changed. */
+  legacyFooter?: boolean;
 }
 
 export function renderInner(mail: Mail, d: DesignTokens, settings: Settings, opts: RenderOpts = {}): string {
@@ -44,17 +53,31 @@ export function renderInner(mail: Mail, d: DesignTokens, settings: Settings, opt
   }
   for (const b of mail.blocks || []) rows.push(`<tr><td style="padding:${space}px 0 0;">${renderBlock(b, d, opts.merge, opts.legacyColumns)}</td></tr>`);
 
+  // No renderer version bump: only ask mails, which no earlier snapshot holds, change.
+  if (mail.segment === "inactive") {
+    const keep: Block = { id: "keep", type: "button", text: "Yes, keep me subscribed", href: opts.keepUrl || "#", align: "center", fullWidth: true };
+    rows.push(`<tr><td style="padding:${space * 2}px 0 0;">${renderBlock(keep, d)}</td></tr>`);
+  }
+
+  // Was `{{{RESEND_UNSUBSCRIBE_URL}}}`, a Resend-Broadcasts-only variable —
+  // a dead literal now that sends are per-recipient. The app hosts its own
+  // unsubscribe page instead, so the link is the publication's, not a
+  // third party's.
+  const unsub = opts.unsubscribeUrl || "#";
   if (d.options.showFooter) {
-    // Was `{{{RESEND_UNSUBSCRIBE_URL}}}`, a Resend-Broadcasts-only variable —
-    // a dead literal now that sends are per-recipient. The app hosts its own
-    // unsubscribe page instead, so the link is the publication's, not a
-    // third party's.
-    const unsub = opts.unsubscribeUrl || "#";
     const footerText = settings.footer_text || `You're receiving this because you subscribed to ${settings.publication_name || "our newsletter"}.`;
     rows.push(
       `<tr><td style="padding:${space + 8}px 0 0;"><div style="font-family:${body};font-size:12px;line-height:1.5;color:${d.colors.secondary};border-top:1px solid ${d.colors.border};padding-top:${space}px;">` +
         `${esc(settings.publication_name || "")}<br>${esc(footerText)}<br>` +
         `<a href="${unsub}" style="color:${d.colors.secondary};font-weight:600;text-decoration:underline;">Unsubscribe</a></div></td></tr>`,
+    );
+  } else if (!opts.legacyFooter) {
+    // The footer can go, the link can't: nothing else in the body carries a
+    // reader's own unsubscribe URL, and Gmail and Yahoo require a visible one
+    // from bulk senders on top of the List-Unsubscribe header.
+    rows.push(
+      `<tr><td style="padding:${space + 8}px 0 0;"><div style="font-family:${body};font-size:12px;line-height:1.5;color:${d.colors.secondary};">` +
+        `<a href="${unsub}" style="color:${d.colors.secondary};text-decoration:underline;">Unsubscribe</a></div></td></tr>`,
     );
   }
 

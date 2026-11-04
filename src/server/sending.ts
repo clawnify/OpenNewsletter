@@ -46,6 +46,7 @@
  */
 import { query, get, run } from "./db";
 import { renderEmailHtml } from "./render";
+import { INACTIVE_DAYS, INACTIVE_IDS, MIN_RECEIVED } from "./sunset";
 import { fillSubject, type MergeValues } from "../shared/merge";
 import type { BatchMessage, BatchOutcome, EmailProvider } from "./providers";
 import type { DesignTokens } from "../shared/design";
@@ -99,6 +100,7 @@ export const DELIVERIES_DDL = [
   `CREATE INDEX IF NOT EXISTS idx_deliveries_batch ON deliveries(mail_id, status, batch)`,
   `CREATE INDEX IF NOT EXISTS idx_deliveries_provider ON deliveries(provider_message_id)
      WHERE provider_message_id IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_deliveries_contact ON deliveries(contact_id, sent_at)`,
 ];
 
 /** Everything a send needs, frozen at the moment it starts. */
@@ -116,7 +118,7 @@ export interface SendSnapshot {
    * send renders with its own version even after the app is upgraded. Bump it
    * whenever the same mail would render to different HTML.
    */
-  renderer?: 2;
+  renderer?: 2 | 3;
 }
 
 export type BeginResult =
@@ -160,15 +162,27 @@ const token = () => crypto.randomUUID().replace(/-/g, "");
  *   something the operator was meant to fix (the key, the sender). Delivered
  *   rows stay delivered; only unresolved rows go out.
  * - sent: refused.
+ *
+ * `scheduledFor` is set by a queued job: the claim then also requires the mail
+ * to still be scheduled for that job's time (null: any time). The job checked
+ * this already, but an operator can cancel or move the schedule between that
+ * read and this claim, and the plain claim would take a draft.
  */
-export async function beginSend(mailId: number, audienceId: string, snapshot: SendSnapshot): Promise<BeginResult> {
+export async function beginSend(
+  mailId: number,
+  audienceId: string,
+  snapshot: SendSnapshot,
+  scheduledFor?: string | null,
+): Promise<BeginResult> {
   const sendId = crypto.randomUUID();
+  const queued = scheduledFor !== undefined;
   const claimed = await query<{ id: number }>(
     `UPDATE mails SET status = 'sending', send_id = ?, send_snapshot = ?, send_error = NULL,
             updated_at = datetime('now')
-      WHERE id = ? AND status IN ('draft', 'scheduled')
+      WHERE id = ? AND (CASE WHEN ? THEN status = 'scheduled' AND (? IS NULL OR scheduled_at = ?)
+                             ELSE status IN ('draft', 'scheduled') END)
       RETURNING id`,
-    [sendId, JSON.stringify(snapshot), mailId],
+    [sendId, JSON.stringify(snapshot), mailId, queued ? 1 : 0, scheduledFor ?? null, scheduledFor ?? null],
   );
   if (claimed.length > 0) {
     await writeRecipients(mailId, audienceId);
@@ -220,16 +234,31 @@ export async function beginSend(mailId: number, audienceId: string, snapshot: Se
  * statement guarded by NOT EXISTS, so two concurrent starts can't both write
  * (a count-then-insert could, and a late subscriber could then land in a batch
  * that was already claimed).
+ *
+ * An ask to inactive subscribers (`segment = 'inactive'`) goes only to the ones
+ * inactive at this moment (src/server/sunset.ts). The send route's precheck
+ * stores `tracking_since` first; while it is NULL, SQLite's MAX() is NULL and
+ * nobody qualifies.
  */
-async function writeRecipients(mailId: number, audienceId: string): Promise<void> {
+async function writeRecipients(mailId: number, audienceId: string, nowMs = Date.now()): Promise<void> {
+  const m = await get<{ segment: string | null; segment_days: number | null }>(
+    `SELECT segment, segment_days FROM mails WHERE id = ?`,
+    [mailId],
+  );
+  const inactive = m?.segment === "inactive";
+  const since = inactive
+    ? (await get<{ tracking_since: string | null }>(`SELECT tracking_since FROM settings WHERE id = 1`))?.tracking_since ?? null
+    : null;
+  const cutoff = new Date(nowMs - (m?.segment_days || INACTIVE_DAYS) * 24 * 3600_000).toISOString();
   await run(
     `INSERT OR IGNORE INTO deliveries (id, mail_id, contact_id, email, first_name, last_name, batch)
      SELECT 'dlv_' || lower(hex(randomblob(16))), ?, id, email, first_name, last_name,
             CAST((ROW_NUMBER() OVER (ORDER BY created_at, id) - 1) / ? AS INTEGER)
        FROM contacts
       WHERE audience_id = ? AND status = 'subscribed'
-        AND NOT EXISTS (SELECT 1 FROM deliveries WHERE mail_id = ?)`,
-    [mailId, BATCH_SIZE, audienceId, mailId],
+        AND NOT EXISTS (SELECT 1 FROM deliveries WHERE mail_id = ?)
+        ${inactive ? `AND id IN (${INACTIVE_IDS})` : ""}`,
+    [mailId, BATCH_SIZE, audienceId, mailId, ...(inactive ? [since, audienceId, cutoff, MIN_RECEIVED] : [])],
   );
 }
 
@@ -485,15 +514,20 @@ function renderFor(snap: SendSnapshot, r: ClaimedRow): BatchMessage {
   const unsubscribeUrl = `${snap.origin}/api/unsubscribe?c=${r.contact_id}`;
   // From the row, not the contact: a name edited mid-send must not change a
   // payload that may be retried under the same key.
-  const v2 = snap.renderer === 2;
+  const version = snap.renderer ?? 1;
+  const v2 = version >= 2;
   const merge: MergeValues | undefined = v2
     ? { first_name: r.first_name ?? "", last_name: r.last_name ?? "", email: r.email }
     : undefined;
+  // Only an ask to inactive subscribers carries one; the renderer adds the button.
+  const keepUrl = snap.mail.segment === "inactive" ? `${snap.origin}/api/keep?c=${r.contact_id}` : undefined;
   const html = renderEmailHtml(snap.mail as Mail, snap.design, snap.settings, {
     unsubscribeUrl,
+    keepUrl,
     mobile: snap.mail.design_mobile,
     merge,
     legacyColumns: !v2,
+    legacyFooter: version < 3,
   });
   const subject = fillSubject(snap.mail.title, merge);
   return { to: r.email, html, unsubscribeUrl, deliveryId: r.id, ...(subject !== snap.mail.title ? { subject } : {}) };

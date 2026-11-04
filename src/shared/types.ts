@@ -92,6 +92,13 @@ export interface Mail {
   template_slug: string | null;
   /** Resend audience this mail sends to. */
   audience_id: string | null;
+  /**
+   * 'inactive': an ask to the audience's inactive subscribers, who are removed
+   * if they don't answer (src/server/sunset.ts). Null: an ordinary issue.
+   */
+  segment?: "inactive" | null;
+  /** Inactive means no open or click for this many days. */
+  segment_days?: number | null;
   status: "draft" | "scheduled" | "sending" | "sent" | "failed";
   /**
    * The automation whose step sends this mail, one person at a time. Such a
@@ -212,5 +219,35 @@ export interface ResendContact {
   confirm_sent_at?: string | null;
   confirm_attempts?: number;
   confirm_error?: string | null;
+  /** Last open, click or keep-link click. */
+  last_engaged_at?: string | null;
+  /** 'inactive' when the sunset removed them; null when they chose to leave. */
+  unsubscribe_reason?: string | null;
   created_at?: string;
+}
+
+/** GET /api/audiences/:id/inactive (src/server/sunset.ts). */
+export interface InactiveSummary {
+  days: number;
+  inactive: number;
+  asked: number;
+  removes_from: string | null;
+  last_engagement_at: string | null;
+  blocked: string | null;
+  min_received: number;
+  grace_days: number;
+}
+
+/**
+ * One deliverability preflight result (server/preflight.ts). Advice: "fail"
+ * means the mail won't arrive well. Only a domain that can't send stops a
+ * send, and the send route enforces that on its own.
+ */
+export interface Check {
+  id: "domain" | "dmarc" | "size" | "images";
+  level: "ok" | "warn" | "fail" | "unknown";
+  title: string;
+  detail: string;
+  /** A DNS record to add, shown so it can be copied. */
+  record?: { name: string; type: "TXT"; value: string };
 }

@@ -10,9 +10,12 @@ import { getEmailProvider } from "./providers";
 import { generateDraft, generateField, completeText, rewriteBatch } from "./ai";
 import { renderEmailHtml } from "./render";
 import { SAMPLE_VALUES, fillSubject, type MergeValues } from "../shared/merge";
-import { sendVerdict } from "./schedule";
+import { parseScheduleTime, sendVerdict } from "./schedule";
+import { domainCheck, dmarcCheck, dohTxt, findDmarc, imagesCheck, sizeCheck, type ProviderDomain } from "./preflight";
+import { sendableStatus, signingDomain } from "../shared/sending-domain";
 import * as sending from "./sending";
 import * as flows from "./flows";
+import * as sunset from "./sunset";
 import { applyDeliveryEvent } from "./events";
 import { parseResendEvent, verifyResendWebhook, RESEND_EVENTS } from "./providers/resend-webhook";
 import { WebhookSetupError } from "./providers/types";
@@ -20,7 +23,7 @@ import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, cleanTokens, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle, mailFromSkeleton } from "../shared/blocks";
 import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
-import type { Block, Mail, Settings, Template } from "../shared/types";
+import type { Block, Check, Mail, Settings, Template } from "../shared/types";
 
 type Env = {
   Bindings: {
@@ -86,6 +89,13 @@ async function ensureSeed() {
     `ALTER TABLE mails ADD COLUMN preheader TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN crm_enabled INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE settings ADD COLUMN crm_app_id TEXT`,
+    `ALTER TABLE settings ADD COLUMN tracking_since TEXT`,
+    `ALTER TABLE contacts ADD COLUMN last_engaged_at TEXT`,
+    `ALTER TABLE contacts ADD COLUMN unsubscribe_reason TEXT`,
+    `ALTER TABLE mails ADD COLUMN segment TEXT`,
+    `ALTER TABLE mails ADD COLUMN segment_days INTEGER`,
+    `ALTER TABLE mails ADD COLUMN sunset_done_at TEXT`,
+    `ALTER TABLE settings ADD COLUMN engagement_backfilled_at TEXT`,
   ]);
   // Idempotent, and outside the try: a mistake here must surface, not be read
   // as "already exists".
@@ -98,17 +108,39 @@ async function ensureSeed() {
   for (const sql of flows.FLOWS_DDL) await run(sql);
   const flowColumnsOk = await addColumns(flows.FLOWS_COLUMNS);
   for (const sql of [
+    `CREATE INDEX IF NOT EXISTS idx_mails_sunset ON mails(segment) WHERE sunset_done_at IS NULL`,
     `CREATE TABLE IF NOT EXISTS signup_attempts (ip_hash TEXT NOT NULL, at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts ON signup_attempts(ip_hash, at)`,
     `CREATE INDEX IF NOT EXISTS idx_signup_attempts_at ON signup_attempts(at)`,
   ]) await run(sql);
   await contacts.dropDuplicateDefaultAudiences();
+  // After the columns: needs contacts.last_engaged_at and the settings flag.
+  // Never fatal: until it succeeds the sunset is refused (blockedReason), and
+  // the app keeps working. The next cold start tries again.
+  if (columnsOk) {
+    try {
+      await sunset.backfillEngagement();
+    } catch (e) {
+      console.error("[sunset backfill]", e);
+    }
+  }
   seeded = columnsOk && deliveryColumnsOk && flowColumnsOk;
 }
 
+// Sunset removals fall due with no job to run them (src/server/sunset.ts), so
+// requests do it, at most once a minute per isolate. A send runs it itself.
+let sunsetCheckedAt = 0;
 app.use("*", async (c, next) => {
   initDB(c.env);
   await ensureSeed();
+  if (Date.now() - sunsetCheckedAt > 60_000) {
+    sunsetCheckedAt = Date.now();
+    try {
+      await sunset.finishSunsets();
+    } catch (e) {
+      console.error("[sunset]", e);
+    }
+  }
   await next();
 });
 
@@ -473,8 +505,6 @@ app.put("/api/mails/:id", async (c) => {
     design_mobile: b.design_mobile !== undefined ? storedTokens(b.design_mobile) : existing.design_mobile,
     template_slug: b.template_slug ?? existing.template_slug,
     audience_id: b.audience_id !== undefined ? b.audience_id : existing.audience_id,
-    status: b.status ?? existing.status,
-    scheduled_at: b.scheduled_at !== undefined ? b.scheduled_at : existing.scheduled_at,
   };
 
 
@@ -483,11 +513,12 @@ app.put("/api/mails/:id", async (c) => {
   if (b.blocks !== undefined) fields.title = deriveTitle(b.blocks);
 
   await run(
-    // Once a send has started, only the send engine moves the status: a client
-    // carrying an old status must not pull a running send back to draft.
-    // Decided inside the UPDATE, not from the row read above, so a send that
-    // starts between the two can't be overwritten. Content edits still save;
-    // the send delivers its own snapshot.
+    // Content only. `status` and `scheduled_at` belong to the send and schedule
+    // routes, and a body carrying them is ignored: the editor's undo restores a
+    // whole earlier copy of the mail, and writing its status back cancelled a
+    // schedule (undo after scheduling) or left an issue reading "scheduled"
+    // with no job for that time (undo across a reschedule). Content edits to a
+    // scheduled or running send still save; a send delivers its own snapshot.
     // The design columns are only written when this request sets them: a save
     // carrying none must not put back a value read before a template delete
     // copied its design into the mail.
@@ -496,8 +527,6 @@ app.put("/api/mails/:id", async (c) => {
        design_mobile = CASE WHEN ? THEN ? ELSE design_mobile END,
        template_slug = CASE WHEN ? THEN ? ELSE template_slug END,
        audience_id=?,
-       status = CASE WHEN status IN ('sending', 'sent', 'failed') THEN status ELSE ? END,
-       scheduled_at = CASE WHEN status IN ('sending', 'sent', 'failed') THEN scheduled_at ELSE ? END,
        updated_at=datetime('now') WHERE id=?`,
     [
       fields.eyebrow, fields.title, fields.preheader, fields.subtitle, fields.byline_name, fields.byline_date,
@@ -505,8 +534,7 @@ app.put("/api/mails/:id", async (c) => {
       b.design !== undefined ? 1 : 0, fields.design,
       b.design_mobile !== undefined ? 1 : 0, fields.design_mobile,
       b.template_slug != null ? 1 : 0, fields.template_slug,
-      fields.audience_id,
-      fields.status, fields.scheduled_at, id,
+      fields.audience_id, id,
     ],
   );
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
@@ -675,6 +703,63 @@ app.get("/api/mails/:id/preview", async (c) => {
   // runs here, whatever a block contains.
   c.header("Content-Security-Policy", "script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
   return c.html(html);
+});
+
+// ── deliverability preflight ─────────────────────────────────────────
+//
+// Advice for the send dialog, from the issue exactly as it would render and
+// the sender picked there. See preflight.ts for where each rule comes from.
+// Every lookup is best-effort: a check that can't run reports "unknown".
+
+function domainOf(from: string): string {
+  return from.slice(from.lastIndexOf("@") + 1).replace(/>$/, "").trim().toLowerCase();
+}
+
+app.get("/api/mails/:id/preflight", async (c) => {
+  const row = await get<any>("SELECT * FROM mails WHERE id = ?", [Number(c.req.param("id"))]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  const mail = parseMail(row);
+  const s = await getSettings();
+  const fromParam = c.req.query("from") || "";
+  const from = fromParam.includes("@") ? fromParam : fromAddress(s);
+  const checks: Check[] = [];
+
+  let clickTracking = false;
+  const fromDomain = from ? domainOf(from) : "";
+  if (fromDomain) {
+    // DNS runs while Resend answers.
+    const dmarc = findDmarc(fromDomain, dohTxt).catch(() => "error" as const);
+    const p = await provider(c);
+    let domain: ProviderDomain | null = null;
+    const unknown = (detail: string): Check => ({ id: "domain", level: "unknown", title: "Sending domain", detail });
+    if (!p) checks.push(unknown("No sending backend is connected."));
+    else {
+      try {
+        // The domain the send route will sign with: the closest one that can
+        // send, else the closest at all, to say why it can't.
+        const all = await p.listDomains();
+        domain = signingDomain(fromDomain, all.filter((d) => sendableStatus(d.status))) ?? signingDomain(fromDomain, all);
+        const records = domain?.id && p.domainRecords && sendableStatus(domain.status)
+          ? await p.domainRecords(domain.id).catch(() => null)
+          : null;
+        checks.push(domainCheck(fromDomain, domain, records));
+      } catch {
+        checks.push(unknown("Couldn't reach Resend to check the domain."));
+      }
+    }
+    clickTracking = !!domain?.clickTracking;
+    checks.push(dmarcCheck(fromDomain, domain?.name ?? null, await dmarc));
+  }
+
+  // One reader's copy, with a real-length unsubscribe link: the size each
+  // recipient gets differs only by their name.
+  const html = renderEmailHtml(mail, await resolveDesign(mail), s, {
+    mobile: mail.design_mobile,
+    merge: SAMPLE_VALUES,
+    unsubscribeUrl: `${new URL(c.req.url).origin}/api/unsubscribe?c=${crypto.randomUUID()}`,
+  });
+  checks.push(sizeCheck(html, clickTracking), imagesCheck(html));
+  return c.json({ from, checks });
 });
 
 // ── image uploads (R2) ───────────────────────────────────────────────
@@ -1377,6 +1462,11 @@ async function enqueueSend(c: any, mailId: number, runAt: string, from: string):
     //
     // The old job still exists and still fires; sendVerdict() is what stops it.
     idempotencyKey: `send-mail-${mailId}@${runAt}`,
+    // The platform's maximum. A 503 (the backend couldn't be resolved) is
+    // retried at 2, 4, 8, 16, 32 and then every 60 minutes: about 5 hours,
+    // where the default 5 attempts gave up after about 30 minutes and left the
+    // issue reading "scheduled". Past that, the editor flags it as late.
+    maxAttempts: 10,
   });
 }
 
@@ -1446,7 +1536,7 @@ async function sendMailNow(
   // means an operator pressed send just now, which needs no such check — they
   // are looking at the issue and their intent is the request itself.
   scheduledFor?: string | null,
-): Promise<{ status: 200 | 400 | 404 | 409 | 502; body: Record<string, unknown> }> {
+): Promise<{ status: 200 | 400 | 404 | 409 | 502 | 503; body: Record<string, unknown> }> {
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   if (!row) return { status: 404, body: { error: "Not found" } };
   const mail = parseMail(row);
@@ -1477,7 +1567,10 @@ async function sendMailNow(
   }
 
   const p = await provider(c);
-  if (!p) return { status: 400, body: { error: "No sending backend is configured." } };
+  // 503, not 400: with no key of its own the app resolves Resend through the
+  // org's connection, and a failed lookup (a network blip) also comes back
+  // null. A queued job must retry that, never treat it as the operator's to fix.
+  if (!p) return { status: 503, body: { error: "No sending backend could be resolved. Check Resend is connected, then try again." } };
   if (!mail.audience_id) {
     return { status: 400, body: { error: "Pick an audience before sending." } };
   }
@@ -1498,11 +1591,8 @@ async function sendMailNow(
   const fromDomain = from.slice(from.lastIndexOf("@") + 1).replace(/>$/, "").toLowerCase();
   try {
     const domains = await p.listDomains();
-    const verified = domains.filter((d) => d.status === "verified" || d.status === "Verified");
-    const covered = verified.some(
-      (d) => fromDomain === d.name.toLowerCase() || fromDomain.endsWith(`.${d.name.toLowerCase()}`),
-    );
-    if (!covered) {
+    const verified = domains.filter((d) => sendableStatus(d.status));
+    if (!signingDomain(fromDomain, verified)) {
       return {
         status: 400,
         body: {
@@ -1518,7 +1608,20 @@ async function sendMailNow(
   }
 
   const resuming = row.status === "sending" || row.status === "failed";
-  if (!resuming && (await contacts.subscribedRecipients(mail.audience_id)).length === 0) {
+  // Its copies promise removal in GRACE_DAYS, which a closed ask no longer does.
+  if (mail.segment === "inactive" && row.sunset_done_at) {
+    return { status: 409, body: { error: "This ask is closed. Write a new one from Audience to ask again." } };
+  }
+  // Due removals first, unthrottled: whoever an ask let go must not get the
+  // next issue because the middleware's once-a-minute check hasn't run yet.
+  if (!resuming) await sunset.finishSunsets();
+  if (!resuming && mail.segment === "inactive") {
+    // The data the cohort rests on is checked again: it may have changed since
+    // the ask was written.
+    const sum = await sunset.inactiveSummary(mail.audience_id, !!(await webhookSecret(c)).secret, mail.segment_days || sunset.INACTIVE_DAYS);
+    if (sum.blocked) return { status: 400, body: { error: sum.blocked } };
+    if (sum.inactive === 0) return { status: 400, body: { error: "Nobody on this audience is inactive right now." } };
+  } else if (!resuming && !(await contacts.hasSubscribers(mail.audience_id))) {
     return { status: 400, body: { error: "No confirmed subscribers on this audience yet." } };
   }
 
@@ -1534,6 +1637,8 @@ async function sendMailNow(
     scheduled_at: _scheduledAt,
     sent_at: _sentAt,
     updated_at: _updatedAt,
+    // Written by the sunset, not the send: inside, it would change a retry's snapshot.
+    sunset_done_at: _sunsetDone,
     ...frozen
   } = mail as Mail & Record<string, unknown>;
   const begun = await sending.beginSend(id, mail.audience_id, {
@@ -1542,8 +1647,8 @@ async function sendMailNow(
     settings: s,
     from,
     origin: new URL(c.req.url).origin,
-    renderer: 2,
-  });
+    renderer: 3,
+  }, scheduledFor);
   if (!begun.ok) {
     return begun.reason === "already-sent"
       ? { status: 409, body: { error: "This issue has already been sent." } }
@@ -1551,7 +1656,7 @@ async function sendMailNow(
   }
 
   const result = await drain(c, id, begun.sendId);
-  if (!result) return { status: 400, body: { error: "No sending backend is configured." } };
+  if (!result) return { status: 503, body: { error: "No sending backend could be resolved. Check Resend is connected, then try again." } };
   const updated = parseMail(await get<any>("SELECT * FROM mails WHERE id = ?", [id]));
   return sendResponse(result, updated);
 }
@@ -1570,10 +1675,9 @@ app.post("/api/mails/:id/send", async (c) => {
   }
 
   if (scheduled_at) {
-    const when = new Date(scheduled_at);
-    if (Number.isNaN(when.getTime())) {
-      return c.json({ error: "Invalid scheduled_at — expected an ISO-8601 timestamp." }, 400);
-    }
+    const parsed = parseScheduleTime(scheduled_at, Date.now());
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    const when = new Date(parsed.iso);
     const current = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
     if (!current) return c.json({ error: "Not found" }, 404);
     if (current.status !== "draft" && current.status !== "scheduled") {
@@ -1591,8 +1695,11 @@ app.post("/api/mails/:id/send", async (c) => {
       // when nothing exists to fire it.
       return c.json({ error: e?.message || "Could not schedule this send." }, 502);
     }
+    // Guarded like the status check above, which ran before the enqueue: a
+    // send that started in between keeps its status.
     await run(
-      `UPDATE mails SET status='scheduled', scheduled_at=?, sent_at=NULL, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE mails SET status='scheduled', scheduled_at=?, sent_at=NULL, send_error=NULL, updated_at=datetime('now')
+        WHERE id=? AND status IN ('draft', 'scheduled')`,
       [when.toISOString(), id],
     );
     const updated = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
@@ -1601,6 +1708,24 @@ app.post("/api/mails/:id/send", async (c) => {
 
   const r = await sendMailNow(c, id, fromOverride);
   return c.json(r.body, r.status);
+});
+
+// Back to draft. The queued job still fires at its time and stops itself
+// (sendVerdict: not-scheduled). It is deliberately NOT cancelled: enqueueing a
+// key that exists returns the existing row whatever its status, so cancelling,
+// then scheduling the same minute again, would get back a cancelled job and
+// the issue would never go out.
+app.post("/api/mails/:id/unschedule", async (c) => {
+  const id = Number(c.req.param("id"));
+  const rows = await query<any>(
+    `UPDATE mails SET status='draft', scheduled_at=NULL, updated_at=datetime('now')
+      WHERE id=? AND status='scheduled' RETURNING *`,
+    [id],
+  );
+  if (rows.length) return c.json({ ok: true, mail: parseMail(rows[0]) });
+  const row = await get<{ status: string }>("SELECT status FROM mails WHERE id = ?", [id]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json({ error: row.status === "draft" ? "This issue isn't scheduled." : `Too late: this issue is ${row.status}.` }, 409);
 });
 
 // Queue delivery target for scheduled sends. Public (the queue calls it from
@@ -1648,7 +1773,24 @@ app.post("/api/jobs/send-mail", async (c) => {
   // Jobs enqueued before the payload carried scheduled_for are still in flight
   // across this deploy. null keeps their status guards and skips only the
   // timestamp compare they cannot answer — see sendVerdict.
-  const r = await sendMailNow(c, id, body.from, body.scheduled_for ?? null);
+  const scheduledFor = body.scheduled_for ?? null;
+  const r = await sendMailNow(c, id, body.from, scheduledFor);
+  // Every answer below is final, so each is a 200: a non-2xx makes the queue
+  // retry with backoff, and no retry changes the outcome.
+  if (r.status === 404) return c.json({ ok: true, skipped: "not-found" });
+  if (r.status === 400) {
+    // Stopped before anything went out on something only the operator can fix
+    // (no audience, no sender, unverified domain, nobody confirmed), so the
+    // issue goes back to draft and says why, instead of reading "scheduled"
+    // forever. A backend that couldn't be resolved is a 503 and retries.
+    const error = `Scheduled send didn't go out: ${String(r.body.error ?? "it couldn't start")}`;
+    await run(
+      `UPDATE mails SET status='draft', scheduled_at=NULL, send_error=?, updated_at=datetime('now')
+        WHERE id=? AND status='scheduled' AND (? IS NULL OR scheduled_at = ?)`,
+      [error, id, scheduledFor, scheduledFor],
+    );
+    return c.json({ ok: true, skipped: "precheck", error });
+  }
   return c.json(r.body, r.status);
 });
 
@@ -1928,6 +2070,7 @@ app.post("/api/tracking", async (c) => {
   try {
     const w = await p.ensureWebhook(manual.endpoint);
     await run("UPDATE settings SET resend_webhook_id = ?, resend_webhook_secret = ? WHERE id = 1", [w.id, w.secret]);
+    await sunset.markTrackingOn();
     return c.json({ ok: true, tracking: await trackingState(c) });
   } catch (e) {
     if (e instanceof WebhookSetupError) return c.json({ error: e.message, manual }, 400);
@@ -1940,6 +2083,7 @@ app.put("/api/tracking/secret", async (c) => {
   const { secret } = await c.req.json<{ secret?: string }>().catch(() => ({}) as { secret?: string });
   if (!secret?.trim().startsWith("whsec_")) return c.json({ error: "Paste the webhook's signing secret (it starts with whsec_)." }, 400);
   await run("UPDATE settings SET resend_webhook_id = NULL, resend_webhook_secret = ? WHERE id = 1", [secret.trim()]);
+  await sunset.markTrackingOn();
   return c.json({ ok: true, tracking: await trackingState(c) });
 });
 
@@ -1967,6 +2111,68 @@ app.get("/api/mails/:id/stats", async (c) => {
   );
   const stats = Object.fromEntries(Object.entries(r ?? {}).map(([k, v]) => [k, Number(v ?? 0)]));
   return c.json({ ...stats, tracking: (await trackingState(c)).enabled });
+});
+
+// ── Sunset: ask inactive subscribers, then let them go ──────────────
+// See src/server/sunset.ts and ~/wiki/OpenNewsletter/sunset-inactive.md.
+
+function sunsetDays(raw: unknown): number {
+  const n = Math.round(Number(raw));
+  return Number.isFinite(n) && n >= 30 && n <= 365 ? n : sunset.INACTIVE_DAYS;
+}
+
+app.get("/api/audiences/:id/inactive", async (c) => {
+  const id = c.req.param("id");
+  if (!(await contacts.listAudiences()).some((a) => a.id === id)) return c.json({ error: "Audience not found" }, 404);
+  const trackingOn = !!(await webhookSecret(c)).secret;
+  const summary = await sunset.inactiveSummary(id, trackingOn, sunsetDays(c.req.query("days")));
+  return c.json({ ...summary, min_received: sunset.MIN_RECEIVED, grace_days: sunset.GRACE_DAYS });
+});
+
+/** Write the ask as a draft issue. It is edited, tested and sent like any other. */
+app.post("/api/audiences/:id/ask-inactive", async (c) => {
+  const id = c.req.param("id");
+  if (!(await contacts.listAudiences()).some((a) => a.id === id)) return c.json({ error: "Audience not found" }, 404);
+  const { days: rawDays } = await c.req.json<{ days?: number }>().catch(() => ({}) as { days?: number });
+  const days = sunsetDays(rawDays);
+  const blocked = await sunset.blockedReason(!!(await webhookSecret(c)).secret, days);
+  if (blocked) return c.json({ error: blocked }, 400);
+
+  const s = await getSettings();
+  const pub = s.publication_name || "this newsletter";
+  const slug = "classic-editorial";
+  const t = await get<any>("SELECT * FROM templates WHERE slug = ?", [slug]);
+  const title = `Do you still want ${pub}?`;
+  const blocks: Block[] = [
+    titleBlock(title),
+    ...markdownToBlocks(
+      `Hi {{first_name|there}},\n\n` +
+        `We'd rather write to people who read us than fill an inbox that doesn't want us. ` +
+        `If you'd like to keep getting ${pub}, press the button below.\n\n` +
+        `If you don't, there's nothing to do: we'll stop sending in ${sunset.GRACE_DAYS} days. ` +
+        `You can always sign up again.`,
+    ),
+  ];
+  const m = mailFromSkeleton({ blocks, title }, s.publication_name || "");
+  const row = await get<any>(
+    `INSERT INTO mails (eyebrow, title, subtitle, byline_name, byline_date, feature_image, blocks, template_slug, audience_id,
+                        segment, segment_days)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'inactive', ?) RETURNING *`,
+    [m.eyebrow, title, m.subtitle, m.byline_name, m.byline_date, m.feature_image, JSON.stringify(m.blocks), t ? slug : null, id, days],
+  );
+  return c.json(parseMail(row), 201);
+});
+
+// The keep link in an ask. A GET that changes state, on purpose: a scanner
+// following it only keeps someone one more round, while a second click would
+// lose real readers. Keyed by contact id (a UUID), like unsubscribe.
+app.get("/api/keep", async (c) => {
+  const id = c.req.query("c") || "";
+  const kept = id ? await sunset.keepSubscribed(id) : null;
+  const s = await getSettings();
+  const name = escapeHtml(s.publication_name || "this newsletter");
+  if (!kept) return c.html(page(`<h1>Link expired</h1><p>This link is no longer valid.</p>`), 400);
+  return c.html(page(`<h1>You're still subscribed</h1><p>Thanks. ${name} keeps coming to ${escapeHtml(kept.email)}.</p>`));
 });
 
 // ── unsubscribe (public, branded) ────────────────────────────────────
