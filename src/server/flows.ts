@@ -85,11 +85,15 @@ export interface Flow {
   updated_at: string;
 }
 
+export type StepStatus = "draft" | "live";
+
 export interface FlowStep {
   id: string;
   flow_id: string;
   kind: StepKind;
   config: string;
+  /** Email steps: a draft is skipped, never sent. */
+  status: StepStatus;
   next_step_id: string | null;
   deleted_at: string | null;
   forward_to_step_id: string | null;
@@ -146,13 +150,20 @@ export interface FlowDeps {
    * throw (propagates out of runWake, the HTTP handler answers non-2xx, and the
    * at-least-once queue redelivers the job). Both are safe: the stable key keeps
    * a recovered attempt from double-sending.
+   *
+   * `{ ok: false, skip: true }` means the email itself isn't ready (no subject,
+   * no content): retrying can't fix that, so the step is recorded `skipped`
+   * with the reason and the contact moves on. This is what makes adding an
+   * email to a live automation safe: the new email is born empty, and people
+   * reaching it pass it until it's written (Klaviyo skips a draft message the
+   * same way).
    */
   send: (input: {
     mailId: number;
     contactId: string;
     contact: MergeSnapshot;
     idempotencyKey: string;
-  }) => Promise<{ ok: true; id: string } | { ok: false; error: string }>;
+  }) => Promise<{ ok: true; id: string } | { ok: false; error: string; skip?: boolean }>;
 }
 
 // ── Pure helpers (no DB) ────────────────────────────────────────────────────
@@ -209,7 +220,7 @@ export async function getFlow(id: string): Promise<Flow | null> {
 
 export async function stepsOf(flowId: string): Promise<FlowStep[]> {
   return (await query(
-    `SELECT id, flow_id, kind, config, next_step_id, deleted_at, forward_to_step_id
+    `SELECT id, flow_id, kind, config, status, next_step_id, deleted_at, forward_to_step_id
        FROM flow_steps WHERE flow_id = ?`,
     [flowId],
   )) as unknown as FlowStep[];
@@ -268,6 +279,23 @@ export async function stepStats(flowId: string): Promise<Record<string, StepStat
   return out;
 }
 
+/** Whether anyone has ever entered this flow (the trigger's list is fixed from then on). */
+export async function hasEnrollments(flowId: string): Promise<boolean> {
+  return !!(await get(`SELECT 1 AS x FROM flow_enrollments WHERE flow_id = ? LIMIT 1`, [flowId]));
+}
+
+/** Point a `subscribed` flow at another list, keeping its other trigger settings. */
+export async function setTriggerAudience(flowId: string, audienceId: string): Promise<void> {
+  const flow = await getFlow(flowId);
+  if (!flow) return;
+  const trig = parseConfig<SubscribedTrigger>(flow.trigger_config) ?? {};
+  await run(`UPDATE flows SET trigger_config = ?, updated_at = ? WHERE id = ?`, [
+    JSON.stringify({ ...trig, audience_id: audienceId }),
+    now(),
+    flowId,
+  ]);
+}
+
 export async function renameFlow(flowId: string, name: string): Promise<void> {
   await run(`UPDATE flows SET name = ?, updated_at = ? WHERE id = ?`, [name, now(), flowId]);
 }
@@ -297,16 +325,17 @@ export async function createFlow(spec: {
   return (await getFlow(id))!;
 }
 
-export async function addStep(flowId: string, kind: StepKind, config: object = {}): Promise<FlowStep> {
+export async function addStep(flowId: string, kind: StepKind, config: object = {}, status: StepStatus = "live"): Promise<FlowStep> {
   const id = uid("step");
-  await run(`INSERT INTO flow_steps (id, flow_id, kind, config) VALUES (?, ?, ?, ?)`, [
+  await run(`INSERT INTO flow_steps (id, flow_id, kind, config, status) VALUES (?, ?, ?, ?, ?)`, [
     id,
     flowId,
     kind,
     JSON.stringify(config),
+    status,
   ]);
   return (await get(
-    `SELECT id, flow_id, kind, config, next_step_id, deleted_at, forward_to_step_id FROM flow_steps WHERE id = ?`,
+    `SELECT id, flow_id, kind, config, status, next_step_id, deleted_at, forward_to_step_id FROM flow_steps WHERE id = ?`,
     [id],
   )) as FlowStep;
 }
@@ -317,6 +346,11 @@ export async function setNext(stepId: string, nextStepId: string | null): Promis
 
 export async function setEntry(flowId: string, stepId: string): Promise<void> {
   await run(`UPDATE flows SET entry_step_id = ?, updated_at = ? WHERE id = ?`, [stepId, now(), flowId]);
+}
+
+/** Set an email step to draft (skipped) or live (sent). The caller checks the email is ready first. */
+export async function setStepStatus(stepId: string, status: StepStatus): Promise<void> {
+  await run(`UPDATE flow_steps SET status = ?, updated_at = ? WHERE id = ? AND kind = 'email'`, [status, now(), stepId]);
 }
 
 /** Edit a step's config. For a delay this changes only later arrivals; waiters keep their frozen `due_at`. */
@@ -345,6 +379,99 @@ export async function deleteStep(flowId: string, stepId: string): Promise<void> 
   await run(`UPDATE flow_steps SET next_step_id = ? WHERE flow_id = ? AND next_step_id = ?`, [forward, flowId, stepId]);
   // If this was the entry, move entry forward too.
   await run(`UPDATE flows SET entry_step_id = ? WHERE id = ? AND entry_step_id = ?`, [forward, flowId, stepId]);
+}
+
+/**
+ * Insert an email or a wait into the chain, after `afterStepId` (null = first,
+ * right after the trigger). Allowed on a live flow; the rule for people
+ * already in it is Klaviyo's (teardown §5): **nobody's send time moves, and a
+ * new email ahead of someone is one they get.**
+ *
+ * Because a delay is consumed on arrival, a waiter points at the step *after*
+ * its wait (`Q` below). An email inserted right before `Q` is ahead of them,
+ * so they are moved onto it, keeping `due_at` and `wake_seq`: their existing
+ * wake fires at the same moment and runs the new email, then `Q`. Waiters
+ * pointing at a deleted step that forwards to `Q` are the same people. Anyone
+ * who already attempted `Q` (a send retry parks on `Q` itself) has passed this
+ * point and stays put. A new *wait* moves nobody: it would push back a time
+ * already promised. Either way no wake is booked or bumped here, so this can't
+ * strand anyone; a wake in progress that reads the row before this write just
+ * carries on past the new step, which is the "already passed" case.
+ *
+ * An email added while the flow is live starts as a **draft**, which the engine
+ * skips: it is born blank, and being edited in place (autosaved as it's typed)
+ * it would otherwise go out half written to whoever reached it. The operator
+ * sets it live when it's done, as with Klaviyo's per-message status.
+ *
+ * The link is a compare-and-set read back with RETURNING (the storage binding
+ * reports no change counts): two inserts at the same point (a double click)
+ * would otherwise both point at the same next step, and the first new step
+ * would drop out of the chain. The loser's row is removed and it throws.
+ */
+export async function insertStep(
+  flowId: string,
+  afterStepId: string | null,
+  kind: "email" | "delay",
+  config: object,
+): Promise<FlowStep> {
+  const flow = await getFlow(flowId);
+  if (!flow) throw new Error("Flow not found.");
+  const steps = await stepsOf(flowId);
+  const byId = new Map(steps.map((s) => [s.id, s]));
+  let next: string | null;
+  if (afterStepId === null) {
+    next = resolveLiveStep(byId, flow.entry_step_id)?.id ?? null;
+  } else {
+    const after = byId.get(afterStepId);
+    if (!after || after.deleted_at || after.kind === "end") throw new Error("Can't add a step there.");
+    next = resolveLiveStep(byId, after.next_step_id)?.id ?? null;
+  }
+
+  const status: StepStatus = kind === "email" && flow.status === "live" ? "draft" : "live";
+  const step = await addStep(flowId, kind, config, status);
+  await setNext(step.id, next);
+  const linked =
+    afterStepId === null
+      ? await get(
+          `UPDATE flows SET entry_step_id = ?, updated_at = ? WHERE id = ? AND entry_step_id IS ? RETURNING id`,
+          [step.id, now(), flowId, flow.entry_step_id],
+        )
+      : await get(
+          `UPDATE flow_steps SET next_step_id = ?, updated_at = ? WHERE id = ? AND next_step_id IS ? RETURNING id`,
+          [step.id, now(), afterStepId, byId.get(afterStepId)!.next_step_id],
+        );
+  if (!linked) {
+    await run(`DELETE FROM flow_steps WHERE id = ?`, [step.id]); // never linked, so nothing points at it
+    throw new Error("This automation changed while you were editing it. Try again.");
+  }
+
+  if (kind === "email" && next) {
+    const targets = [next, ...steps.filter((s) => s.deleted_at && resolveLiveStep(byId, s.id)?.id === next).map((s) => s.id)];
+    await run(
+      `UPDATE flow_enrollments SET current_step_id = ?, updated_at = ?
+         WHERE flow_id = ? AND state = 'waiting'
+           AND current_step_id IN (SELECT value FROM json_each(?))
+           AND NOT EXISTS (SELECT 1 FROM flow_step_events ev
+                            WHERE ev.enrollment_id = flow_enrollments.id AND ev.step_id = ?)`,
+      [step.id, now(), flowId, JSON.stringify(targets), next],
+    );
+  }
+  return (await get(
+    `SELECT id, flow_id, kind, config, status, next_step_id, deleted_at, forward_to_step_id FROM flow_steps WHERE id = ?`,
+    [step.id],
+  )) as FlowStep;
+}
+
+/** Live email steps and the flow each belongs to, keyed by mail id. */
+export async function flowEmails(): Promise<Map<number, { id: string; name: string }>> {
+  const rows = (await query(
+    `SELECT json_extract(s.config, '$.mail_id') AS mail_id, f.id AS id, f.name AS name
+       FROM flow_steps s JOIN flows f ON f.id = s.flow_id
+      WHERE s.kind = 'email' AND s.deleted_at IS NULL`,
+  )) as unknown as { mail_id: number | null; id: string; name: string }[];
+  const out = new Map<number, { id: string; name: string }>();
+  for (const r of rows) if (r.mail_id != null) out.set(Number(r.mail_id), { id: r.id, name: r.name });
+  return out;
 }
 
 // ── Validation (what "turn on" refuses) ─────────────────────────────────────
@@ -376,12 +503,16 @@ export async function validateFlow(
   // must reach an End — a delay (or email) with nothing live after it would
   // strand waiters, so it's a turn-on error, never a silent exit.
   const seen = new Set<string>();
+  let emails = 0;
+  let drafts = 0;
   const walk = async (startId: string | null) => {
     let s = resolveLiveStep(byId, startId);
     while (s && !seen.has(s.id)) {
       seen.add(s.id);
       if (s.kind === "end") return;
-      if (s.kind === "email") {
+      if (s.kind === "email" && s.status === "draft") drafts++;
+      if (s.kind === "email" && s.status !== "draft") {
+        emails++;
         const cfg = parseConfig<EmailConfig>(s.config);
         const why = cfg?.mail_id ? await emailReady(cfg.mail_id) : "Email step has no newsletter attached.";
         if (why) issues.push({ step_id: s.id, message: why });
@@ -395,6 +526,9 @@ export async function validateFlow(
     }
   };
   if (entry) await walk(entry.id);
+  if (entry && emails === 0) {
+    issues.push({ message: drafts ? "Set an email live before turning this on." : "Add an email before turning this on." });
+  }
   return issues;
 }
 
@@ -598,14 +732,18 @@ export async function runWake(enrollmentId: string, wakeSeq: number, deps: FlowD
           return { acted: true, sent, state: "exited" };
         }
         const cfg = parseConfig<EmailConfig>(step.config);
-        if (cfg?.mail_id) {
+        if (step.status === "draft") {
+          await recordEvent(enr.id, step.id, "skipped", "Draft");
+        } else if (cfg?.mail_id) {
           // Prefer the contact's current name/email for the send; fall back to
           // the enrollment snapshot. Consent already confirmed above.
           const to: MergeSnapshot = { first_name: contact.first_name, last_name: contact.last_name, email: contact.email || merge.email };
           // One stable key across every attempt at this step, so a retry after
           // a lost response dedupes at the provider instead of mailing twice.
           const res = await deps.send({ mailId: cfg.mail_id, contactId: enr.contact_id, contact: to, idempotencyKey: `flow-${enr.id}-${step.id}` });
-          if (!res.ok) {
+          if (!res.ok && res.skip) {
+            await recordEvent(enr.id, step.id, "skipped", res.error.slice(0, 300));
+          } else if (!res.ok) {
             // A send that failed is not skipped forward (that silently loses an
             // email on a transient blip): re-park on THIS step and retry with
             // backoff, up to a cap, then give up and record 'failed'. The same
@@ -753,6 +891,7 @@ export const FLOWS_DDL = [
     flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN ('email','delay','split','end')),
     config TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'live' CHECK (status IN ('draft','live')),
     next_step_id TEXT,
     deleted_at TEXT,
     forward_to_step_id TEXT,
@@ -776,6 +915,7 @@ export const FLOWS_DDL = [
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_enroll_active ON flow_enrollments(flow_id, contact_id) WHERE state = 'waiting'`,
   `CREATE INDEX IF NOT EXISTS idx_enroll_due ON flow_enrollments(state, due_at)`,
   `CREATE INDEX IF NOT EXISTS idx_enroll_step ON flow_enrollments(current_step_id, state)`,
+  `CREATE INDEX IF NOT EXISTS idx_enroll_flow ON flow_enrollments(flow_id, state)`,
   `CREATE TABLE IF NOT EXISTS flow_step_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     enrollment_id TEXT NOT NULL REFERENCES flow_enrollments(id) ON DELETE CASCADE,
@@ -785,4 +925,10 @@ export const FLOWS_DDL = [
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_step_sent_once ON flow_step_events(enrollment_id, step_id) WHERE outcome = 'sent'`,
+  `CREATE INDEX IF NOT EXISTS idx_step_events ON flow_step_events(enrollment_id, step_id)`,
+];
+
+/** Columns added after the tables first shipped; run through addColumns, after FLOWS_DDL. */
+export const FLOWS_COLUMNS = [
+  `ALTER TABLE flow_steps ADD COLUMN status TEXT NOT NULL DEFAULT 'live' CHECK (status IN ('draft','live'))`,
 ];

@@ -100,6 +100,12 @@ export interface Mail {
   /** Inactive means no open or click for this many days. */
   segment_days?: number | null;
   status: "draft" | "scheduled" | "sending" | "sent" | "failed";
+  /**
+   * The automation whose step sends this mail, one person at a time. Such a
+   * mail is never an issue: it stays out of the mail list and can't be sent
+   * or scheduled to a list (the server refuses). Set by the server on reads.
+   */
+  flow?: { id: string; name: string } | null;
   /** Why the last send stopped, when it did (status "failed"). Resending resumes it. */
   send_error?: string | null;
   /** Resend broadcast id once created. */

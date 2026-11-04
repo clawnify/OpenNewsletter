@@ -41,12 +41,16 @@ function Shell() {
   const { loading, error, setError, status } = useStore();
   const [view, setView] = useState<View>(() => viewFromPath(window.location.pathname));
   const [editing, setEditing] = useState<number | null>(null);
+  // Bumped on every sidebar click, so clicking the view you're in starts it
+  // over (Automations back to its list from an open automation).
+  const [navSeq, setNavSeq] = useState(0);
 
   const navigate = useCallback((v: View) => {
     const href = NAV.find((n) => n.view === v)?.href ?? "/";
     if (window.location.pathname !== href) window.history.pushState(null, "", href);
     setView(v);
     setEditing(null);
+    setNavSeq((n) => n + 1);
   }, []);
 
   useEffect(() => {
@@ -101,7 +105,7 @@ function Shell() {
         ) : view === "mail" ? (
           <MailsView openMail={setEditing} />
         ) : view === "automations" ? (
-          <FlowsView openMail={setEditing} />
+          <FlowsView key={navSeq} openMail={setEditing} />
         ) : view === "templates" ? (
           <TemplatesView openMail={setEditing} />
         ) : view === "audience" ? (
