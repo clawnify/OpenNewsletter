@@ -1610,7 +1610,7 @@ async function sendMailNow(
     settings: s,
     from,
     origin: new URL(c.req.url).origin,
-    renderer: 2,
+    renderer: 3,
   }, scheduledFor);
   if (!begun.ok) {
     return begun.reason === "already-sent"
