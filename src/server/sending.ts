@@ -46,6 +46,7 @@
  */
 import { query, get, run } from "./db";
 import { renderEmailHtml } from "./render";
+import { INACTIVE_DAYS, INACTIVE_IDS, MIN_RECEIVED } from "./sunset";
 import { fillSubject, type MergeValues } from "../shared/merge";
 import type { BatchMessage, BatchOutcome, EmailProvider } from "./providers";
 import type { DesignTokens } from "../shared/design";
@@ -99,6 +100,7 @@ export const DELIVERIES_DDL = [
   `CREATE INDEX IF NOT EXISTS idx_deliveries_batch ON deliveries(mail_id, status, batch)`,
   `CREATE INDEX IF NOT EXISTS idx_deliveries_provider ON deliveries(provider_message_id)
      WHERE provider_message_id IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_deliveries_contact ON deliveries(contact_id, sent_at)`,
 ];
 
 /** Everything a send needs, frozen at the moment it starts. */
@@ -232,16 +234,31 @@ export async function beginSend(
  * statement guarded by NOT EXISTS, so two concurrent starts can't both write
  * (a count-then-insert could, and a late subscriber could then land in a batch
  * that was already claimed).
+ *
+ * An ask to inactive subscribers (`segment = 'inactive'`) goes only to the ones
+ * inactive at this moment (src/server/sunset.ts). The send route's precheck
+ * stores `tracking_since` first; while it is NULL, SQLite's MAX() is NULL and
+ * nobody qualifies.
  */
-async function writeRecipients(mailId: number, audienceId: string): Promise<void> {
+async function writeRecipients(mailId: number, audienceId: string, nowMs = Date.now()): Promise<void> {
+  const m = await get<{ segment: string | null; segment_days: number | null }>(
+    `SELECT segment, segment_days FROM mails WHERE id = ?`,
+    [mailId],
+  );
+  const inactive = m?.segment === "inactive";
+  const since = inactive
+    ? (await get<{ tracking_since: string | null }>(`SELECT tracking_since FROM settings WHERE id = 1`))?.tracking_since ?? null
+    : null;
+  const cutoff = new Date(nowMs - (m?.segment_days || INACTIVE_DAYS) * 24 * 3600_000).toISOString();
   await run(
     `INSERT OR IGNORE INTO deliveries (id, mail_id, contact_id, email, first_name, last_name, batch)
      SELECT 'dlv_' || lower(hex(randomblob(16))), ?, id, email, first_name, last_name,
             CAST((ROW_NUMBER() OVER (ORDER BY created_at, id) - 1) / ? AS INTEGER)
        FROM contacts
       WHERE audience_id = ? AND status = 'subscribed'
-        AND NOT EXISTS (SELECT 1 FROM deliveries WHERE mail_id = ?)`,
-    [mailId, BATCH_SIZE, audienceId, mailId],
+        AND NOT EXISTS (SELECT 1 FROM deliveries WHERE mail_id = ?)
+        ${inactive ? `AND id IN (${INACTIVE_IDS})` : ""}`,
+    [mailId, BATCH_SIZE, audienceId, mailId, ...(inactive ? [since, audienceId, cutoff, MIN_RECEIVED] : [])],
   );
 }
 
@@ -501,8 +518,11 @@ function renderFor(snap: SendSnapshot, r: ClaimedRow): BatchMessage {
   const merge: MergeValues | undefined = v2
     ? { first_name: r.first_name ?? "", last_name: r.last_name ?? "", email: r.email }
     : undefined;
+  // Only an ask to inactive subscribers carries one; the renderer adds the button.
+  const keepUrl = snap.mail.segment === "inactive" ? `${snap.origin}/api/keep?c=${r.contact_id}` : undefined;
   const html = renderEmailHtml(snap.mail as Mail, snap.design, snap.settings, {
     unsubscribeUrl,
+    keepUrl,
     mobile: snap.mail.design_mobile,
     merge,
     legacyColumns: !v2,

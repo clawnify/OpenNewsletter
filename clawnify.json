@@ -39,6 +39,12 @@
         ]
       },
       {
+        "path": "/api/keep",
+        "methods": [
+          "GET"
+        ]
+      },
+      {
         "path": "/widget.js",
         "methods": [
           "GET"

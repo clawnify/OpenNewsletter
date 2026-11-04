@@ -11,7 +11,7 @@
 import { fontStack, applyMobile, type DesignTokens } from "../shared/design";
 import { fillTags, type MergeValues } from "../shared/merge";
 import { esc, renderBlock } from "../shared/email-blocks";
-import type { Mail, Settings } from "../shared/types";
+import type { Block, Mail, Settings } from "../shared/types";
 
 export interface RenderOpts {
   forEmail?: boolean;
@@ -23,6 +23,13 @@ export interface RenderOpts {
    * Omitted for previews and test sends, which fall back to a dead link.
    */
   unsubscribeUrl?: string;
+  /**
+   * This subscriber's keep link, for an ask to inactive subscribers
+   * (`mail.segment === 'inactive'`, src/server/sunset.ts). Such a mail always
+   * shows the button, like the unsubscribe link: nobody may be removed without
+   * a way to stay. Previews and test sends get a dead link.
+   */
+  keepUrl?: string;
   /**
    * This subscriber's merge-tag values. Omitted, tags render as written:
    * a send whose snapshot predates merge tags must render byte for byte as it
@@ -43,6 +50,12 @@ export function renderInner(mail: Mail, d: DesignTokens, settings: Settings, opt
     rows.push(`<tr><td style="padding:0 0 ${space}px;"><img src="${esc(logo)}" alt="${esc(settings.publication_name)}" height="28" style="height:28px;width:auto;display:block;border:0;"></td></tr>`);
   }
   for (const b of mail.blocks || []) rows.push(`<tr><td style="padding:${space}px 0 0;">${renderBlock(b, d, opts.merge, opts.legacyColumns)}</td></tr>`);
+
+  // No renderer version bump: only ask mails, which no earlier snapshot holds, change.
+  if (mail.segment === "inactive") {
+    const keep: Block = { id: "keep", type: "button", text: "Yes, keep me subscribed", href: opts.keepUrl || "#", align: "center", fullWidth: true };
+    rows.push(`<tr><td style="padding:${space * 2}px 0 0;">${renderBlock(keep, d)}</td></tr>`);
+  }
 
   if (d.options.showFooter) {
     // Was `{{{RESEND_UNSUBSCRIBE_URL}}}`, a Resend-Broadcasts-only variable —
