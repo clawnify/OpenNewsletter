@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Plus, Trash2, RefreshCw, Database, Send, FileUp, Download, Search, MailQuestion } from "lucide-react";
+import { useHostChanges } from "@clawnify/app/client";
 import { api } from "../api";
 import { useStore } from "../store";
 import type { InactiveSummary, Mail, ResendAudience, ResendContact } from "../../shared/types";
@@ -52,6 +53,7 @@ export function AudienceView({ openMail }: { openMail: (id: number) => void }) {
   useEffect(() => {
     if (selected) load(selected);
   }, [selected, statusFilter]);
+  useHostChanges(() => { if (selected) load(selected); }); // the Clawnify chat changed contacts
 
   const current = audiences.find((a: ResendAudience) => a.id === selected);
 

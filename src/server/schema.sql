@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS settings (
   -- activates anything on its own; the operator chooses one in Settings before
   -- any CRM read happens. Falls back to the CRM_APP_ID env var (bundle installs).
   crm_app_id TEXT,
+  -- What issues are grounded on, JSON [{kind:"github", repo:"owner/name"}].
+  -- Every source here is always included by both assistants (src/server/sources.ts).
+  sources TEXT NOT NULL DEFAULT '[]',
   -- When delivery tracking was turned on: engagement data starts here, so
   -- nobody can look inactive for longer than tracking has been watching.
   tracking_since TEXT,

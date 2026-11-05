@@ -1,19 +1,22 @@
 import { useEffect, useState } from "react";
-import { CheckCircle2, XCircle, Trash2, AppWindow } from "lucide-react";
+import { CheckCircle2, XCircle, Trash2, AppWindow, Plus } from "lucide-react";
+import { embedded } from "@clawnify/app/client";
 import { useStore } from "../store";
 import { api } from "../api";
-import type { Settings, Sender, ConnectedApp } from "../../shared/types";
+import type { Settings, Sender, ConnectedApp, Source } from "../../shared/types";
 import { sendableStatus } from "../../shared/sending-domain";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 
 export function SettingsView() {
   const { settings, status, saveSettings, refreshStatus, setError } = useStore();
   const [form, setForm] = useState<Settings>(
-    settings || { publication_name: "", logo: "", from_name: "", from_email: "", senders: [], default_audience_id: null, footer_text: "", crm_app_id: null },
+    settings || { publication_name: "", logo: "", from_name: "", from_email: "", senders: [], default_audience_id: null, footer_text: "", crm_app_id: null, sources: [] },
   );
   const [savedAt, setSavedAt] = useState(false);
   const [domains, setDomains] = useState<{ name: string; status: string }[]>([]);
@@ -25,7 +28,10 @@ export function SettingsView() {
 
   const save = async () => {
     try {
-      await saveSettings(form);
+      // Sources save on their own (SourcesSection); the copy in this form is
+      // from when the page opened and would undo a source added since.
+      const { sources: _sources, ...rest } = form;
+      await saveSettings(rest);
       setSavedAt(true);
       setTimeout(() => setSavedAt(false), 1500);
     } catch (e) {
@@ -72,17 +78,23 @@ export function SettingsView() {
       <section className="mt-6 space-y-2 rounded-md bg-card p-5 shadow-edge">
         <h2 className="text-sm font-semibold">Connections</h2>
         <Status ok={!!status?.resend_connected} label="Resend" detail={status?.resend_connected ? "Connected" : "Connect Resend in your Clawnify dashboard (Settings → Integrations), or set RESEND_API_KEY"} />
-        <Status ok={!!status?.ai_available} label="AI generation (OpenRouter)" detail={status?.ai_available ? "Ready" : "Set OPENROUTER_API_KEY to enable Generate"} />
+        {/* Inside Clawnify the sidebar chat is the assistant, on the workspace's
+            own model: this app's key matters only when it runs elsewhere. */}
+        {!embedded ? (
+          <Status ok={!!status?.ai_available} label="Assistant (OpenRouter)" detail={status?.ai_available ? "Ready" : "Set OPENROUTER_API_KEY to use the assistant"} />
+        ) : null}
         <Status
           ok={!!status?.github_connected}
-          label="GitHub (Hints)"
+          label="GitHub (Sources)"
           detail={
             status?.github_connected
-              ? "Connected — your repos appear when adding a hint"
-              : "Set GITHUB_TOKEN in your Clawnify environment (Contents: read) to list private repos. Public repos work without it."
+              ? "Connected: your repos are listed when adding a source"
+              : "Set GITHUB_TOKEN (Contents: read) to use private repos. Public repos work without it."
           }
         />
       </section>
+
+      <SourcesSection />
 
       <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
         <h2 className="text-sm font-semibold">Connected apps</h2>
@@ -310,6 +322,81 @@ function TrackingSection() {
             <Button size="sm" disabled={!secret.trim()} onClick={saveSecret}>Save</Button>
           </div>
         </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * Sources: what issues are grounded on. Every source here is always included,
+ * by the sidebar chat in Clawnify and by the in-app assistant elsewhere, so
+ * there is no per-chat picker to remember. Applies on change, like a switch.
+ */
+function SourcesSection() {
+  const { settings, saveSettings, setError } = useStore();
+  const sources = settings?.sources ?? [];
+  const [open, setOpen] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [repos, setRepos] = useState<string[]>([]);
+  useEffect(() => {
+    api<{ repos: { full_name: string }[] }>("GET", "/api/github/repos").then((d) => setRepos(d.repos.map((r) => r.full_name))).catch(() => {});
+  }, []);
+
+  const save = async (next: Source[]) => {
+    try { await saveSettings({ sources: next }); } catch (e) { setError((e as Error).message); }
+  };
+  const slug = typed.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "");
+  const has = (repo: string) => sources.some((src) => src.repo.toLowerCase() === repo.toLowerCase());
+  const add = (repo: string) => {
+    setOpen(false);
+    setTyped("");
+    if (!has(repo)) void save([...sources, { kind: "github", repo }]);
+  };
+
+  return (
+    <section className="mt-6 space-y-3 rounded-md bg-card p-5 shadow-edge">
+      <div className="flex items-center gap-3">
+        <h2 className="text-sm font-semibold">Sources</h2>
+        <Popover open={open} onOpenChange={setOpen}>
+          <PopoverTrigger asChild>
+            <Button size="sm" variant="outline" className="ml-auto" disabled={sources.length >= 10}><Plus size={14} /> Add a GitHub repo</Button>
+          </PopoverTrigger>
+          <PopoverContent align="end" className="w-80 p-0">
+            <Command>
+              <CommandInput placeholder="owner/name" value={typed} onValueChange={setTyped} />
+              <CommandList>
+                <CommandEmpty>{/^[\w.-]+\/[\w.-]+$/.test(slug) ? null : "Type a repo as owner/name."}</CommandEmpty>
+                {/^[\w.-]+\/[\w.-]+$/.test(slug) && !repos.includes(slug) && !has(slug) ? (
+                  <CommandGroup>
+                    <CommandItem value={`add ${slug}`} onSelect={() => add(slug)}>Add {slug}</CommandItem>
+                  </CommandGroup>
+                ) : null}
+                {repos.length ? (
+                  <CommandGroup heading="Your repos">
+                    {repos.filter((r) => !has(r)).map((r) => (
+                      <CommandItem key={r} value={r} onSelect={() => add(r)}>{r}</CommandItem>
+                    ))}
+                  </CommandGroup>
+                ) : null}
+              </CommandList>
+            </Command>
+          </PopoverContent>
+        </Popover>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Issues are grounded on these. Their recent commits go into every draft, from the {embedded ? "sidebar chat" : "assistant"}, and specific changes can be searched. Every source here is always included.
+      </p>
+      {sources.length ? (
+        <ul className="space-y-1.5">
+          {sources.map((src) => (
+            <li key={src.repo} className="flex items-center gap-3 rounded-sm px-3 py-2 shadow-edge">
+              <span className="min-w-0 flex-1 truncate text-sm">{src.repo}</span>
+              <Button variant="ghost" size="icon" className="size-7" aria-label={`Remove ${src.repo}`} onClick={() => save(sources.filter((x) => x.repo !== src.repo))}>
+                <Trash2 size={14} />
+              </Button>
+            </li>
+          ))}
+        </ul>
       ) : null}
     </section>
   );

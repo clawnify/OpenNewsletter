@@ -3,7 +3,7 @@ import {
   Zap, Mail, Clock, Plus, Play, Pause, Archive, Pencil, AlertTriangle,
   ChevronLeft, MoreVertical, Flag, Check, Trash2, Sparkles, Info,
 } from "lucide-react";
-import { reportLocation } from "@clawnify/app/client";
+import { reportLocation, useHostChanges } from "@clawnify/app/client";
 import { api } from "../api";
 import { useStore } from "../store";
 import { Button } from "@/components/ui/button";
@@ -103,6 +103,7 @@ function FlowsList({ onOpen }: { onOpen: (id: string) => void }) {
     catch (e) { setError((e as Error).message); }
   }, [setError]);
   useEffect(() => { void load(); }, [load]);
+  useHostChanges(() => { void load(); }); // the Clawnify chat changed something
 
   const create = async (prebuilt: Prebuilt, audienceId: string) => {
     const flow = await api<Flow>("POST", "/api/flows", { prebuilt, audience_id: audienceId || undefined });
@@ -290,6 +291,7 @@ function FlowDetailView({ id, onBack, openMail }: { id: string; onBack: () => vo
     catch (e) { setError((e as Error).message); }
   }, [id, setError]);
   useEffect(() => { void load(); }, [load]);
+  useHostChanges(() => { void load(); }); // the Clawnify chat changed something
 
   const setStatus = async (status: FlowStatus) => {
     setBusy(true);
