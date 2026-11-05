@@ -6,6 +6,7 @@ import { baseDesign, effectiveDesign } from "../lib/design";
 import { diffTokens, withDefaults, type DesignTokens } from "../../shared/design";
 import { newBlock } from "../../shared/blocks";
 import { applyMailOp, designSummary, mailOutline } from "../../shared/mail-ops";
+import { contentPatch, mergeMail } from "../../shared/mail-merge";
 import type { Block, BlockType, Mail } from "../../shared/types";
 import { SAMPLE_VALUES, fillBlocksText } from "../../shared/merge";
 import { Preview, type EditHandlers } from "./preview";
@@ -42,8 +43,11 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   const live = useRef({ mail, history, future });
   live.current = { mail, history, future };
 
+  // The last copy the server confirmed: the base this editor's unsaved edits
+  // are measured against, and the rev every save names.
+  const savedRef = useRef<Mail | null>(mail);
   useEffect(() => {
-    if (!mail) api<Mail>("GET", `/api/mails/${mailId}`).then(setMail).catch((e) => store.setError((e as Error).message));
+    if (!mail) api<Mail>("GET", `/api/mails/${mailId}`).then((m) => { savedRef.current = m; setMail(m); }).catch((e) => store.setError((e as Error).message));
   }, [mailId]);
 
   const base = useMemo(() => (mail ? baseDesign(mail, store.templates) : withDefaults(null)), [mail, store.templates]);
@@ -53,20 +57,53 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   // Edits inside one debounce window are merged: saving only the last patch
   // dropped an earlier edit to another field (preview text, then a block).
   const pending = useRef<Partial<Mail>>({});
-  const queueSave = (next: Mail, patch: Partial<Mail>) => {
+  const inFlight = useRef<Promise<void> | null>(null);
+  const queueSave = (_next: Mail, patch: Partial<Mail>) => {
     setSaved(false);
     pending.current = { ...pending.current, ...patch };
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(async () => {
-      const merged = pending.current;
-      pending.current = {};
+    timer.current = setTimeout(flush, 500);
+  };
+  // Every save names the rev it started from. If someone else (the Clawnify
+  // chat) saved in between, the server refuses it (409) with its copy, and the
+  // edits merge into that copy and save again, instead of erasing its change.
+  const flush = () => {
+    timer.current = null;
+    const patch = pending.current;
+    pending.current = {};
+    if (!Object.keys(patch).length) return;
+    const run: Promise<void> = (async () => {
       try {
-        await store.saveMail(next.id, merged);
-        setSaved(true);
+        savedRef.current = await store.saveMail(mailId, { ...patch, rev: savedRef.current?.rev });
+        if (!timer.current) setSaved(true);
       } catch (e) {
-        store.setError((e as Error).message);
+        const err = e as Error & { status?: number; data?: { mail?: Mail } };
+        if (err.status === 409 && err.data?.mail) reconcile(err.data.mail);
+        else store.setError(err.message);
       }
-    }, 500);
+    })();
+    inFlight.current = run;
+    void run.finally(() => { if (inFlight.current === run) inFlight.current = null; });
+  };
+  /**
+   * Take in a newer copy from the server, keeping this editor's unsaved edits
+   * (src/shared/mail-merge.ts): its edits win on what they touched, the rest
+   * and the send state come from the server. A visible change from the other
+   * writer goes on the undo stack, so Undo takes it back.
+   */
+  const reconcile = (remote: Mail) => {
+    const cur = live.current.mail;
+    const base = savedRef.current;
+    savedRef.current = remote;
+    if (!cur || !base) { live.current.mail = remote; setMail(remote); return; }
+    const merged = mergeMail(base, cur, remote);
+    const shown = (m: Mail) => JSON.stringify([m.blocks, m.preheader, m.eyebrow, m.subtitle, m.design, m.design_mobile]);
+    if (shown(merged) !== shown(cur)) record(cur);
+    live.current.mail = merged;
+    setMail(merged);
+    const left = contentPatch(remote, merged);
+    pending.current = left; // what this editor still has to save, measured against the new copy
+    if (Object.keys(left).length) queueSave(merged, {});
   };
   /** Snapshot the current mail onto the undo stack and clear redo. */
   const record = (cur: Mail) => {
@@ -163,18 +200,17 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   // POST /api/mails/:id/edit; when it writes, refetch and put its edit on the
   // undo stack, so the user's Undo takes back what the chat did. Edits typed
   // in the last moment and not yet saved stay on top of the fresh copy.
-  useHostChanges(() => {
-    api<Mail>("GET", `/api/mails/${mailId}`).then((fresh) => {
-      const cur = live.current.mail;
-      const content = (m: Mail) => JSON.stringify([m.title, m.preheader, m.blocks, m.design, m.design_mobile]);
-      if (cur && content(cur) === content(fresh)) return;
-      if (cur) record(cur);
-      const keep = pending.current;
-      const next = { ...fresh, ...keep };
-      live.current.mail = next;
-      setMail(next);
-      if (Object.keys(keep).length) queueSave(next, {});
-    }).catch(() => {});
+  const fetchSeq = useRef(0);
+  useHostChanges(async (paths) => {
+    // Only writes to this issue (the edit route, a send, a schedule) matter here.
+    const mine = new RegExp(`^/api/mails/${mailId}(/|\\?|$)`);
+    if (paths.length && !paths.some((p) => mine.test(p))) return;
+    const seq = ++fetchSeq.current;
+    await inFlight.current?.catch(() => {}); // a save in flight settles first (it may 409 and merge)
+    try {
+      const fresh = await api<Mail>("GET", `/api/mails/${mailId}`);
+      if (seq === fetchSeq.current) reconcile(fresh); // a later change's fetch wins over this one
+    } catch { /* the next change, or the next save's 409, catches up */ }
   });
   // What the chat is told is on screen. Ids only, never content: it reads the
   // issue itself through GET /api/mails/:id/context.

@@ -13,7 +13,7 @@
  */
 import { z } from "zod";
 import { markdownToBlocks, deriveTitle, blockId } from "./blocks";
-import { cleanTokens, diffTokens, type DesignTokens } from "./design";
+import { applyMobile, cleanTokens, diffTokens, type DesignTokens } from "./design";
 import type { Block, Mail } from "./types";
 
 const position = z.enum(["start", "end"]).default("end");
@@ -70,7 +70,7 @@ export function setDesignKey(base: DesignTokens, key: string, value: unknown): D
   return next as unknown as DesignTokens;
 }
 
-export type OpTarget = Pick<Mail, "blocks" | "title">;
+export type OpTarget = Pick<Mail, "blocks" | "title"> & { design_mobile?: Mail["design_mobile"] };
 export type OpResult = { ok: true; patch: Partial<Mail>; message: string } | { ok: false; message: string };
 
 /**
@@ -125,7 +125,9 @@ export function applyMailOp(
       const title = String(input.title || "");
       const h1 = blocks.findIndex((b) => b.type === "heading" && b.level === 1);
       const at = h1 >= 0 ? h1 : blocks.findIndex((b) => b.type === "heading");
-      if (at < 0) return { ok: true, patch: { title }, message: "Set the subject." };
+      // Without a heading the subject comes from the first paragraph, so a
+      // subject set on its own would be replaced by the next block save.
+      if (at < 0) return { ok: false, message: 'This issue has no heading, and its subject is its top heading. Add one first: add_block with "# Your subject" at position "start".' };
       return {
         ok: true,
         patch: { blocks: blocks.map((b, i) => (i === at ? ({ ...b, text: title } as Block) : b)), title },
@@ -133,7 +135,9 @@ export function applyMailOp(
       };
     }
     case "set_design": {
-      const next = setDesignKey(opts.base, String(input.key), input.value);
+      // On mobile the change joins the overrides already there, never replaces them.
+      const from = opts.device === "mobile" ? applyMobile(opts.base, mail.design_mobile) : opts.base;
+      const next = setDesignKey(from, String(input.key), input.value);
       if (!next) {
         return DESIGN_KEYS.has(String(input.key))
           ? { ok: false, message: `${JSON.stringify(input.value)} isn't a usable value for ${input.key}.` }

@@ -64,15 +64,19 @@ function Shell() {
 
   // Show whatever a path names: the browser's back/forward, and the Clawnify
   // chat opening a page (useHostNavigate), both arrive here.
-  const showPath = useCallback((path: string) => {
+  // `from` is the screen the user was on, when known: opening an issue from
+  // there makes it where Back returns; arriving any other way returns to Mail.
+  const showPath = useCallback((path: string, from?: string) => {
     const pathname = path.split(/[?#]/)[0];
+    if (editingFromPath(pathname) !== null) returnTo.current = from && editingFromPath(from) === null ? from : "/mail";
     setView(viewFromPath(pathname));
     setEditing(editingFromPath(pathname));
     setNavSeq((n) => n + 1); // screens that read the path (an open automation) read it again
   }, []);
   useHostNavigate((path) => {
-    if (window.location.pathname !== path) window.history.pushState(null, "", path);
-    showPath(path);
+    const from = window.location.pathname;
+    if (from !== path) window.history.pushState(null, "", path);
+    showPath(path, from);
   });
 
   useEffect(() => {
@@ -88,6 +92,7 @@ function Shell() {
   }, []);
   const closeMail = useCallback(() => {
     const to = returnTo.current.startsWith("/mail/") ? "/mail" : returnTo.current;
+    returnTo.current = "/mail";
     window.history.pushState(null, "", to);
     showPath(to);
   }, [showPath]);

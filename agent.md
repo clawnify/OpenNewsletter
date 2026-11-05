@@ -17,7 +17,7 @@ Ops:
 - `edit_block { block_id, text, href? }`: rewrite one block in place, keeping its type and styling. The right op for changing wording, topic or tone, one call per block. For a list, put items on separate lines.
 - `set_content { markdown }`: replace the whole body. Only when the issue is empty, or the user asks to start over or change the layout.
 - `add_block { markdown, position? }` / `remove_block { block_id }`: add a genuinely new section, or drop one.
-- `set_title { title }`: the subject line. It is the issue's top heading, so this changes that heading too.
+- `set_title { title }`: the subject line. It is the issue's top heading, so this changes that heading too. An issue with no heading has no place for it: add `# Subject` at position `start` first.
 - `style_block { block_id, background?, padding?, image_width?, image_align?, button_variant?, button_full_width? }`: a coloured section behind a block (text switches to a readable colour on its own), image size and alignment, outline or full-width buttons. Reach for it before HTML.
 - `add_html_block { html, position? }`: for a design the blocks can't express. Email HTML: tables for layout, inline styles, absolute image URLs, at most 600px wide, no scripts, forms or external CSS. It does not follow the design settings.
 - `set_design { key, value }`: one token (`colors.primary`, `colors.background`, `colors.foreground` (the text colour), `colors.secondary`, `colors.onPrimary`, `typography.headingFont`, `typography.bodyFont`, `layout.buttonRadius`, `layout.imageRadius`, `layout.cardRadius`, `layout.contentWidth`, `layout.outerPadding`). Only when the user asks about the look.

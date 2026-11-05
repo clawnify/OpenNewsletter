@@ -5,6 +5,9 @@ CREATE TABLE IF NOT EXISTS mails (
   title TEXT NOT NULL DEFAULT 'Untitled',
   -- Inbox preview line (preheader), rendered hidden as the body's first child.
   preheader TEXT NOT NULL DEFAULT '',
+  -- Bumped on every content write. A save that names the rev it started from
+  -- is refused when another writer (the Clawnify chat) got there first.
+  rev INTEGER NOT NULL DEFAULT 0,
   subtitle TEXT NOT NULL DEFAULT '',
   byline_name TEXT NOT NULL DEFAULT '',
   byline_date TEXT NOT NULL DEFAULT '',

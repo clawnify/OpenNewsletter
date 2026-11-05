@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import app from "./index";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
+import { clearActivityCache } from "./sources";
 
 declare const process: { getBuiltinModule(id: string): any };
 const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
@@ -31,7 +32,10 @@ beforeEach(() => {
       .run(t.slug, t.name, t.description, JSON.stringify(t.design), JSON.stringify(t.skeleton));
   }
 });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  clearActivityCache();
+});
 
 type Reply = { status: number; json(): Promise<any>; text(): Promise<string> };
 const call = async (method: string, path: string, body?: unknown): Promise<Reply> =>
@@ -105,6 +109,13 @@ describe("POST /api/mails/:id/edit", () => {
     expect(saved.blocks).toEqual((mail as any).blocks);
   });
 
+  it("an op name from Object's prototype is an unknown op, not a crash", async () => {
+    const mail = await newIssue();
+    for (const op of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      expect((await call("POST", `/api/mails/${mail.id}/edit`, { ops: [{ op, input: {} }] })).status).toBe(400);
+    }
+  });
+
   it("validates every op's input before applying any", async () => {
     const mail = await newIssue();
     const bad = await call("POST", `/api/mails/${mail.id}/edit`, { ops: [{ op: "style_block", input: { block_id: "x", padding: 500 } }] });
@@ -174,6 +185,41 @@ describe("sources", () => {
     const ok = await (await call("GET", "/api/sources/search?repo=acme/site&q=signup")).json();
     expect(ok.commits).toEqual(["Fix the signup form (2026-10-30)"]);
   });
+
+  it("search words can't add qualifiers that widen it past the source", async () => {
+    const fetchMock = fakeGitHub({});
+    await call("PUT", "/api/settings", { sources: [{ kind: "github", repo: "acme/site" }] });
+    await call("GET", `/api/sources/search?repo=acme/site&q=${encodeURIComponent("fix repo:acme/private-secrets org:acme")}`);
+    const url = decodeURIComponent(String(fetchMock.mock.calls.at(-1)![0]));
+    expect(url).toContain("q=repo:acme/site fix&");
+    expect(url).not.toContain("private-secrets");
+    expect((await call("GET", `/api/sources/search?repo=acme/site&q=${encodeURIComponent("repo:x/y")}`)).status).toBe(400);
+  });
+
+  it("recent activity is cached for a few minutes, so reads don't spend GitHub's hourly limit", async () => {
+    const fetchMock = fakeGitHub({ "acme/site": ["One"] });
+    await call("PUT", "/api/settings", { sources: [{ kind: "github", repo: "acme/site" }] });
+    await call("GET", "/api/sources");
+    await call("GET", "/api/sources");
+    expect(fetchMock.mock.calls.filter((c) => String(c[0]).includes("/commits?")).length).toBe(1);
+  });
+});
+
+describe("two writers on one issue", () => {
+  it("a save based on an older copy is refused with the current one, so it can merge instead of erase", async () => {
+    const mail = await newIssue();
+    const fresh = await (await call("GET", `/api/mails/${mail.id}`)).json();
+    // The chat edits the issue...
+    expect((await call("POST", `/api/mails/${mail.id}/edit`, { ops: [{ op: "set_title", input: { title: "From the chat" } }] })).status).toBe(200);
+    // ...then the editor saves from the copy it opened.
+    const stale = await call("PUT", `/api/mails/${mail.id}`, { preheader: "From the editor", rev: fresh.rev });
+    expect(stale.status).toBe(409);
+    const body = await stale.json();
+    expect(body.mail.title).toBe("From the chat");
+    expect((await call("PUT", `/api/mails/${mail.id}`, { preheader: "From the editor", rev: body.mail.rev })).status).toBe(200);
+    // A writer without a copy (no rev) still saves as before.
+    expect((await call("PUT", `/api/mails/${mail.id}`, { preheader: "Plain" })).status).toBe(200);
+  });
 });
 
 describe("GET /api/mails?summary=1", () => {
@@ -186,5 +232,6 @@ describe("GET /api/mails?summary=1", () => {
     const rest = await (await call("GET", "/api/mails?summary=1&limit=2&offset=2")).json();
     expect(rest.mails).toHaveLength(1);
     expect(rest.next_offset).toBeNull();
+    expect((await call("GET", "/api/mails?summary=1&limit=1.5&offset=0.5")).status).toBe(200);
   });
 });

@@ -48,20 +48,40 @@ function commitLines(items: Array<{ commit?: { message?: string; author?: { date
 
 export type SourceActivity = { kind: "github"; repo: string; recent_commits: string[]; error?: string };
 
+/**
+ * A week of commits changes slowly, and every context read and every step of
+ * the in-app assistant asks for it: without GITHUB_TOKEN, GitHub allows 60
+ * calls an hour per IP, shared with every other app on that Worker IP.
+ */
+const ACTIVITY_TTL_MS = 5 * 60_000;
+// shortcut: per-isolate memory, so a cold isolate refetches; KV if the 60/h limit still bites.
+const activityCache = new Map<string, { at: number; value: SourceActivity }>();
+
 /** Commit subjects from the last week in each source. A source GitHub refuses reports why instead of failing the rest. */
 export async function recentActivity(sources: Source[], token?: string): Promise<SourceActivity[]> {
   const since = new Date(Date.now() - RECENT_DAYS * 86_400_000).toISOString();
   return Promise.all(
     sources.map(async (s): Promise<SourceActivity> => {
+      const key = `${s.repo.toLowerCase()}|${token ? "t" : "-"}`;
+      const hit = activityCache.get(key);
+      if (hit && Date.now() - hit.at < ACTIVITY_TTL_MS) return hit.value;
+      let value: SourceActivity;
       try {
         const r = await fetch(`https://api.github.com/repos/${s.repo}/commits?per_page=40&since=${since}`, { headers: ghHeaders(token) });
         if (!r.ok) return { ...s, recent_commits: [], error: `GitHub answered ${r.status}${r.status === 404 && !token ? " (a private repo needs GITHUB_TOKEN)" : ""}` };
-        return { ...s, recent_commits: commitLines((await r.json()) as Parameters<typeof commitLines>[0]) };
+        value = { ...s, recent_commits: commitLines((await r.json()) as Parameters<typeof commitLines>[0]) };
       } catch {
         return { ...s, recent_commits: [], error: "GitHub could not be reached" };
       }
+      activityCache.set(key, { at: Date.now(), value }); // failures aren't cached: the next read retries
+      return value;
     }),
   );
+}
+
+/** Test seam: forget cached activity. */
+export function clearActivityCache(): void {
+  activityCache.clear();
 }
 
 /** The activity as prompt text, for the in-app assistant. Empty when nothing happened. */
@@ -74,8 +94,16 @@ export function activityText(activity: SourceActivity[]): string {
 }
 
 /** Search commit messages in one source. */
-export async function searchCommits(repo: string, query: string, token?: string): Promise<{ ok: true; commits: string[] } | { ok: false; error: string }> {
-  const q = encodeURIComponent(`repo:${repo} ${query}`);
+export async function searchCommits(
+  repo: string,
+  query: string,
+  token?: string,
+): Promise<{ ok: true; commits: string[] } | { ok: false; error: string; badQuery?: true }> {
+  // Search qualifiers in the words (repo:, org:, user:…) would widen the
+  // search past the one source it was allowed for: GitHub ORs repeated repo:.
+  const words = query.split(/\s+/).filter((w) => w && !/^-?[a-z][\w-]*:/i.test(w)).join(" ");
+  if (!words) return { ok: false, badQuery: true, error: "Search for words in commit messages; qualifiers like repo: aren't allowed." };
+  const q = encodeURIComponent(`repo:${repo} ${words}`);
   try {
     const r = await fetch(`https://api.github.com/search/commits?q=${q}&per_page=20`, { headers: ghHeaders(token) });
     if (!r.ok) return { ok: false, error: `GitHub search failed (${r.status}).` };

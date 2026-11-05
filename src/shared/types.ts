@@ -100,6 +100,8 @@ export interface Mail {
   /** Inactive means no open or click for this many days. */
   segment_days?: number | null;
   status: "draft" | "scheduled" | "sending" | "sent" | "failed";
+  /** Bumped on every content write; a save naming an older one is refused (409). */
+  rev?: number;
   /**
    * The automation whose step sends this mail, one person at a time. Such a
    * mail is never an issue: it stays out of the mail list and can't be sent

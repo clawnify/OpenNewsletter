@@ -36,9 +36,15 @@ describe("applyMailOp", () => {
     expect(deriveTitle(r.patch.blocks!)).toBe("Shipped this week");
   });
 
-  it("set_title on an issue with no heading sets only the subject", () => {
+  it("set_title on an issue with no heading is refused, since nothing would keep that subject", () => {
     const r = applyMailOp({ blocks: [blocks[1]], title: "" }, "set_title", { title: "Hi" }, { base });
-    expect(r.ok && r.patch).toEqual({ title: "Hi" });
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain("no heading");
+  });
+
+  it("a mobile design change joins the mobile overrides already there", () => {
+    const r = applyMailOp({ ...mail, design_mobile: { typography: { baseSize: 15 } } as any }, "set_design", { key: "colors.primary", value: "#112233" }, { base, device: "mobile" });
+    expect(r.ok && r.patch.design_mobile).toEqual({ colors: { primary: "#112233" }, typography: { baseSize: 15 } });
   });
 
   it("set_content replaces the body and derives the subject from it", () => {

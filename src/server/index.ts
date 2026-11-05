@@ -93,6 +93,7 @@ async function ensureSeed() {
     `ALTER TABLE settings ADD COLUMN crm_enabled INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE settings ADD COLUMN crm_app_id TEXT`,
     `ALTER TABLE settings ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'`,
+    `ALTER TABLE mails ADD COLUMN rev INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE settings ADD COLUMN tracking_since TEXT`,
     `ALTER TABLE contacts ADD COLUMN last_engaged_at TEXT`,
     `ALTER TABLE contacts ADD COLUMN unsubscribe_reason TEXT`,
@@ -206,7 +207,7 @@ app.get("/api/sources/search", async (c) => {
     return c.json({ error: `"${repo}" is not one of the sources. Sources: ${sources.map((s) => s.repo).join(", ") || "none (add them in Settings)"}.` }, 400);
   }
   const r = await searchCommits(repo, q, c.env.GITHUB_TOKEN);
-  if (!r.ok) return c.json({ error: r.error }, 502);
+  if (!r.ok) return c.json({ error: r.error }, r.badQuery ? 400 : 502);
   return c.json({ repo, query: q, commits: r.commits });
 });
 
@@ -238,39 +239,50 @@ app.get("/api/mails/:id/context", async (c) => {
 });
 
 // Apply editing ops in order, all or nothing: one that fails saves none, so a
-// half-applied request never lands on someone's issue.
+// half-applied request never lands on someone's issue. The write is
+// conditional on the copy the ops were applied to: if the editor saved in
+// between, apply them again to the newer copy rather than overwrite it.
 app.post("/api/mails/:id/edit", async (c) => {
   const id = Number(c.req.param("id"));
-  const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
-  if (!row) return c.json({ error: "Not found" }, 404);
   const body = await c.req.json<{ ops?: unknown }>().catch(() => ({}) as { ops?: unknown });
   const ops = body.ops;
   if (!Array.isArray(ops) || ops.length === 0 || ops.length > 50) {
     return c.json({ error: `Send { "ops": [...] }, 1 to 50 of { "op", "input" }. Ops: ${OP_NAMES.join(", ")}.` }, 400);
   }
-  let mail = parseMail(row);
-  let base = await resolveDesign(mail);
-  const patch: Partial<Mail> = {};
-  const results: string[] = [];
+  // Validate every op before touching the issue.
+  const parsed: { name: OpName; input: Record<string, unknown> }[] = [];
   for (const [i, raw] of ops.entries()) {
     const name = String((raw as { op?: unknown })?.op ?? "");
     const at = `Op ${i + 1} (${name || "missing op"})`;
-    const schema = OP_INPUTS[name as OpName];
-    if (!schema) return c.json({ error: `${at}: unknown op. Ops: ${OP_NAMES.join(", ")}. Nothing was saved.` }, 400);
-    const parsed = schema.safeParse((raw as { input?: unknown }).input ?? {});
-    if (!parsed.success) {
-      return c.json({ error: `${at}: ${parsed.error.issues.map((x) => `${x.path.join(".") || "input"} ${x.message}`).join("; ")}. Nothing was saved.` }, 400);
+    if (!Object.hasOwn(OP_INPUTS, name)) return c.json({ error: `${at}: unknown op. Ops: ${OP_NAMES.join(", ")}. Nothing was saved.` }, 400);
+    const r = OP_INPUTS[name as OpName].safeParse((raw as { input?: unknown }).input ?? {});
+    if (!r.success) {
+      return c.json({ error: `${at}: ${r.error.issues.map((x) => `${x.path.join(".") || "input"} ${x.message}`).join("; ")}. Nothing was saved.` }, 400);
     }
-    const r = applyMailOp(mail, name, parsed.data as Record<string, unknown>, { base });
-    if (!r.ok) return c.json({ error: `${at}: ${r.message} Nothing was saved.` }, 400);
-    mail = { ...mail, ...r.patch };
-    Object.assign(patch, r.patch);
-    if (r.patch.design) base = withDefaults(r.patch.design); // the next design op builds on this one
-    results.push(r.message);
+    parsed.push({ name: name as OpName, input: r.data as Record<string, unknown> });
   }
-  await updateMail(id, patch);
-  const fresh = parseMail(await get<any>("SELECT * FROM mails WHERE id = ?", [id]));
-  return c.json({ ok: true, results, subject: fresh.title, outline: boundedOutline(fresh.blocks) });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
+    if (!row) return c.json({ error: "Not found" }, 404);
+    let mail = parseMail(row);
+    let base = await resolveDesign(mail);
+    const patch: Partial<Mail> = {};
+    const results: string[] = [];
+    for (const [i, op] of parsed.entries()) {
+      const r = applyMailOp(mail, op.name, op.input, { base });
+      if (!r.ok) return c.json({ error: `Op ${i + 1} (${op.name}): ${r.message} Nothing was saved.` }, 400);
+      mail = { ...mail, ...r.patch };
+      Object.assign(patch, r.patch);
+      if (r.patch.design) base = withDefaults(r.patch.design); // the next design op builds on this one
+      results.push(r.message);
+    }
+    const w = await updateMail(id, patch, Number(row.rev ?? 0));
+    if (w === "missing") return c.json({ error: "Not found" }, 404);
+    if (w === "conflict") continue;
+    const fresh = parseMail(await get<any>("SELECT * FROM mails WHERE id = ?", [id]));
+    return c.json({ ok: true, results, subject: fresh.title, outline: boundedOutline(fresh.blocks) });
+  }
+  return c.json({ error: "The issue kept changing while these edits were applied (someone is editing it). Nothing was saved; try again." }, 409);
 });
 
 // The assistant conversation is stored 1:1 with each mail so it reloads with
@@ -551,11 +563,12 @@ app.delete("/api/templates/:slug", async (c) => {
 app.get("/api/mails", async (c) => {
   // ?summary=1: one line per issue, newest first, a page at a time. The full
   // list carries every issue's blocks, which no agent should have to read.
+  // Ordered by id, which never changes, so pages don't shift while issues are edited.
   if (c.req.query("summary")) {
-    const limit = Math.min(Math.max(Number(c.req.query("limit")) || 30, 1), 100);
-    const offset = Math.max(Number(c.req.query("offset")) || 0, 0);
+    const limit = Math.min(Math.max(Math.floor(Number(c.req.query("limit"))) || 30, 1), 100);
+    const offset = Math.max(Math.floor(Number(c.req.query("offset"))) || 0, 0);
     const rows = await query<any>(
-      "SELECT id, title, status, scheduled_at, sent_at, updated_at FROM mails ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+      "SELECT id, title, status, scheduled_at, sent_at, updated_at FROM mails ORDER BY id DESC LIMIT ? OFFSET ?",
       [limit + 1, offset],
     );
     const owned = await flows.flowEmails();
@@ -600,12 +613,18 @@ app.post("/api/mails", async (c) => {
 /**
  * Write content fields of one mail: the editor's autosave and the edit route
  * both come through here, so the subject derivation, token cleaning and the
- * send-state rules below hold for every writer. Returns false when the mail
- * doesn't exist.
+ * send-state rules below hold for every writer.
+ *
+ * `expectedRev` makes the write conditional: two writers (the editor's
+ * autosave and the Clawnify chat) each send a whole block list, so the later
+ * one would silently erase the earlier one's change. With it, a write based on
+ * an older copy is refused as a conflict, and the writer merges and retries.
+ * Read back with RETURNING: the storage binding reports no change counts.
  */
-async function updateMail(id: number, b: Partial<Mail>): Promise<boolean> {
+async function updateMail(id: number, b: Partial<Mail>, expectedRev?: number): Promise<"ok" | "missing" | "conflict"> {
   const existing = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
-  if (!existing) return false;
+  if (!existing) return "missing";
+  if (expectedRev !== undefined && Number(existing.rev ?? 0) !== expectedRev) return "conflict";
   const fields: Record<string, unknown> = {
     eyebrow: b.eyebrow ?? existing.eyebrow,
     title: b.title ?? existing.title,
@@ -627,7 +646,7 @@ async function updateMail(id: number, b: Partial<Mail>): Promise<boolean> {
   // title is now just a display-heading block.
   if (b.blocks !== undefined) fields.title = deriveTitle(b.blocks);
 
-  await run(
+  const written = await get<{ rev: number }>(
     // Content only. `status` and `scheduled_at` belong to the send and schedule
     // routes, and a body carrying them is ignored: the editor's undo restores a
     // whole earlier copy of the mail, and writing its status back cancelled a
@@ -642,23 +661,31 @@ async function updateMail(id: number, b: Partial<Mail>): Promise<boolean> {
        design_mobile = CASE WHEN ? THEN ? ELSE design_mobile END,
        template_slug = CASE WHEN ? THEN ? ELSE template_slug END,
        audience_id=?,
-       updated_at=datetime('now') WHERE id=?`,
+       rev = rev + 1,
+       updated_at=datetime('now') WHERE id=? AND (? IS NULL OR rev = ?) RETURNING rev`,
     [
       fields.eyebrow, fields.title, fields.preheader, fields.subtitle, fields.byline_name, fields.byline_date,
       fields.feature_image, fields.blocks,
       b.design !== undefined ? 1 : 0, fields.design,
       b.design_mobile !== undefined ? 1 : 0, fields.design_mobile,
       b.template_slug != null ? 1 : 0, fields.template_slug,
-      fields.audience_id, id,
+      fields.audience_id, id, expectedRev ?? null, expectedRev ?? null,
     ],
   );
-  return true;
+  return written ? "ok" : "conflict";
 }
 
 app.put("/api/mails/:id", async (c) => {
   const id = Number(c.req.param("id"));
   const b = await c.req.json<Partial<Mail>>();
-  if (!(await updateMail(id, b))) return c.json({ error: "Not found" }, 404);
+  // `rev` is optional: only a writer that keeps a copy (the editor) sends it.
+  const expected = Number.isInteger(b.rev) ? (b.rev as number) : undefined;
+  const r = await updateMail(id, b, expected);
+  if (r === "missing") return c.json({ error: "Not found" }, 404);
+  if (r === "conflict") {
+    const cur = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
+    return c.json({ error: "This issue changed since you opened it.", mail: { ...parseMail(cur), flow: await flowOfMail(id) } }, 409);
+  }
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   return c.json({ ...parseMail(row), flow: await flowOfMail(id) });
 });
