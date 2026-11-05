@@ -8,5 +8,5 @@ RESEND_API_KEY=re_xxxxxxxxxxxxxxxxxxxx
 # Required for AI generation (https://openrouter.ai/keys)
 OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxxxxxx
 
-# Optional: override the generation model (default: anthropic/claude-sonnet-4)
-# NEWSLETTER_MODEL=anthropic/claude-sonnet-4
+# Optional: override the generation model (default: ~anthropic/claude-sonnet-latest, the newest Claude Sonnet)
+# NEWSLETTER_MODEL=anthropic/claude-sonnet-5.5

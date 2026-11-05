@@ -5,7 +5,7 @@
  * is overridable via NEWSLETTER_MODEL.
  */
 
-const DEFAULT_MODEL = "anthropic/claude-sonnet-4";
+const DEFAULT_MODEL = "~anthropic/claude-sonnet-latest";
 
 export interface GenInput {
   prompt: string;

@@ -127,7 +127,7 @@ cp .dev.vars.example .dev.vars
 ```
 RESEND_API_KEY=re_xxxxxxxx        # https://resend.com/api-keys
 OPENROUTER_API_KEY=sk-or-xxxxxxxx # https://openrouter.ai/keys
-# NEWSLETTER_MODEL=anthropic/claude-sonnet-4   (optional override)
+# NEWSLETTER_MODEL=anthropic/claude-sonnet-5.5   (optional override)
 ```
 
 Restart `pnpm dev` after editing `.dev.vars`.
