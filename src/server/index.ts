@@ -22,7 +22,10 @@ import { WebhookSetupError } from "./providers/types";
 import { BUILTIN_TEMPLATES } from "../shared/templates";
 import { DEFAULT_DESIGN, cleanTokens, withDefaults, type DesignTokens } from "../shared/design";
 import { markdownToBlocks, blocksToMarkdown, blockId, eyebrowBlock, titleBlock, deckBlock, bylineBlock, deriveTitle, mailFromSkeleton } from "../shared/blocks";
-import { streamNewsletterChat, buildHintsContext, type ChatContext, type Hint } from "./agent";
+import { streamNewsletterChat, type ChatContext } from "./agent";
+import { activityText, cleanSlug, cleanSources, recentActivity, searchCommits } from "./sources";
+import { OP_INPUTS, OP_NAMES, applyMailOp, designSummary, mailOutline, type OpName } from "../shared/mail-ops";
+import { mountDiscovery } from "@clawnify/app";
 import type { Block, Check, Mail, Settings, Template } from "../shared/types";
 
 type Env = {
@@ -89,6 +92,8 @@ async function ensureSeed() {
     `ALTER TABLE mails ADD COLUMN preheader TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE settings ADD COLUMN crm_enabled INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE settings ADD COLUMN crm_app_id TEXT`,
+    `ALTER TABLE settings ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'`,
+    `ALTER TABLE mails ADD COLUMN rev INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE settings ADD COLUMN tracking_since TEXT`,
     `ALTER TABLE contacts ADD COLUMN last_engaged_at TEXT`,
     `ALTER TABLE contacts ADD COLUMN unsubscribe_reason TEXT`,
@@ -151,9 +156,12 @@ app.use("*", async (c, next) => {
 app.post("/api/chat", async (c) => {
   const env = c.env;
   if (!env.OPENROUTER_API_KEY) return c.json({ error: "Connect OPENROUTER_API_KEY to use the assistant." }, 400);
-  const body = await c.req.json<{ messages: Parameters<typeof streamNewsletterChat>[0]["messages"]; context?: ChatContext; hints?: Hint[] }>();
-  const hintsText = await buildHintsContext(body.hints, env);
-  const repos = (body.hints || []).filter((h) => h.kind === "github" && h.repo).map((h) => h.repo.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, ""));
+  const body = await c.req.json<{ messages: Parameters<typeof streamNewsletterChat>[0]["messages"]; context?: ChatContext }>();
+  // Sources come from Settings and are always included, so this chat and the
+  // Clawnify sidebar chat ground on the same things.
+  const sources = (await getSettings()).sources;
+  const hintsText = activityText(await recentActivity(sources, env.GITHUB_TOKEN));
+  const repos = sources.map((s) => s.repo);
   return streamNewsletterChat({
     apiKey: env.OPENROUTER_API_KEY,
     model: env.NEWSLETTER_MODEL,
@@ -175,6 +183,106 @@ app.post("/api/chat", async (c) => {
       },
     },
   });
+});
+
+// ── the Clawnify sidebar chat ────────────────────────────────────────
+//
+// Inside Clawnify the dashboard's chat is this app's assistant; the in-app
+// panel renders only outside Clawnify. The sidebar chat works an issue through
+// these routes: one read that shows it the way the in-app assistant sees it,
+// sources included, and one write that applies the same editing ops
+// (src/shared/mail-ops.ts). agent.md points it here.
+
+app.get("/api/sources", async (c) => {
+  const s = await getSettings();
+  return c.json({ sources: await recentActivity(s.sources, c.env.GITHUB_TOKEN) });
+});
+
+app.get("/api/sources/search", async (c) => {
+  const repo = cleanSlug(c.req.query("repo") || "");
+  const q = (c.req.query("q") || "").trim();
+  if (!q) return c.json({ error: "Pass q, the words to look for in commit messages." }, 400);
+  const sources = (await getSettings()).sources;
+  if (!sources.some((s) => s.repo.toLowerCase() === repo.toLowerCase())) {
+    return c.json({ error: `"${repo}" is not one of the sources. Sources: ${sources.map((s) => s.repo).join(", ") || "none (add them in Settings)"}.` }, 400);
+  }
+  const r = await searchCommits(repo, q, c.env.GITHUB_TOKEN);
+  if (!r.ok) return c.json({ error: r.error }, r.badQuery ? 400 : 502);
+  return c.json({ repo, query: q, commits: r.commits });
+});
+
+/** An outline past this is cut: one read must stay bounded however many HTML blocks an issue has. */
+const OUTLINE_CAP = 40_000;
+const boundedOutline = (blocks: Block[]) => {
+  const o = mailOutline(blocks);
+  return o.length > OUTLINE_CAP ? `${o.slice(0, OUTLINE_CAP)}\n…(cut at ${OUTLINE_CAP} characters; GET /api/mails/:id has every block)` : o;
+};
+
+app.get("/api/mails/:id/context", async (c) => {
+  const id = Number(c.req.param("id"));
+  const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  const mail = parseMail(row);
+  const s = await getSettings();
+  return c.json({
+    id,
+    subject: mail.title,
+    preheader: mail.preheader,
+    status: mail.status,
+    scheduled_at: mail.scheduled_at,
+    automation: await flowOfMail(id),
+    design: designSummary(await resolveDesign(mail)),
+    outline: boundedOutline(mail.blocks),
+    sources: await recentActivity(s.sources, c.env.GITHUB_TOKEN),
+    edit: { route: `POST /api/mails/${id}/edit`, body: '{ "ops": [{ "op": "<name>", "input": { ... } }] }', ops: OP_NAMES },
+  });
+});
+
+// Apply editing ops in order, all or nothing: one that fails saves none, so a
+// half-applied request never lands on someone's issue. The write is
+// conditional on the copy the ops were applied to: if the editor saved in
+// between, apply them again to the newer copy rather than overwrite it.
+app.post("/api/mails/:id/edit", async (c) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json<{ ops?: unknown }>().catch(() => ({}) as { ops?: unknown });
+  const ops = body.ops;
+  if (!Array.isArray(ops) || ops.length === 0 || ops.length > 50) {
+    return c.json({ error: `Send { "ops": [...] }, 1 to 50 of { "op", "input" }. Ops: ${OP_NAMES.join(", ")}.` }, 400);
+  }
+  // Validate every op before touching the issue.
+  const parsed: { name: OpName; input: Record<string, unknown> }[] = [];
+  for (const [i, raw] of ops.entries()) {
+    const name = String((raw as { op?: unknown })?.op ?? "");
+    const at = `Op ${i + 1} (${name || "missing op"})`;
+    if (!Object.hasOwn(OP_INPUTS, name)) return c.json({ error: `${at}: unknown op. Ops: ${OP_NAMES.join(", ")}. Nothing was saved.` }, 400);
+    const r = OP_INPUTS[name as OpName].safeParse((raw as { input?: unknown }).input ?? {});
+    if (!r.success) {
+      return c.json({ error: `${at}: ${r.error.issues.map((x) => `${x.path.join(".") || "input"} ${x.message}`).join("; ")}. Nothing was saved.` }, 400);
+    }
+    parsed.push({ name: name as OpName, input: r.data as Record<string, unknown> });
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
+    if (!row) return c.json({ error: "Not found" }, 404);
+    let mail = parseMail(row);
+    let base = await resolveDesign(mail);
+    const patch: Partial<Mail> = {};
+    const results: string[] = [];
+    for (const [i, op] of parsed.entries()) {
+      const r = applyMailOp(mail, op.name, op.input, { base });
+      if (!r.ok) return c.json({ error: `Op ${i + 1} (${op.name}): ${r.message} Nothing was saved.` }, 400);
+      mail = { ...mail, ...r.patch };
+      Object.assign(patch, r.patch);
+      if (r.patch.design) base = withDefaults(r.patch.design); // the next design op builds on this one
+      results.push(r.message);
+    }
+    const w = await updateMail(id, patch, Number(row.rev ?? 0));
+    if (w === "missing") return c.json({ error: "Not found" }, 404);
+    if (w === "conflict") continue;
+    const fresh = parseMail(await get<any>("SELECT * FROM mails WHERE id = ?", [id]));
+    return c.json({ ok: true, results, subject: fresh.title, outline: boundedOutline(fresh.blocks) });
+  }
+  return c.json({ error: "The issue kept changing while these edits were applied (someone is editing it). Nothing was saved; try again." }, 409);
 });
 
 // The assistant conversation is stored 1:1 with each mail so it reloads with
@@ -226,6 +334,7 @@ async function getSettings(): Promise<Settings> {
     default_audience_id: row?.default_audience_id || null,
     footer_text: row?.footer_text || "",
     crm_app_id: (row?.crm_app_id as string | null) ?? null,
+    sources: (() => { try { return cleanSources(JSON.parse(row?.sources || "[]")); } catch { return []; } })(),
   };
 }
 
@@ -341,8 +450,8 @@ app.put("/api/settings", async (c) => {
   const cur = await getSettings();
   const next = { ...cur, ...b };
   await run(
-    `UPDATE settings SET publication_name = ?, logo = ?, from_name = ?, from_email = ?, senders = ?, default_audience_id = ?, footer_text = ?, crm_app_id = ? WHERE id = 1`,
-    [next.publication_name, next.logo, next.from_name, next.from_email, JSON.stringify(next.senders || []), next.default_audience_id, next.footer_text, next.crm_app_id || null],
+    `UPDATE settings SET publication_name = ?, logo = ?, from_name = ?, from_email = ?, senders = ?, default_audience_id = ?, footer_text = ?, crm_app_id = ?, sources = ? WHERE id = 1`,
+    [next.publication_name, next.logo, next.from_name, next.from_email, JSON.stringify(next.senders || []), next.default_audience_id, next.footer_text, next.crm_app_id || null, JSON.stringify(cleanSources(next.sources))],
   );
   return c.json(await getSettings());
 });
@@ -452,6 +561,22 @@ app.delete("/api/templates/:slug", async (c) => {
 // off the Send button, and the send and delete routes refuse it. The step's
 // config is the only record of the link; nothing is copied onto the mail.
 app.get("/api/mails", async (c) => {
+  // ?summary=1: one line per issue, newest first, a page at a time. The full
+  // list carries every issue's blocks, which no agent should have to read.
+  // Ordered by id, which never changes, so pages don't shift while issues are edited.
+  if (c.req.query("summary")) {
+    const limit = Math.min(Math.max(Math.floor(Number(c.req.query("limit"))) || 30, 1), 100);
+    const offset = Math.max(Math.floor(Number(c.req.query("offset"))) || 0, 0);
+    const rows = await query<any>(
+      "SELECT id, title, status, scheduled_at, sent_at, updated_at FROM mails ORDER BY id DESC LIMIT ? OFFSET ?",
+      [limit + 1, offset],
+    );
+    const owned = await flows.flowEmails();
+    return c.json({
+      mails: rows.slice(0, limit).map((r) => ({ ...r, flow: owned.get(Number(r.id)) ?? null })),
+      next_offset: rows.length > limit ? offset + limit : null,
+    });
+  }
   const rows = await query<any>("SELECT * FROM mails ORDER BY updated_at DESC");
   const owned = await flows.flowEmails();
   return c.json(rows.map((r) => ({ ...parseMail(r), flow: owned.get(Number(r.id)) ?? null })));
@@ -485,12 +610,21 @@ app.post("/api/mails", async (c) => {
   return c.json(parseMail(row), 201);
 });
 
-app.put("/api/mails/:id", async (c) => {
-  const id = Number(c.req.param("id"));
+/**
+ * Write content fields of one mail: the editor's autosave and the edit route
+ * both come through here, so the subject derivation, token cleaning and the
+ * send-state rules below hold for every writer.
+ *
+ * `expectedRev` makes the write conditional: two writers (the editor's
+ * autosave and the Clawnify chat) each send a whole block list, so the later
+ * one would silently erase the earlier one's change. With it, a write based on
+ * an older copy is refused as a conflict, and the writer merges and retries.
+ * Read back with RETURNING: the storage binding reports no change counts.
+ */
+async function updateMail(id: number, b: Partial<Mail>, expectedRev?: number): Promise<"ok" | "missing" | "conflict"> {
   const existing = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
-  if (!existing) return c.json({ error: "Not found" }, 404);
-  const b = await c.req.json<Partial<Mail>>();
-
+  if (!existing) return "missing";
+  if (expectedRev !== undefined && Number(existing.rev ?? 0) !== expectedRev) return "conflict";
   const fields: Record<string, unknown> = {
     eyebrow: b.eyebrow ?? existing.eyebrow,
     title: b.title ?? existing.title,
@@ -512,7 +646,7 @@ app.put("/api/mails/:id", async (c) => {
   // title is now just a display-heading block.
   if (b.blocks !== undefined) fields.title = deriveTitle(b.blocks);
 
-  await run(
+  const written = await get<{ rev: number }>(
     // Content only. `status` and `scheduled_at` belong to the send and schedule
     // routes, and a body carrying them is ignored: the editor's undo restores a
     // whole earlier copy of the mail, and writing its status back cancelled a
@@ -527,16 +661,31 @@ app.put("/api/mails/:id", async (c) => {
        design_mobile = CASE WHEN ? THEN ? ELSE design_mobile END,
        template_slug = CASE WHEN ? THEN ? ELSE template_slug END,
        audience_id=?,
-       updated_at=datetime('now') WHERE id=?`,
+       rev = rev + 1,
+       updated_at=datetime('now') WHERE id=? AND (? IS NULL OR rev = ?) RETURNING rev`,
     [
       fields.eyebrow, fields.title, fields.preheader, fields.subtitle, fields.byline_name, fields.byline_date,
       fields.feature_image, fields.blocks,
       b.design !== undefined ? 1 : 0, fields.design,
       b.design_mobile !== undefined ? 1 : 0, fields.design_mobile,
       b.template_slug != null ? 1 : 0, fields.template_slug,
-      fields.audience_id, id,
+      fields.audience_id, id, expectedRev ?? null, expectedRev ?? null,
     ],
   );
+  return written ? "ok" : "conflict";
+}
+
+app.put("/api/mails/:id", async (c) => {
+  const id = Number(c.req.param("id"));
+  const b = await c.req.json<Partial<Mail>>();
+  // `rev` is optional: only a writer that keeps a copy (the editor) sends it.
+  const expected = Number.isInteger(b.rev) ? (b.rev as number) : undefined;
+  const r = await updateMail(id, b, expected);
+  if (r === "missing") return c.json({ error: "Not found" }, 404);
+  if (r === "conflict") {
+    const cur = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
+    return c.json({ error: "This issue changed since you opened it.", mail: { ...parseMail(cur), flow: await flowOfMail(id) } }, 409);
+  }
   const row = await get<any>("SELECT * FROM mails WHERE id = ?", [id]);
   return c.json({ ...parseMail(row), flow: await flowOfMail(id) });
 });
@@ -2242,6 +2391,13 @@ app.post("/api/unsubscribe", async (c) => {
         `${escapeHtml(s.publication_name || "this newsletter")}.</p>`,
     ),
   );
+});
+
+// GET /llms.txt and /api/openapi.json: the route index the Clawnify chat reads
+// before it calls this app. Last, so every route above is in it.
+mountDiscovery(app as any, {
+  title: "OpenNewsletter",
+  description: "Newsletter studio: issues, subscribers, automations. Start with GET /api/mails/:id/context to work on an issue.",
 });
 
 export default app;

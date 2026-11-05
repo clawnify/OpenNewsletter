@@ -8,6 +8,8 @@
 import { streamText, tool, convertToModelMessages, stepCountIs, type UIMessage } from "ai";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { z } from "zod";
+import { OP_INPUTS } from "../shared/mail-ops";
+import { cleanSlug, searchCommits } from "./sources";
 
 export const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
 
@@ -41,7 +43,7 @@ Design:
 - Only touch design tokens (set_design) when the user asks about look, colour, fonts or roundness.
 
 Sources:
-- When GitHub repos are connected, their recent commits are provided above. To find a specific change (a feature, a fix, a release), call search_commits with the repo and keywords. Turn real commits into changelog copy — never invent shipped features.
+- The publication's sources (GitHub repos set in Settings) have their recent commits provided above when there are any. To find a specific change (a feature, a fix, a release), call search_commits with the repo and keywords. Turn real commits into changelog copy; never invent shipped features.
 - You can browse the user's past newsletters with list_mails, then read_mail to pull one's full content — use it to reuse a section or match their established voice.
 
 Keep chat replies to one or two sentences. The newsletter itself is the output.`;
@@ -54,60 +56,39 @@ export const NEWSLETTER_TOOLS = {
   set_content: tool({
     description:
       "Replace the ENTIRE newsletter body with new content, written as Markdown. Use for writing a newsletter from scratch or a complete rewrite.",
-    inputSchema: z.object({ markdown: z.string().describe("The full newsletter body as Markdown.") }),
+    inputSchema: OP_INPUTS.set_content,
   }),
   add_block: tool({
     description: "Add one or more blocks (parsed from Markdown) to the newsletter.",
-    inputSchema: z.object({
-      markdown: z.string().describe("Markdown for the block(s) to add."),
-      position: z.enum(["start", "end"]).default("end"),
-    }),
+    inputSchema: OP_INPUTS.add_block,
   }),
   edit_block: tool({
     description:
       "Rewrite ONE existing block's text in place, keeping its type and styling (eyebrow, deck, heading level, button, etc.). This is the right tool for changing wording, topic or tone. For a list, separate items with newlines; for a button you may also pass href.",
-    inputSchema: z.object({
-      block_id: z.string(),
-      text: z.string().describe("The new text/copy for this block."),
-      href: z.string().optional().describe("New link, for a button block only."),
-    }),
+    inputSchema: OP_INPUTS.edit_block,
   }),
   remove_block: tool({
     description: "Delete one block by its id.",
-    inputSchema: z.object({ block_id: z.string() }),
+    inputSchema: OP_INPUTS.remove_block,
   }),
   set_title: tool({
     description: "Set the newsletter title (used as the email subject line).",
-    inputSchema: z.object({ title: z.string() }),
+    inputSchema: OP_INPUTS.set_title,
   }),
   set_design: tool({
     description:
-      "Change one brand/design token. key is a dot-path: colors.primary, colors.background, colors.text, colors.secondary, typography.headingFont, typography.bodyFont, layout.buttonRadius, layout.imageRadius.",
-    inputSchema: z.object({
-      key: z.string(),
-      value: z.union([z.string(), z.number(), z.boolean()]),
-    }),
+      "Change one brand/design token. key is a dot-path: colors.primary, colors.background, colors.foreground (text), colors.secondary, typography.headingFont, typography.bodyFont, layout.buttonRadius, layout.imageRadius.",
+    inputSchema: OP_INPUTS.set_design,
   }),
   style_block: tool({
     description:
       "Style one block: a coloured section behind it with padding, an image's width and alignment, or a button's look. Pass only what changes.",
-    inputSchema: z.object({
-      block_id: z.string(),
-      background: z.string().optional().describe('A design colour (page, primary, secondary, foreground, border), a hex like "#F4F4F5", or "none" to remove the section.'),
-      padding: z.number().optional().describe("Inner padding in px (0-64)."),
-      image_width: z.number().optional().describe("Image width as a percent of the content (10-100)."),
-      image_align: z.enum(["left", "center", "right"]).optional(),
-      button_variant: z.enum(["solid", "outline"]).optional(),
-      button_full_width: z.boolean().optional(),
-    }),
+    inputSchema: OP_INPUTS.style_block,
   }),
   add_html_block: tool({
     description:
       "Add a block of raw email HTML (tables + inline styles) for a design the regular blocks can't express. It renders as written and does not follow the design tokens.",
-    inputSchema: z.object({
-      html: z.string().describe("Email-safe HTML: tables for layout, inline styles, no scripts."),
-      position: z.enum(["start", "end"]).default("end"),
-    }),
+    inputSchema: OP_INPUTS.add_html_block,
   }),
   add_image: tool({
     description:
@@ -132,77 +113,23 @@ function contextMessage(ctx: ChatContext | undefined): string {
   return lines.join("\n");
 }
 
-// ── Hints (sources the assistant can ground on) ──────────────────────
-
-/** A source the user connected in the chat. GitHub repo only today. */
-export type Hint = { kind: "github"; repo: string };
-
-const ghHeaders = (token?: string): Record<string, string> => ({
-  "User-Agent": "open-newsletter",
-  Accept: "application/vnd.github+json",
-  ...(token ? { Authorization: `Bearer ${token}` } : {}),
-});
-
-const cleanSlug = (repo: string) => repo.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "");
-const isSlug = (slug: string) => /^[\w.-]+\/[\w.-]+$/.test(slug);
-
-function commitLines(
-  items: Array<{ commit?: { message?: string; author?: { date?: string } } }>,
-): string[] {
-  return items
-    .map((c) => {
-      const subject = (c.commit?.message || "").split("\n")[0];
-      const date = (c.commit?.author?.date || "").slice(0, 10);
-      return subject ? `- ${subject}${date ? ` (${date})` : ""}` : "";
-    })
-    .filter(Boolean);
-}
-
-async function recentCommits(repo: string, token?: string): Promise<string | null> {
-  const slug = cleanSlug(repo);
-  if (!isSlug(slug)) return null;
-  const since = new Date(Date.now() - 7 * 86_400_000).toISOString();
-  const r = await fetch(`https://api.github.com/repos/${slug}/commits?per_page=40&since=${since}`, { headers: ghHeaders(token) });
-  if (!r.ok) return null;
-  const lines = commitLines((await r.json()) as Parameters<typeof commitLines>[0]);
-  return lines.length ? `Recent commits in ${slug} (last 7 days):\n${lines.join("\n")}` : null;
-}
-
-/**
- * Recent commits for each connected repo, injected as passive grounding. The
- * assistant can go deeper on its own via the search_commits tool.
- */
-export async function buildHintsContext(hints: Hint[] | undefined, env: { GITHUB_TOKEN?: string }): Promise<string> {
-  if (!hints?.length) return "";
-  const blocks: string[] = [];
-  for (const h of hints) {
-    if (h.kind === "github" && h.repo) {
-      const c = await recentCommits(h.repo, env.GITHUB_TOKEN);
-      if (c) blocks.push(c);
-    }
-  }
-  if (!blocks.length) return "";
-  return `\n\nCONNECTED SOURCES — recent activity, use as factual grounding (e.g. turn commits into a changelog):\n${blocks.join("\n\n")}`;
-}
+// ── Sources (Settings) ──────────────────────────────────────────────
 
 /** Server-executed tool: lets the assistant freely search commits in the connected repos. */
 function searchCommitsTool(allowedRepos: string[], token?: string) {
   return tool({
     description:
-      "Search commit messages in a connected GitHub repo. Use when you need a specific change (a feature, a fix, a release) rather than just the recent commits already provided.",
+      "Search commit messages in one of the publication's GitHub sources. Use when you need a specific change (a feature, a fix, a release) rather than just the recent commits already provided.",
     inputSchema: z.object({
-      repo: z.string().describe("owner/name — must be one of the connected repos."),
+      repo: z.string().describe("owner/name, one of the sources."),
       query: z.string().describe("Keywords to match in commit messages."),
     }),
     execute: async ({ repo, query }) => {
       const slug = cleanSlug(repo);
-      if (!allowedRepos.includes(slug)) return `"${slug}" is not connected. Connected repos: ${allowedRepos.join(", ") || "none"}.`;
-      const q = encodeURIComponent(`repo:${slug} ${query}`);
-      const r = await fetch(`https://api.github.com/search/commits?q=${q}&per_page=20`, { headers: ghHeaders(token) });
-      if (!r.ok) return `GitHub search failed (${r.status}).`;
-      const data = (await r.json()) as { items?: Parameters<typeof commitLines>[0] };
-      const lines = commitLines(data.items || []);
-      return lines.length ? `Commits in ${slug} matching "${query}":\n${lines.join("\n")}` : `No commits in ${slug} matched "${query}".`;
+      if (!allowedRepos.includes(slug)) return `"${slug}" is not one of the sources. Sources: ${allowedRepos.join(", ") || "none"}.`;
+      const r = await searchCommits(slug, query, token);
+      if (!r.ok) return r.error;
+      return r.commits.length ? `Commits in ${slug} matching "${query}":\n${r.commits.map((l) => `- ${l}`).join("\n")}` : `No commits in ${slug} matched "${query}".`;
     },
   });
 }

@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState, useCallback, useRef, type ReactNode } from "react";
+import { useHostChanges } from "@clawnify/app/client";
 import { api } from "./api";
 import type { Mail, Template, Settings, StatusInfo } from "../shared/types";
 
@@ -76,6 +77,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setLoading(false);
     })();
   }, []);
+
+  // The Clawnify chat just wrote through the API: reload what the lists show.
+  useHostChanges(() => {
+    void Promise.allSettled([refreshMails(), refreshTemplates(), refreshStatus(), api<Settings>("GET", "/api/settings").then(setSettings)]);
+  });
 
   const value: Store = {
     loading, error, setError, status, settings, templates, mails,

@@ -5,12 +5,14 @@
  * the live mail via `applyTool`, so every change lands on the editor's undo
  * stack and the user watches blocks update as the assistant works.
  *
- * Hints are sources the assistant grounds on (GitHub commits today), attached
- * as pills above the composer and sent alongside each turn.
+ * It renders only outside Clawnify (through <AppChat standalone> in the
+ * editor): inside the dashboard the sidebar chat is the assistant. Sources come
+ * from Settings and are always included, on the server, for both.
  */
 import { useEffect, useRef, useState } from "react";
 import { useChat } from "@ai-sdk/react";
 import { api } from "../api";
+import type { Source } from "../../shared/types";
 import { DefaultChatTransport, lastAssistantMessageIsCompleteWithToolCalls } from "ai";
 import { Sparkles, X, Plus, ChevronDown, Wrench, Pencil, Trash2, Type, Palette, Search, BookOpen, ListChecks, FileText, Image as ImageIcon } from "lucide-react";
 import {
@@ -34,21 +36,13 @@ import {
   usePromptInputAttachments,
   type PromptInputMessage,
 } from "@/components/ai-elements/prompt-input";
-import { Suggestions } from "@/components/ai-elements/suggestion";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
 
 /** What the assistant is told about the current newsletter each turn. */
 export type ChatContext = { title?: string; outline?: string; design?: string };
 /** Applies a streamed tool-call to the editor; returns a short result line. */
 export type ApplyTool = (name: string, input: Record<string, unknown>) => string;
-
-/** A source the assistant can ground on. GitHub repo only today. */
-type Hint = { id: string; kind: "github"; repo: string; active: boolean };
 
 function GithubMark({ className }: { className?: string }) {
   return (
@@ -58,7 +52,6 @@ function GithubMark({ className }: { className?: string }) {
   );
 }
 
-let hintSeq = 0;
 
 /** Upload a chat attachment (data URL) to R2 storage; returns its public URL. */
 async function uploadAttachment(file: { url: string; filename?: string; mediaType?: string }): Promise<string | null> {
@@ -109,6 +102,8 @@ export function Chat({
   available,
   selectedCount,
   onClearSelection,
+  sources,
+  draft,
 }: {
   mailId: number;
   getContext: () => ChatContext;
@@ -116,6 +111,10 @@ export function Chat({
   available: boolean;
   selectedCount: number;
   onClearSelection: () => void;
+  /** Settings sources, shown so the user knows what grounds the reply. */
+  sources: Source[];
+  /** A prompt an "Ask" button opened the chat with: prefilled, never sent. */
+  draft?: { id: number; text: string } | null;
 }) {
   // Keep the latest callbacks/state in refs — useChat captures its options once,
   // so a plain closure would freeze the first render's values.
@@ -127,27 +126,15 @@ export function Chat({
   // Files attached to the most recent message — uploaded on demand when the
   // assistant calls add_image.
   const lastFilesRef = useRef<{ url: string; filename?: string; mediaType?: string }[]>([]);
-  const [hints, setHints] = useState<Hint[]>([]);
-  const hintsRef = useRef(hints);
-  hintsRef.current = hints;
-  // Repos the connected GITHUB_TOKEN can see — offered as a picker so the user
-  // needn't type. Empty when no token; typing any public repo still works.
-  const [repos, setRepos] = useState<string[]>([]);
   useEffect(() => {
-    api<{ repos: { full_name: string }[] }>("GET", "/api/github/repos")
-      .then((d) => setRepos(d.repos.map((r) => r.full_name)))
-      .catch(() => {});
-  }, []);
+    if (draft) setInput(draft.text);
+  }, [draft]);
 
   const { messages, sendMessage, status, addToolOutput, setMessages } = useChat({
     transport: new DefaultChatTransport({
       api: "/api/chat",
       prepareSendMessagesRequest: ({ messages }) => ({
-        body: {
-          messages,
-          context: ctxRef.current(),
-          hints: hintsRef.current.filter((h) => h.active).map(({ kind, repo }) => ({ kind, repo })),
-        },
+        body: { messages, context: ctxRef.current() },
       }),
     }),
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
@@ -193,10 +180,6 @@ export function Chat({
     sendMessage({ text: m.text || "", files: m.files });
     setInput("");
   };
-
-  const addHint = (h: Omit<Hint, "id" | "active">) => setHints((hs) => [...hs, { ...h, id: `h${++hintSeq}`, active: true }]);
-  const toggleHint = (id: string) => setHints((hs) => hs.map((h) => (h.id === id ? { ...h, active: !h.active } : h)));
-  const removeHint = (id: string) => setHints((hs) => hs.filter((h) => h.id !== id));
 
   return (
     <TooltipProvider>
@@ -244,34 +227,17 @@ export function Chat({
           </div>
         ) : null}
 
-        {/* Hints — sources the assistant grounds on */}
-        <div className="px-3 pb-1">
-          <Suggestions className="py-0.5">
-            {hints.map((h) => (
-              <button
-                key={h.id}
-                onClick={() => toggleHint(h.id)}
-                title={h.active ? "Connected — recent commits ground the assistant; it can also search this repo" : "Click to include this source"}
-                className={cn(
-                  "group inline-flex h-7 items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 text-xs transition",
-                  h.active ? "border-primary bg-accent text-foreground" : "border-input bg-background text-muted-foreground",
-                )}
-              >
-                <GithubMark className="size-3.5 shrink-0" />
-                <span className="max-w-[160px] truncate">{h.repo}</span>
-                <span
-                  role="button"
-                  onClick={(e) => { e.stopPropagation(); removeHint(h.id); }}
-                  className="ml-0.5 opacity-40 hover:opacity-100"
-                  aria-label="Remove hint"
-                >
-                  <X className="size-3" />
-                </span>
-              </button>
+        {/* Sources from Settings: always included, listed so the user knows */}
+        {sources.length ? (
+          <div className="flex flex-wrap items-center gap-1.5 px-3 pb-1.5 text-xs text-muted-foreground" title="From Settings. Recent commits ground every reply; the assistant can also search them.">
+            {sources.map((src) => (
+              <span key={src.repo} className="inline-flex h-6 items-center gap-1 rounded-full bg-muted px-2">
+                <GithubMark className="size-3 shrink-0" />
+                <span className="max-w-[160px] truncate">{src.repo}</span>
+              </span>
             ))}
-            <AddHintPill onAdd={addHint} repos={repos} />
-          </Suggestions>
-        </div>
+          </div>
+        ) : null}
 
         <div className="px-3 pb-3">
           <PromptInput onSubmit={submit} accept="image/*" multiple globalDrop>
@@ -358,53 +324,3 @@ function MessageTools({ parts }: { parts: ToolPart[] }) {
   );
 }
 
-function AddHintPill({ onAdd, repos }: { onAdd: (h: Omit<Hint, "id" | "active">) => void; repos: string[] }) {
-  const [open, setOpen] = useState(false);
-  const [repo, setRepo] = useState("");
-
-  const slug = repo.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "");
-  const valid = /^[\w.-]+\/[\w.-]+$/.test(slug);
-
-  const submit = () => {
-    if (!valid) return;
-    onAdd({ kind: "github", repo: slug });
-    setRepo("");
-    setOpen(false);
-  };
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button className="inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-sm border border-dashed border-border px-2.5 text-xs text-muted-foreground transition hover:bg-accent hover:text-foreground">
-          <Plus className="size-3.5" /> Hint
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-72 space-y-3">
-        <div className="flex items-center gap-2 text-sm font-medium">
-          <GithubMark className="size-4" /> GitHub source
-        </div>
-        <Input
-          autoFocus
-          placeholder={repos.length ? "Pick or type owner/repo" : "owner/repo"}
-          value={repo}
-          list="gh-repos"
-          onChange={(e) => setRepo(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && submit()}
-        />
-        {repos.length ? (
-          <datalist id="gh-repos">
-            {repos.map((r) => (
-              <option key={r} value={r} />
-            ))}
-          </datalist>
-        ) : null}
-        <p className="text-xs text-muted-foreground">
-          The assistant sees recent commits and can search this repo for specific changes.
-        </p>
-        <Button size="sm" className="w-full" disabled={!valid} onClick={submit}>
-          Add source
-        </Button>
-      </PopoverContent>
-    </Popover>
-  );
-}

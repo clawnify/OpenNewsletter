@@ -100,6 +100,8 @@ export interface Mail {
   /** Inactive means no open or click for this many days. */
   segment_days?: number | null;
   status: "draft" | "scheduled" | "sending" | "sent" | "failed";
+  /** Bumped on every content write; a save naming an older one is refused (409). */
+  rev?: number;
   /**
    * The automation whose step sends this mail, one person at a time. Such a
    * mail is never an issue: it stays out of the mail list and can't be sent
@@ -144,6 +146,13 @@ export interface Sender {
 }
 
 /** Single-row app configuration. */
+/** Something issues are grounded on. GitHub repos today; every one in Settings is always included. */
+export interface Source {
+  kind: "github";
+  /** owner/name */
+  repo: string;
+}
+
 export interface Settings {
   publication_name: string;
   /** Publication logo URL shown atop the masthead. */
@@ -156,6 +165,8 @@ export interface Settings {
   footer_text: string;
   /** The sibling app chosen as the contacts source (from the app directory), or null. The opt-in. */
   crm_app_id: string | null;
+  /** What issues are grounded on (both assistants always include them). */
+  sources: Source[];
 }
 
 /** A sibling app discovered via GET /api/connected-apps. */

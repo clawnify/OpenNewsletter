@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { PanelLeft } from "lucide-react";
-import { AppNav, reportLocation, type AppNavItem } from "@clawnify/app/client";
+import { AppNav, reportLocation, useChatCommands, useHostNavigate, type AppNavItem } from "@clawnify/app/client";
 import { StoreProvider, useStore } from "./store";
 import { HomeView } from "./components/home-view";
 import { MailsView } from "./components/mails-view";
@@ -29,6 +29,12 @@ function viewFromPath(pathname: string): View {
   return NAV.find((n) => n.href !== "/" && pathname.startsWith(n.href!))?.view ?? "home";
 }
 
+/** The open issue, from /mail/<id>: an issue has a URL, so a reload or the Clawnify chat can open it. */
+function editingFromPath(pathname: string): number | null {
+  const m = pathname.match(/^\/mail\/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
 export function App() {
   return (
     <StoreProvider>
@@ -40,7 +46,10 @@ export function App() {
 function Shell() {
   const { loading, error, setError, status } = useStore();
   const [view, setView] = useState<View>(() => viewFromPath(window.location.pathname));
-  const [editing, setEditing] = useState<number | null>(null);
+  const [editing, setEditing] = useState<number | null>(() => editingFromPath(window.location.pathname));
+  // Where Back from an issue returns: the screen it was opened from (an
+  // automation's canvas for its email), else the mail list.
+  const returnTo = useRef("/mail");
   // Bumped on every sidebar click, so clicking the view you're in starts it
   // over (Automations back to its list from an open automation).
   const [navSeq, setNavSeq] = useState(0);
@@ -53,16 +62,50 @@ function Shell() {
     setNavSeq((n) => n + 1);
   }, []);
 
+  // Show whatever a path names: the browser's back/forward, and the Clawnify
+  // chat opening a page (useHostNavigate), both arrive here.
+  // `from` is the screen the user was on, when known: opening an issue from
+  // there makes it where Back returns; arriving any other way returns to Mail.
+  const showPath = useCallback((path: string, from?: string) => {
+    const pathname = path.split(/[?#]/)[0];
+    if (editingFromPath(pathname) !== null) returnTo.current = from && editingFromPath(from) === null ? from : "/mail";
+    setView(viewFromPath(pathname));
+    setEditing(editingFromPath(pathname));
+    setNavSeq((n) => n + 1); // screens that read the path (an open automation) read it again
+  }, []);
+  useHostNavigate((path) => {
+    const from = window.location.pathname;
+    if (from !== path) window.history.pushState(null, "", path);
+    showPath(path, from);
+  });
+
   useEffect(() => {
-    const onPop = () => setView(viewFromPath(window.location.pathname));
+    const onPop = () => showPath(window.location.pathname);
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
+  }, [showPath]);
+
+  const openMail = useCallback((id: number) => {
+    returnTo.current = window.location.pathname;
+    window.history.pushState(null, "", `/mail/${id}`);
+    setEditing(id);
   }, []);
+  const closeMail = useCallback(() => {
+    const to = returnTo.current.startsWith("/mail/") ? "/mail" : returnTo.current;
+    returnTo.current = "/mail";
+    window.history.pushState(null, "", to);
+    showPath(to);
+  }, [showPath]);
+
+  // App-wide entries for the Clawnify chat's "/" menu; the editor adds its own.
+  useChatCommands([
+    { id: "new-issue", label: "Draft a new issue", description: "From the sources set in Settings", prompt: "Create a new newsletter issue and write it from my sources' recent activity." },
+  ]);
 
   // Lets the dashboard restore this exact screen on reload.
   useEffect(() => {
     reportLocation(window.location.pathname + window.location.search);
-  }, [view]);
+  }, [view, editing]);
 
   // Confirmed subscribers across audiences, shown as the badge on "Audience".
   const subscribers = (status?.audiences ?? []).reduce((n, a) => n + (a.subscribed_count ?? 0), 0);
@@ -99,17 +142,17 @@ function Shell() {
       </div>
       <main className="min-w-0 flex-1 overflow-auto">
         {editing !== null ? (
-          <Editor mailId={editing} onBack={() => setEditing(null)} />
+          <Editor key={editing} mailId={editing} onBack={closeMail} />
         ) : view === "home" ? (
-          <HomeView openMail={setEditing} onNavigate={navigate} />
+          <HomeView openMail={openMail} onNavigate={navigate} />
         ) : view === "mail" ? (
-          <MailsView openMail={setEditing} />
+          <MailsView openMail={openMail} />
         ) : view === "automations" ? (
-          <FlowsView key={navSeq} openMail={setEditing} />
+          <FlowsView key={navSeq} openMail={openMail} />
         ) : view === "templates" ? (
-          <TemplatesView openMail={setEditing} />
+          <TemplatesView openMail={openMail} />
         ) : view === "audience" ? (
-          <AudienceView openMail={setEditing} />
+          <AudienceView openMail={openMail} />
         ) : (
           <SettingsView />
         )}

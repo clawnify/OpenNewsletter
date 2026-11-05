@@ -4,7 +4,9 @@ import { useStore } from "../store";
 import { api } from "../api";
 import { baseDesign, effectiveDesign } from "../lib/design";
 import { diffTokens, withDefaults, type DesignTokens } from "../../shared/design";
-import { newBlock, markdownToBlocks, deriveTitle, blockId } from "../../shared/blocks";
+import { newBlock } from "../../shared/blocks";
+import { applyMailOp, designSummary, mailOutline } from "../../shared/mail-ops";
+import { contentPatch, mergeMail } from "../../shared/mail-merge";
 import type { Block, BlockType, Mail } from "../../shared/types";
 import { SAMPLE_VALUES, fillBlocksText } from "../../shared/merge";
 import { Preview, type EditHandlers } from "./preview";
@@ -13,6 +15,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogC
 import { Input } from "@/components/ui/input";
 import { SendDialog } from "./send-dialog";
 import { TestSendDialog } from "./test-send-dialog";
+import { AppChat, embedded, useChatCommands, useChatContext, useHostChanges } from "@clawnify/app/client";
 import { Chat, type ChatContext, type ApplyTool } from "./chat";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -40,8 +43,11 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   const live = useRef({ mail, history, future });
   live.current = { mail, history, future };
 
+  // The last copy the server confirmed: the base this editor's unsaved edits
+  // are measured against, and the rev every save names.
+  const savedRef = useRef<Mail | null>(mail);
   useEffect(() => {
-    if (!mail) api<Mail>("GET", `/api/mails/${mailId}`).then(setMail).catch((e) => store.setError((e as Error).message));
+    if (!mail) api<Mail>("GET", `/api/mails/${mailId}`).then((m) => { savedRef.current = m; setMail(m); }).catch((e) => store.setError((e as Error).message));
   }, [mailId]);
 
   const base = useMemo(() => (mail ? baseDesign(mail, store.templates) : withDefaults(null)), [mail, store.templates]);
@@ -51,20 +57,53 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
   // Edits inside one debounce window are merged: saving only the last patch
   // dropped an earlier edit to another field (preview text, then a block).
   const pending = useRef<Partial<Mail>>({});
-  const queueSave = (next: Mail, patch: Partial<Mail>) => {
+  const inFlight = useRef<Promise<void> | null>(null);
+  const queueSave = (_next: Mail, patch: Partial<Mail>) => {
     setSaved(false);
     pending.current = { ...pending.current, ...patch };
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(async () => {
-      const merged = pending.current;
-      pending.current = {};
+    timer.current = setTimeout(flush, 500);
+  };
+  // Every save names the rev it started from. If someone else (the Clawnify
+  // chat) saved in between, the server refuses it (409) with its copy, and the
+  // edits merge into that copy and save again, instead of erasing its change.
+  const flush = () => {
+    timer.current = null;
+    const patch = pending.current;
+    pending.current = {};
+    if (!Object.keys(patch).length) return;
+    const run: Promise<void> = (async () => {
       try {
-        await store.saveMail(next.id, merged);
-        setSaved(true);
+        savedRef.current = await store.saveMail(mailId, { ...patch, rev: savedRef.current?.rev });
+        if (!timer.current) setSaved(true);
       } catch (e) {
-        store.setError((e as Error).message);
+        const err = e as Error & { status?: number; data?: { mail?: Mail } };
+        if (err.status === 409 && err.data?.mail) reconcile(err.data.mail);
+        else store.setError(err.message);
       }
-    }, 500);
+    })();
+    inFlight.current = run;
+    void run.finally(() => { if (inFlight.current === run) inFlight.current = null; });
+  };
+  /**
+   * Take in a newer copy from the server, keeping this editor's unsaved edits
+   * (src/shared/mail-merge.ts): its edits win on what they touched, the rest
+   * and the send state come from the server. A visible change from the other
+   * writer goes on the undo stack, so Undo takes it back.
+   */
+  const reconcile = (remote: Mail) => {
+    const cur = live.current.mail;
+    const base = savedRef.current;
+    savedRef.current = remote;
+    if (!cur || !base) { live.current.mail = remote; setMail(remote); return; }
+    const merged = mergeMail(base, cur, remote);
+    const shown = (m: Mail) => JSON.stringify([m.blocks, m.preheader, m.eyebrow, m.subtitle, m.design, m.design_mobile]);
+    if (shown(merged) !== shown(cur)) record(cur);
+    live.current.mail = merged;
+    setMail(merged);
+    const left = contentPatch(remote, merged);
+    pending.current = left; // what this editor still has to save, measured against the new copy
+    if (Object.keys(left).length) queueSave(merged, {});
   };
   /** Snapshot the current mail onto the undo stack and clear redo. */
   const record = (cur: Mail) => {
@@ -156,120 +195,71 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
       return next;
     });
 
-  // ── Assistant bridge ────────────────────────────────────────────────
+  // ── The Clawnify sidebar chat ───────────────────────────────────────
+  // Inside Clawnify the dashboard's chat is the assistant. It edits through
+  // POST /api/mails/:id/edit; when it writes, refetch and put its edit on the
+  // undo stack, so the user's Undo takes back what the chat did. Edits typed
+  // in the last moment and not yet saved stay on top of the fresh copy.
+  const fetchSeq = useRef(0);
+  useHostChanges(async (paths) => {
+    // Only writes to this issue (the edit route, a send, a schedule) matter here.
+    const mine = new RegExp(`^/api/mails/${mailId}(/|\\?|$)`);
+    if (paths.length && !paths.some((p) => mine.test(p))) return;
+    const seq = ++fetchSeq.current;
+    await inFlight.current?.catch(() => {}); // a save in flight settles first (it may 409 and merge)
+    try {
+      const fresh = await api<Mail>("GET", `/api/mails/${mailId}`);
+      if (seq === fetchSeq.current) reconcile(fresh); // a later change's fetch wins over this one
+    } catch { /* the next change, or the next save's 409, catches up */ }
+  });
+  // What the chat is told is on screen. Ids only, never content: it reads the
+  // issue itself through GET /api/mails/:id/context.
+  // shortcut: focused block ids ride the 60-character context label, so about
+  // four fit; past that the chat hears only how many. A record per block if
+  // people focus more.
+  const focusIds = [...aiSelected];
+  const focusLabel = `Issue editor, focus ${focusIds.join(",")}`;
+  useChatContext(
+    mail
+      ? {
+          label: !focusIds.length ? "Issue editor" : focusLabel.length <= 60 ? focusLabel : `Issue editor, ${focusIds.length} blocks in focus`,
+          record: { type: mail.flow ? "automation email" : "newsletter issue", id: String(mail.id), label: mail.title || "Untitled" },
+        }
+      : null,
+  );
+  const which = mail?.flow ? `the automation email #${mailId}` : `newsletter issue #${mailId}`;
+  const scope = focusIds.length ? ` (only the blocks in focus: ${focusIds.join(", ")})` : "";
+  useChatCommands([
+    { id: "draft-from-sources", label: "Draft from my sources", description: "Recent activity in the sources set in Settings", prompt: `Write ${which} from my sources' recent activity. Keep its layout and rewrite each block in place.` },
+    { id: "tighten", label: "Tighten the copy", prompt: `Tighten the copy of ${which}${scope}: shorter sentences, same facts, same layout.` },
+    { id: "subject", label: "Subject and preview text", prompt: `Write a subject line and preview text for ${which} that make people want to open it.` },
+    { id: "brand", label: "Match my brand", prompt: `Restyle ${which} to match my brand: colours, fonts and roundness. Change the design tokens, not the copy.` },
+  ]);
+
+  // ── In-app assistant bridge (outside Clawnify) ──────────────────────
   // A compact snapshot of the mail the assistant sees each turn.
   const getContext = (): ChatContext => {
     const cur = live.current.mail;
     if (!cur) return {};
-    const outline =
-      (cur.blocks || []).map((b) => `[${b.id}] ${b.type}${b.box?.background ? ` (section ${b.box.background})` : ""}: ${blockPreview(b)}`).join("\n") || "(empty)";
+    const outline = mailOutline(cur.blocks || []);
     const focus = [...aiSelected];
     const focusNote = focus.length ? `\n\nThe user has these block ids in focus — scope edits to them: ${focus.join(", ")}` : "";
-    const d = `primary ${design.colors.primary}, background ${design.colors.background}, heading font ${design.typography.headingFont}, button radius ${design.layout.buttonRadius}px`;
-    return { title: cur.title || undefined, outline: outline + focusNote, design: d };
+    return { title: cur.title || undefined, outline: outline + focusNote, design: designSummary(design) };
   };
 
   // Applies a streamed tool-call to the live mail; returns a short result line.
+  // The op itself is shared with the API the Clawnify sidebar chat uses.
   const applyTool: ApplyTool = (name, input) => {
     const cur = live.current.mail;
     if (!cur) return "No newsletter is open.";
-    const commit = (p: Partial<Mail>) => {
-      record(cur);
-      const next = { ...cur, ...p };
-      live.current.mail = next; // sync so chained tool-calls in one turn compose
-      setMail(next);
-      queueSave(next, p);
-    };
-    switch (name) {
-      case "set_content": {
-        const blocks = markdownToBlocks(String(input.markdown || ""));
-        commit({ blocks, title: deriveTitle(blocks) });
-        return `Replaced the body with ${blocks.length} block(s).`;
-      }
-      case "add_block": {
-        const add = markdownToBlocks(String(input.markdown || ""));
-        const curBlocks = cur.blocks || [];
-        const blocks = input.position === "start" ? [...add, ...curBlocks] : [...curBlocks, ...add];
-        commit({ blocks });
-        return `Added ${add.length} block(s).`;
-      }
-      case "edit_block": {
-        const text = String(input.text ?? input.markdown ?? "");
-        let touched = false;
-        const blocks = (cur.blocks || []).map((b): Block => {
-          if (b.id !== input.block_id) return b;
-          touched = true;
-          switch (b.type) {
-            case "heading": return { ...b, text };
-            case "text": return { ...b, md: text };
-            case "button": return { ...b, text, ...(input.href ? { href: String(input.href) } : {}) };
-            case "quote": return { ...b, text };
-            case "list": return { ...b, items: text.split("\n").map((s) => s.replace(/^\s*[-*+]\s+|^\s*\d+\.\s+/, "").trim()).filter(Boolean) };
-            case "image": return { ...b, alt: text };
-            case "html": return { ...b, html: text };
-            default: return b; // divider / spacer / columns — nothing textual to set
-          }
-        });
-        if (!touched) return `No block with id ${input.block_id}.`;
-        commit({ blocks });
-        return "Rewrote the block in place.";
-      }
-      case "remove_block": {
-        commit({ blocks: (cur.blocks || []).filter((b) => b.id !== input.block_id) });
-        return "Removed the block.";
-      }
-      case "set_title": {
-        commit({ title: String(input.title || "") });
-        return "Set the title.";
-      }
-      case "set_design": {
-        const next = setDesignKey(base, String(input.key), input.value);
-        if (!next) return `I can't set "${input.key}".`;
-        commit(device === "mobile" ? { design_mobile: diffTokens(base, next) } : { design: next });
-        return `Set ${input.key}.`;
-      }
-      case "style_block": {
-        let found = false;
-        const blocks = (cur.blocks || []).map((b): Block => {
-          if (b.id !== input.block_id) return b;
-          found = true;
-          const next = { ...b } as Block & Record<string, unknown>;
-          if (input.background !== undefined || input.padding !== undefined) {
-            const bg = input.background === "none" ? undefined : input.background !== undefined ? String(input.background) : b.box?.background;
-            const pad = input.padding !== undefined ? Number(input.padding) : b.box?.padding;
-            next.box = bg || pad ? { ...(bg ? { background: bg } : {}), ...(pad !== undefined ? { padding: pad } : {}) } : undefined;
-          }
-          if (b.type === "image") {
-            if (input.image_width !== undefined) next.width = Number(input.image_width);
-            if (input.image_align !== undefined) next.align = input.image_align;
-          }
-          if (b.type === "button") {
-            if (input.button_variant !== undefined) next.variant = input.button_variant === "outline" ? "outline" : undefined;
-            if (input.button_full_width !== undefined) next.fullWidth = input.button_full_width ? true : undefined;
-          }
-          return next;
-        });
-        if (!found) return `No block ${input.block_id}.`;
-        commit({ blocks });
-        return "Styled the block.";
-      }
-      case "add_html_block": {
-        const block: Block = { id: blockId(), type: "html", html: String(input.html || "") };
-        const curBlocks = cur.blocks || [];
-        commit({ blocks: input.position === "start" ? [block, ...curBlocks] : [...curBlocks, block] });
-        return "Added the HTML block.";
-      }
-      case "add_image": {
-        // src is resolved by the chat (it uploads the attachment before calling).
-        const src = String(input.src || "");
-        if (!src) return "No image to add.";
-        const block: Block = { id: blockId(), type: "image", src, alt: String(input.alt || ""), caption: "", href: "" };
-        commit({ blocks: [...(cur.blocks || []), block] });
-        return "Added the image.";
-      }
-      default:
-        return `Unknown tool: ${name}`;
-    }
+    const r = applyMailOp(cur, name, input, { base, device });
+    if (!r.ok) return r.message;
+    record(cur);
+    const next = { ...cur, ...r.patch };
+    live.current.mail = next; // sync so chained tool-calls in one turn compose
+    setMail(next);
+    queueSave(next, r.patch);
+    return r.message;
   };
 
   // Naming happens in a dialog with the input first and focused, never window.prompt.
@@ -369,17 +359,25 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-96 shrink-0 flex-col border-r md:flex" onClick={(e) => e.stopPropagation()}>
-          <Chat
-            key={mailId}
-            mailId={mailId}
-            getContext={getContext}
-            applyTool={applyTool}
-            available={!!store.status?.ai_available}
-            selectedCount={aiSelected.size}
-            onClearSelection={() => setAiSelected(new Set())}
-          />
-        </aside>
+        {/* The app's own assistant, drawn only outside Clawnify: inside the
+            dashboard the sidebar chat is the assistant and this renders nothing. */}
+        <AppChat
+          standalone={(chat) => (
+            <aside className="hidden w-96 shrink-0 flex-col border-r md:flex" onClick={(e) => e.stopPropagation()}>
+              <Chat
+                key={mailId}
+                mailId={mailId}
+                getContext={getContext}
+                applyTool={applyTool}
+                available={!!store.status?.ai_available}
+                selectedCount={aiSelected.size}
+                onClearSelection={() => setAiSelected(new Set())}
+                sources={store.settings?.sources ?? []}
+                draft={chat.draft}
+              />
+            </aside>
+          )}
+        />
 
         {/* design-lint: allow — a document canvas: the email preview sits on a desk */}
         <div className="flex min-w-0 flex-1 flex-col bg-muted">
@@ -393,7 +391,7 @@ export function Editor({ mailId, onBack }: { mailId: number; onBack: () => void 
           ) : null}
           {mode === "edit" && selectMode ? (
             <div className="flex items-center justify-center gap-2 border-b border-primary/30 bg-accent py-1.5 text-xs text-foreground">
-              <MousePointer2 size={13} /> Click blocks to focus them, then ask the assistant to rewrite them. <strong>{aiSelected.size} in focus</strong>.
+              <MousePointer2 size={13} /> Click blocks to focus them, then ask {embedded ? "the chat" : "the assistant"} to rewrite them. <strong>{aiSelected.size} in focus</strong>.
             </div>
           ) : null}
 
@@ -475,39 +473,6 @@ function InboxLine({ mail, onPreheader }: { mail: Mail; onPreheader: (v: string)
       </p>
     </div>
   );
-}
-
-/** One-line preview of a block, for the assistant's outline. */
-function blockPreview(b: Block): string {
-  const clip = (s: string) => (s.length > 60 ? s.slice(0, 57) + "…" : s);
-  switch (b.type) {
-    case "heading": return clip(b.text) + ` (h${b.level})`;
-    case "text": return clip(b.md);
-    case "image": return `image ${b.alt || b.src}`;
-    case "button": return `button "${b.text}"`;
-    case "list": return clip(b.items.join(", "));
-    case "quote": return clip(b.text);
-    case "divider": return "divider";
-    case "spacer": return "spacer";
-    case "columns": return `${b.items.length} columns`;
-    // In full (to a cap), so the assistant can rewrite it with edit_block.
-    case "html": return b.html.length > 4000 ? b.html.slice(0, 4000) + "\n…(truncated)" : b.html;
-  }
-}
-
-const DESIGN_KEYS = new Set([
-  "colors.primary", "colors.background", "colors.text", "colors.secondary", "colors.onPrimary",
-  "typography.headingFont", "typography.bodyFont",
-  "layout.buttonRadius", "layout.imageRadius", "layout.cardRadius", "layout.contentWidth", "layout.outerPadding",
-]);
-
-/** Set one allow-listed dot-path token on a clone of the base design. */
-function setDesignKey(base: DesignTokens, key: string, value: unknown): DesignTokens | null {
-  if (!DESIGN_KEYS.has(key)) return null;
-  const next = structuredClone(base) as unknown as Record<string, Record<string, unknown>>;
-  const [group, field] = key.split(".");
-  next[group][field] = value;
-  return next as unknown as DesignTokens;
 }
 
 function Segmented<T extends string>({ options, value, onChange }: { options: { v: T; label: string; icon?: React.ReactNode }[]; value: T; onChange: (v: T) => void }) {

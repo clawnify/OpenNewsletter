@@ -71,12 +71,9 @@
     ]
   },
   "env": {
-    "oneOf": [
-      [
-        "OPENROUTER_API_KEY"
-      ]
-    ],
     "optional": [
+      "OPENROUTER_API_KEY",
+      "GITHUB_TOKEN",
       "RESEND_API_KEY",
       "RESEND_WEBHOOK_SECRET",
       "NEWSLETTER_MODEL",

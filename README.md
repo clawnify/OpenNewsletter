@@ -53,6 +53,11 @@ account. The provider is just delivery, and it's swappable.
   can write HTML blocks too. Merge tags work inside them. Scripts, forms and
   embeds are removed, and a snippet left unclosed can't spill into the next
   block.
+- **An assistant that knows your sources.** On Clawnify, your workspace's
+  sidebar chat is the assistant: it reads and edits the open issue, and you
+  can undo what it did. Run anywhere else, the editor has its own assistant on
+  your OpenRouter key. Both ground every draft on the GitHub repos you add as
+  Sources in Settings, so a changelog issue is written from real commits.
 - **Delivery tracking** — one click in Settings registers a Resend webhook with
   your own key. Hard bounces and spam complaints then stop future sends to
   that address on every list, and each sent issue shows delivered, clicked,
@@ -204,7 +209,8 @@ npx clawnify deploy
 | Env | Required | Purpose |
 |-----|----------|---------|
 | `RESEND_API_KEY` | for sending | Your own key — delivery only; contacts stay in D1 |
-| `OPENROUTER_API_KEY` | for AI | The Generate button |
+| `OPENROUTER_API_KEY` | no | The editor's own assistant, when the app runs outside Clawnify (on Clawnify the sidebar chat is the assistant) |
+| `GITHUB_TOKEN` | no | Private repos as Sources (Contents: read). Public repos work without it |
 | `NEWSLETTER_MODEL` | no | Override the generation model |
 | `RESEND_WEBHOOK_SECRET` | no | Signing secret of a Resend webhook you created by hand. Only needed when your key can send but not manage webhooks; otherwise Settings → Delivery tracking → Turn on sets it up |
 
@@ -220,6 +226,7 @@ src/
     templates.ts     — built-in templates (runtime mirror of templates/*/DESIGN.md)
     markdown.ts      — email-safe Markdown → HTML
     types.ts         — Mail, Template, Settings, Contact types
+    mail-ops.ts      the editing ops both assistants use (edit, style, design…)
   server/
     index.ts         — Hono API (mails, templates, settings, audiences,
                        subscribe/confirm/unsubscribe, widget, generate, send)
@@ -228,6 +235,7 @@ src/
     events.ts        — what bounces, complaints, opens and clicks change
     render.ts        — mail + tokens → email-safe inlined HTML
     ai.ts            — OpenRouter generation
+    sources.ts       Sources (GitHub repos in Settings): recent commits, search
     providers/       — EmailProvider interface (send-only) + adapters
     schema.sql       — D1 schema
   client/
