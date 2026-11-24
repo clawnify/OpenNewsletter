@@ -1,6 +1,13 @@
+# pnpm 11 reads build permissions from here, not from package.json's `pnpm`
+# field (kept there for pnpm 10).
 allowBuilds:
-  esbuild: set this to true or false
-  workerd: set this to true or false
+  esbuild: true
+  workerd: true
+  # Reached only through vitest and the shadcn CLI; no service worker to copy.
+  msw: false
+  # wrangler's local simulator pulls sharp for image resizing; it never runs
+  # in the deployed app, so skip the native build.
+  sharp: false
 minimumReleaseAgeExclude:
   - '@clawnify/queue@0.1.0'
   - '@clawnify/app@0.2.1 || 0.4.8 || 0.4.11'
