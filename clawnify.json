@@ -16,6 +16,7 @@
     ]
   },
   "api": {
+    "server_routes": ["/widget.js"],
     "public_routes": [
       {
         "path": "/api/subscribe",
